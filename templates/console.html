@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>记忆控制台 · Memory Console</title>
+<link rel="stylesheet" href="/static/css/fonts.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css">
+<style>
+:root{
+  --bg-deep:#080c18; --bg-card:#0f1525; --bg-card-hover:#151d33;
+  --gold:#c5a55a; --gold-light:#e8d5a3; --gold-dim:rgba(197,165,90,.25);
+  --text-primary:#d4cbb8; --text-secondary:#7a8194; --text-dim:#4a5068;
+  --on:#c5a55a; --off:#3a3f52; --warn:#c87878;
+  --serif:'Cormorant Garamond','Noto Serif SC','Source Han Serif SC','Songti SC','SimSun','Georgia',serif;
+  --sans:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:var(--sans);min-height:100vh;overflow-x:hidden;}
+.container{max-width:900px;margin:0 auto;padding:0 24px 48px;}
+
+.header{padding:44px 0 8px;text-align:center;}
+.header-title{font-family:var(--serif);font-size:28px;font-weight:300;letter-spacing:8px;color:var(--gold-light);}
+.header-sub{font-family:var(--serif);font-size:12px;letter-spacing:4px;color:var(--text-dim);margin-top:4px;}
+.header-back{position:absolute;top:24px;left:24px;font-family:var(--serif);font-size:12px;letter-spacing:2px;color:var(--text-dim);text-decoration:none;}
+.header-back:hover{color:var(--gold-light);}
+
+/* status strip */
+.status-strip{display:flex;flex-wrap:wrap;justify-content:center;gap:18px;margin:22px 0 34px;padding:14px 0;border-top:.5px solid rgba(197,165,90,.1);border-bottom:.5px solid rgba(197,165,90,.1);}
+.stat{display:flex;align-items:center;gap:7px;font-size:12px;letter-spacing:1px;color:var(--text-secondary);font-family:var(--serif);}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--off);box-shadow:none;}
+.stat.live .dot{background:var(--on);box-shadow:0 0 8px rgba(197,165,90,.6);}
+.stat.live{color:var(--gold-light);}
+
+/* panel */
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;}
+.panel{position:relative;padding:22px 24px;border:.5px solid var(--gold-dim);border-radius:2px;background:linear-gradient(135deg,rgba(15,21,37,.8),rgba(8,12,24,.9));}
+.panel::before{content:'';position:absolute;inset:5px;border:.5px solid rgba(197,165,90,.1);border-radius:2px;pointer-events:none;}
+.panel.wide{grid-column:1 / -1;}
+.panel-h{display:flex;align-items:baseline;gap:10px;margin-bottom:16px;}
+.panel-h .en{font-family:var(--serif);font-size:14px;letter-spacing:4px;color:var(--gold);}
+.panel-h .cn{font-size:11px;letter-spacing:2px;color:var(--text-dim);}
+.panel-h i{color:var(--gold-dim);font-size:16px;margin-left:auto;}
+
+/* control row */
+.row{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:.5px solid rgba(197,165,90,.06);}
+.row:last-child{border-bottom:none;}
+.row .label{font-size:13px;color:var(--text-primary);letter-spacing:.5px;}
+.row .hint{font-size:11px;color:var(--text-dim);margin-top:2px;}
+.row .ctl{margin-left:auto;display:flex;align-items:center;gap:10px;flex:0 0 auto;}
+
+/* toggle */
+.tg{position:relative;width:42px;height:22px;flex:0 0 auto;cursor:pointer;}
+.tg input{position:absolute;opacity:0;width:100%;height:100%;cursor:pointer;margin:0;}
+.tg .track{position:absolute;inset:0;border-radius:20px;background:var(--off);border:.5px solid rgba(197,165,90,.2);transition:.35s;}
+.tg .knob{position:absolute;top:3px;left:3px;width:15px;height:15px;border-radius:50%;background:var(--text-dim);transition:.35s;}
+.tg input:checked + .track{background:rgba(197,165,90,.22);border-color:var(--gold-dim);}
+.tg input:checked + .track + .knob{left:24px;background:var(--gold-light);box-shadow:0 0 8px rgba(197,165,90,.5);}
+
+/* slider */
+.sld{display:flex;align-items:center;gap:10px;min-width:150px;}
+input[type=range]{-webkit-appearance:none;appearance:none;height:2px;background:var(--off);border-radius:2px;width:110px;outline:none;}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;background:var(--gold-light);box-shadow:0 0 6px rgba(197,165,90,.5);cursor:pointer;}
+input[type=range]::-moz-range-thumb{width:13px;height:13px;border:none;border-radius:50%;background:var(--gold-light);cursor:pointer;}
+.sld .val{font-family:var(--serif);font-size:15px;color:var(--gold);min-width:34px;text-align:right;}
+
+/* chips & stat-num */
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;}
+.chip{font-size:11px;letter-spacing:1px;color:var(--gold);padding:2px 10px;border:.5px solid var(--gold-dim);border-radius:20px;}
+.numstat{font-family:var(--serif);font-size:15px;color:var(--gold-light);}
+.numstat small{font-size:11px;color:var(--text-dim);letter-spacing:1px;}
+
+/* badges */
+.badge{font-size:9px;letter-spacing:1px;padding:1px 6px;border-radius:3px;vertical-align:middle;margin-left:6px;}
+.badge.sens{color:var(--warn);border:.5px solid rgba(200,120,120,.4);}
+.badge.off-eng{color:var(--text-dim);border:.5px solid var(--text-dim);}
+
+/* button */
+.btn{font-family:var(--serif);font-size:12px;letter-spacing:2px;color:var(--text-secondary);padding:5px 16px;border:.5px solid var(--gold-dim);border-radius:2px;background:transparent;cursor:pointer;transition:.3s;white-space:nowrap;}
+.btn:hover{color:var(--gold-light);border-color:rgba(197,165,90,.5);background:var(--bg-card-hover);}
+.btn.warn:hover{color:var(--warn);border-color:rgba(200,120,120,.4);}
+.btn:disabled{opacity:.35;cursor:not-allowed;}
+.btn:disabled:hover{color:var(--text-secondary);border-color:var(--gold-dim);background:transparent;}
+.btn.sm{font-size:11px;letter-spacing:1px;padding:3px 11px;}
+
+/* preview drawer */
+.drawer{grid-column:1 / -1;display:none;margin-top:-6px;padding:14px 16px;border:.5px solid rgba(197,165,90,.12);border-radius:2px;background:rgba(8,12,24,.6);}
+.drawer.open{display:block;}
+.drawer-body{font-size:12px;line-height:1.7;color:var(--text-secondary);white-space:pre-wrap;font-family:var(--sans);max-height:340px;overflow:auto;}
+.drawer .di{display:flex;gap:8px;margin-bottom:8px;align-items:center;}
+.drawer input[type=text]{flex:1;background:rgba(15,21,37,.8);border:.5px solid var(--gold-dim);border-radius:2px;color:var(--text-primary);padding:6px 10px;font-size:12px;outline:none;font-family:var(--sans);}
+
+/* fold (维护) */
+.fold-h{display:flex;align-items:center;cursor:pointer;user-select:none;}
+.fold-h .caret{margin-left:auto;color:var(--gold-dim);transition:.3s;}
+.fold-h.open .caret{transform:rotate(90deg);}
+.fold-body{display:none;margin-top:10px;}
+.fold-body.open{display:block;}
+.maint-row{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:.5px solid rgba(197,165,90,.06);}
+.maint-row .mlabel{font-size:12px;color:var(--text-primary);}
+.maint-row .mhint{font-size:10px;color:var(--text-dim);margin-top:2px;}
+.maint-row .mctl{margin-left:auto;}
+.maint-status{font-size:10px;color:var(--text-dim);margin-left:10px;}
+
+/* toast */
+#toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--bg-card);border:.5px solid var(--gold-dim);color:var(--gold-light);font-family:var(--serif);font-size:13px;letter-spacing:1px;padding:11px 24px;border-radius:2px;opacity:0;transition:.35s;pointer-events:none;z-index:99;max-width:80%;text-align:center;}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+
+.footer{text-align:center;padding:36px 0 8px;}
+.footer-text{font-family:var(--serif);font-size:12px;color:var(--text-dim);letter-spacing:3px;}
+.corner{position:fixed;width:50px;height:50px;pointer-events:none;opacity:.12;}
+.corner.tl{top:10px;left:10px;} .corner.tr{top:10px;right:10px;transform:scaleX(-1);}
+.corner.bl{bottom:10px;left:10px;transform:scaleY(-1);} .corner.br{bottom:10px;right:10px;transform:scale(-1);}
+@media(max-width:640px){.grid{grid-template-columns:1fr;} .header-title{font-size:20px;letter-spacing:4px;} .header-back{position:static;display:block;margin-bottom:8px;text-align:center;}}
+</style>
+</head>
+<body>
+<svg class="corner tl" viewBox="0 0 50 50"><path d="M2 48 L2 2 L48 2" fill="none" stroke="#c5a55a" stroke-width=".5"/><path d="M2 10 L10 2" fill="none" stroke="#c5a55a" stroke-width=".5"/><circle cx="2" cy="2" r="1.5" fill="#c5a55a"/></svg>
+<svg class="corner tr" viewBox="0 0 50 50"><path d="M2 48 L2 2 L48 2" fill="none" stroke="#c5a55a" stroke-width=".5"/><path d="M2 10 L10 2" fill="none" stroke="#c5a55a" stroke-width=".5"/><circle cx="2" cy="2" r="1.5" fill="#c5a55a"/></svg>
+<svg class="corner bl" viewBox="0 0 50 50"><path d="M2 48 L2 2 L48 2" fill="none" stroke="#c5a55a" stroke-width=".5"/><path d="M2 10 L10 2" fill="none" stroke="#c5a55a" stroke-width=".5"/><circle cx="2" cy="2" r="1.5" fill="#c5a55a"/></svg>
+<svg class="corner br" viewBox="0 0 50 50"><path d="M2 48 L2 2 L48 2" fill="none" stroke="#c5a55a" stroke-width=".5"/><path d="M2 10 L10 2" fill="none" stroke="#c5a55a" stroke-width=".5"/><circle cx="2" cy="2" r="1.5" fill="#c5a55a"/></svg>
+
+<div class="container">
+  <a class="header-back" href="#" id="back-link">‹ 返回面板</a>
+  <div class="header">
+    <div class="header-title">记 忆 控 制 台</div>
+    <div class="header-sub">MEMORY CONSOLE · 操作间</div>
+  </div>
+
+  <div class="status-strip" id="status-strip"></div>
+
+  <div class="grid">
+
+    <!-- EMOTION -->
+    <div class="panel">
+      <div class="panel-h"><span class="en">EMOTION</span><span class="cn">情绪 · 体温</span><i class="ti ti-heartbeat"></i></div>
+      <div class="row"><div><div class="label">心跳随情绪<span class="badge sens">敏感·主链路</span></div><div class="hint" id="h-mood_drift"></div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tg-mood_drift"><span class="track"></span><span class="knob"></span></label></div></div>
+      <div class="row"><div><div class="label">feel · 体温细流</div><div class="hint" id="h-feel"></div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tg-feel"><span class="track"></span><span class="knob"></span></label><button class="btn sm" data-prev="feel">预览▸</button></div></div>
+      <div class="drawer" id="dw-feel"><div class="drawer-body">点「预览」看最近一段 feel 注入块…</div></div>
+      <div class="fold-h" id="fold-drift"><span class="label" style="color:var(--text-secondary)">漂移高级参数<span class="badge sens">敏感</span></span><i class="ti ti-chevron-right caret"></i></div>
+      <div class="fold-body" id="foldb-drift">
+        <div class="row"><div class="label">漂移步长</div><div class="ctl sld"><input type="range" data-num="MOOD_DRIFT_STEP" data-via="settings"><span class="val" id="val-MOOD_DRIFT_STEP"></span></div></div>
+        <div class="row"><div class="label">每日封顶</div><div class="ctl sld"><input type="range" data-num="MOOD_DRIFT_DAILY_CAP" data-via="settings"><span class="val" id="val-MOOD_DRIFT_DAILY_CAP"></span></div></div>
+        <div class="row"><div class="label">心境窗口</div><div class="ctl sld"><input type="range" data-num="MOOD_RECENT_N" data-via="settings"><span class="val" id="val-MOOD_RECENT_N"></span></div></div>
+        <div class="row"><div><div class="label">回忆墙豁免漂移</div><div class="hint" id="h-drift_skip_mw"></div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tg-drift_skip_mw"><span class="track"></span><span class="knob"></span></label></div></div>
+      </div>
+    </div>
+
+    <!-- DISCRETION -->
+    <div class="panel">
+      <div class="panel-h"><span class="en">DISCRETION</span><span class="cn">分寸 · 隐私</span><i class="ti ti-lock"></i></div>
+      <div class="row"><div><div class="label">露骨收敛</div><div class="hint" id="h-redact"></div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tg-redact"><span class="track"></span><span class="knob"></span></label><button class="btn sm" data-prev="redact">解锁sim▸</button></div></div>
+      <div class="drawer" id="dw-redact">
+        <div class="di"><input type="text" id="sim-input" placeholder="输入一句话,看会不会解锁亲密(暗号短语在设置里配)"><button class="btn sm" id="sim-go">判</button></div>
+        <div class="drawer-body" id="dw-redact-body">中性收 · 亲密放。硬钥匙即时解锁,暧昧暗号走 haiku 微判,解锁后粘 2 轮。</div>
+      </div>
+      <div class="row"><div style="width:100%"><div class="label">亲密解锁钥匙</div><div class="chips" id="chips-keys"></div></div></div>
+      <div class="row"><div class="label">is_explicit 标记</div><div class="ctl"><span class="numstat"><span id="cnt-explicit">…</span> <small>条 · 活跃</small></span></div></div>
+    </div>
+
+    <!-- INJECTION -->
+    <div class="panel">
+      <div class="panel-h"><span class="en">INJECTION</span><span class="cn">记忆注入 · 检索</span><i class="ti ti-sparkles"></i></div>
+      <div class="row"><div class="label">最大注入条数</div><div class="ctl sld"><input type="range" data-num="MAX_MEMORIES_INJECT" data-via="settings"><span class="val" id="val-MAX_MEMORIES_INJECT"></span></div></div>
+      <div class="row"><div class="label">相关性阈值</div><div class="ctl sld"><input type="range" data-num="MIN_SCORE_THRESHOLD" data-via="settings"><span class="val" id="val-MIN_SCORE_THRESHOLD"></span></div></div>
+      <div class="row"><div class="label">语义阈值</div><div class="ctl sld"><input type="range" data-num="MEMORY_SEMANTIC_THRESHOLD" data-via="settings"><span class="val" id="val-MEMORY_SEMANTIC_THRESHOLD"></span></div></div>
+      <div class="row"><div class="label">提取间隔(轮)</div><div class="ctl sld"><input type="range" data-num="MEMORY_EXTRACT_INTERVAL" data-via="settings"><span class="val" id="val-MEMORY_EXTRACT_INTERVAL"></span></div></div>
+      <div class="row"><div><div class="label">提取总开关<span class="badge sens">敏感</span></div><div class="hint" id="h-extract"></div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tg-extract"><span class="track"></span><span class="knob"></span></label></div></div>
+      <div class="row"><div><div class="label">看图(多模态透传)<span class="badge sens">敏感</span></div><div class="hint" id="h-image"></div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tg-image"><span class="track"></span><span class="knob"></span></label></div></div>
+    </div>
+
+    <!-- SURFACING -->
+    <div class="panel">
+      <div class="panel-h"><span class="en">SURFACING</span><span class="cn">叙事 · 浮现</span><i class="ti ti-quote"></i></div>
+      <div class="row"><div><div class="label">保质感摘要</div><div class="hint" id="h-summary_quality"></div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tg-summary_quality"><span class="track"></span><span class="knob"></span></label><button class="btn sm" data-prev="summary">预览▸</button></div></div>
+      <div class="row"><div><div class="label">滚动摘要封顶 <span class="hint">早期小结+最近N段·不再无限涨</span></div><div class="hint" id="h-summary_cap"></div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tg-summary_cap"><span class="track"></span><span class="knob"></span></label></div></div>
+      <div class="drawer" id="dw-summary"><div class="drawer-body">点「预览」看新摘要样例(只读)…</div></div>
+      <div class="row"><div><div class="label">主动浮现</div><div class="hint" id="h-proactive"></div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tg-proactive"><span class="track"></span><span class="knob"></span></label><button class="btn sm" data-prev="proactive">预览▸</button></div></div>
+      <div class="drawer" id="dw-proactive"><div class="drawer-body">点「预览」看开场白样例(6 次 haiku,稍慢)…</div></div>
+      <div class="row"><div class="label">浮现间隔(小时)</div><div class="ctl sld"><input type="range" data-num="PROACTIVE_GAP_HOURS" data-via="settings"><span class="val" id="val-PROACTIVE_GAP_HOURS"></span></div></div>
+    </div>
+
+    <!-- DECAY -->
+    <div class="panel wide">
+      <div class="panel-h"><span class="en">DECAY</span><span class="cn">精炼 · 遗忘(归档≠删除·可逆)</span><i class="ti ti-hourglass-low"></i></div>
+      <div class="row"><div><div class="label">自然衰减(允许归档)</div><div class="hint" id="h-decay"></div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tg-decay"><span class="track"></span><span class="knob"></span></label></div></div>
+      <div class="row" style="flex-wrap:wrap;gap:18px">
+        <div class="sld"><span class="label">年龄≥</span><input type="range" data-num="decay_age_days" data-via="decay"><span class="val" id="val-decay_age_days"></span><span class="hint">天</span></div>
+        <div class="sld"><span class="label">重要≤</span><input type="range" data-num="decay_imp_max" data-via="decay"><span class="val" id="val-decay_imp_max"></span></div>
+        <div class="sld"><span class="label">闲置≥</span><input type="range" data-num="decay_idle_days" data-via="decay"><span class="val" id="val-decay_idle_days"></span><span class="hint">天</span></div>
+        <div class="sld"><span class="label">唤醒&lt;</span><input type="range" data-num="decay_arousal_max" data-via="decay"><span class="val" id="val-decay_arousal_max"></span></div>
+      </div>
+      <div class="row"><div class="hint">高imp/高arousal/近期/被回忆过/回忆墙 天然受保护 · 归档项已豁免 30 天硬删</div><div class="ctl"><button class="btn sm" data-prev="decay">预览会淡掉谁▸</button><button class="btn sm" id="decay-run">▶ 归档</button><button class="btn sm" id="decay-undo">↺ 复活上批 <span id="cnt-decaybatch"></span></button></div></div>
+      <div class="drawer" id="dw-decay"><div class="drawer-body">点「预览」按当前阈值看会归档哪些(只读,不动数据)…</div></div>
+    </div>
+
+    <!-- DREAM & L2 -->
+    <div class="panel">
+      <div class="panel-h"><span class="en">DREAM</span><span class="cn">做梦 · 回溯</span><i class="ti ti-moon"></i></div>
+      <div class="row"><div><div class="label">做梦总开关</div><div class="hint" id="h-dream"></div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tg-dream"><span class="track"></span><span class="knob"></span></label><button class="btn sm" data-prev="dream">预览▸</button></div></div>
+      <div class="drawer" id="dw-dream"><div class="drawer-body">点「预览」看一篇梦样例(稍慢)…</div></div>
+      <div class="row"><div><div class="label">每梦写可检索条目</div><div class="hint" id="h-dream_retrievable"></div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tg-dream_retrievable"><span class="track"></span><span class="knob"></span></label></div></div>
+      <div class="row"><div class="label">补做梦(后台)</div><div class="ctl"><button class="btn sm" id="dream-run">▶ 补做未覆盖日</button></div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-h"><span class="en">DAILY</span><span class="cn">L2 今日脉络</span><i class="ti ti-timeline"></i></div>
+      <div class="row"><div><div class="label">L2 今日浓缩</div><div class="hint" id="h-l2_today"></div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tg-l2_today"><span class="track"></span><span class="knob"></span></label><button class="btn sm" data-prev="l2">预览▸</button></div></div>
+      <div class="drawer" id="dw-l2"><div class="drawer-body">点「预览」看今日浓缩样例…</div></div>
+      <div class="row"><div class="label">每几轮刷新</div><div class="ctl sld"><input type="range" data-num="L2_REFRESH_N" data-via="settings"><span class="val" id="val-L2_REFRESH_N"></span></div></div>
+      <div class="row"><div class="label">立即刷新</div><div class="ctl"><button class="btn sm" id="l2-refresh">▶ 刷新今日</button></div></div>
+    </div>
+
+    <!-- SUGGESTIONS -->
+    <div class="panel wide">
+      <div class="panel-h"><span class="en">SUGGESTIONS</span><span class="cn">建议队列 · 人来挑</span><i class="ti ti-list-check"></i></div>
+      <div class="row"><div><div class="label">人设建议</div><div class="hint" id="h-persona"></div></div><div class="ctl sld"><span class="label" style="font-size:11px">门槛 imp≥</span><input type="range" data-num="PERSONA_SUGGESTION_MIN_IMPORTANCE" data-via="settings"><span class="val" id="val-PERSONA_SUGGESTION_MIN_IMPORTANCE"></span><label class="tg"><input type="checkbox" id="tg-persona"><span class="track"></span><span class="knob"></span></label><button class="btn sm warn" id="persona-clear">清空待审 <span id="cnt-persona"></span></button></div></div>
+      <div class="row"><div><div class="label">L5 根基候选</div><div class="hint">机器提里程碑 → 你确认才进根基(在「层视图」审)</div></div><div class="ctl"><button class="btn sm warn" id="l5-clear">清空待审 <span id="cnt-l5"></span></button></div></div>
+    </div>
+
+    <!-- MAINTENANCE -->
+    <div class="panel wide">
+      <div class="fold-h panel-h" id="fold-maint" style="margin-bottom:0"><span class="en">MAINTENANCE</span><span class="cn">维护 · 重建(重操作 · 二次确认)</span><i class="ti ti-chevron-right caret"></i></div>
+      <div class="fold-body" id="foldb-maint">
+        <div class="maint-row"><div><div class="mlabel">is_explicit 语义重判</div><div class="mhint">对高 arousal 记忆用 haiku 重判露骨标(后台)</div></div><div class="mctl"><button class="btn sm" data-maint="rejudge">运行</button><span class="maint-status" id="ms-rejudge"></span></div></div>
+        <div class="maint-row"><div><div class="mlabel">is_explicit 关键词回填</div><div class="mhint">广关键词扫一遍补标(后台)</div></div><div class="mctl"><button class="btn sm" data-maint="backfill-explicit">运行</button><span class="maint-status" id="ms-backfill-explicit"></span></div></div>
+        <div class="maint-row"><div><div class="mlabel">情绪 valence/arousal 回填</div><div class="mhint">给未打标记忆补情绪坐标(后台)</div></div><div class="mctl"><button class="btn sm" data-maint="backfill-emotion">运行</button><span class="maint-status" id="ms-backfill-emotion"></span></div></div>
+        <div class="maint-row"><div><div class="mlabel">向量 embedding 回填</div><div class="mhint">给缺向量的记忆补 embedding(后台)</div></div><div class="mctl"><button class="btn sm" data-maint="backfill-embeddings">运行</button><span class="maint-status" id="ms-backfill-embeddings"></span></div></div>
+        <div class="maint-row"><div><div class="mlabel">清理归档碎片</div><div class="mhint">硬删 30 天前的 layer-1 归档碎片(衰减归档项已豁免)</div></div><div class="mctl"><button class="btn sm warn" data-maint="cleanup">清理</button><span class="maint-status" id="ms-cleanup"></span></div></div>
+        <div class="maint-row"><div><div class="mlabel">记忆巩固 consolidate<span class="badge off-eng">旧引擎 · 禁用</span></div><div class="mhint">早期合并引擎,已被分层/做梦取代,留档不跑</div></div><div class="mctl"><button class="btn sm" disabled>已禁用</button></div></div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="footer"><div class="footer-text">♦ 记忆控制台 ♦</div></div>
+</div>
+<div id="toast"></div>
+
+<script>
+const KEY = new URLSearchParams(location.search).get('gateway_key') || '';
+document.getElementById('back-link').href = '/dashboard' + (KEY ? ('?gateway_key=' + encodeURIComponent(KEY)) : '');
+let DATA = null;
+
+function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove('show'),2600); }
+
+async function api(path, opt){
+  opt = opt || {}; opt.headers = Object.assign({'X-Gateway-Key': KEY}, opt.headers||{});
+  if(opt.body && typeof opt.body!=='string'){ opt.body=JSON.stringify(opt.body); opt.headers['Content-Type']='application/json'; }
+  const r = await fetch(path, opt); let j=null; try{ j=await r.json(); }catch(e){}
+  if(!r.ok) throw new Error((j&&j.error)||('HTTP '+r.status));
+  return j;
+}
+// 代理偶发掐 TLS,GET 退避重试几次
+async function apiGetRetry(path, n){ n=n||4; for(let i=0;i<n;i++){ try{ return await api(path); }catch(e){ if(i===n-1) throw e; await new Promise(s=>setTimeout(s,800)); } } }
+
+const fmt = (k,v)=> (k==='MIN_SCORE_THRESHOLD'||k==='MEMORY_SEMANTIC_THRESHOLD'||k==='MOOD_DRIFT_STEP'||k==='decay_arousal_max') ? (+v).toFixed(2) : (''+v);
+const stepFor = k => (k==='MIN_SCORE_THRESHOLD'||k==='MEMORY_SEMANTIC_THRESHOLD'||k==='decay_arousal_max')?0.01 : (k==='MOOD_DRIFT_STEP')?0.05 : (k==='PROACTIVE_GAP_HOURS')?0.5 : 1;
+
+function paintStatus(){
+  const T=DATA.toggles, items=[['feel','feel 体温'],['redact','露骨收敛'],['summary_quality','保质感摘要'],['proactive','主动浮现'],['mood_drift','情绪漂移'],['decay','自然衰减']];
+  document.getElementById('status-strip').innerHTML = items.map(([k,lab])=>`<div class="stat ${T[k]&&T[k].on?'live':''}"><span class="dot"></span>${lab}</div>`).join('');
+}
+function hintToggle(k){
+  const t=DATA.toggles[k]; if(!t) return '';
+  return `当前 <b style="color:var(--gold-light)">${t.on?'开':'关'}</b> · 默认 ${t.default?'开':'关'}`;
+}
+function setToggle(id,k){ const el=document.getElementById('tg-'+id); if(!el||!DATA.toggles[k]) return; el.checked=!!DATA.toggles[k].on; const h=document.getElementById('h-'+id); if(h) h.innerHTML=hintToggle(k); }
+
+function setSlider(key){
+  const el=document.querySelector(`input[data-num="${key}"]`); const n=DATA.numbers[key]; if(!el||!n) return;
+  el.min=(n.min!==undefined?n.min:0); el.max=(n.max!==undefined?n.max:100); el.step=stepFor(key); el.value=n.value;
+  const v=document.getElementById('val-'+key); if(v) v.textContent=fmt(key,n.value);
+  el.title = `当前 ${fmt(key,n.value)} · 默认 ${fmt(key,n.default)} · 范围 ${fmt(key,el.min)}–${fmt(key,el.max)}`;
+}
+
+function render(){
+  paintStatus();
+  ['feel','redact','summary_quality','summary_cap','proactive','decay','mood_drift','drift_skip_mw','persona','extract','l2_today','dream','dream_retrievable','image']
+    .forEach(k=>setToggle(k,k));
+  Object.keys(DATA.numbers).forEach(setSlider);
+  // counts
+  const c=DATA.counts||{};
+  document.getElementById('cnt-explicit').textContent = c.is_explicit ?? '–';
+  document.getElementById('cnt-persona').textContent = '('+(c.persona_pending ?? 0)+')';
+  document.getElementById('cnt-l5').textContent = '('+(c.l5_pending ?? 0)+')';
+  document.getElementById('cnt-decaybatch').textContent = '('+(c.decay_last_batch ?? 0)+')';
+  document.getElementById('chips-keys').innerHTML = (DATA.intimacy_keys||[]).map(k=>`<span class="chip">${k}</span>`).join('') || '<span class="chip" style="opacity:.5">未设暗号</span>';
+  // decay run 仅在衰减开时可用
+  document.getElementById('decay-run').disabled = !(DATA.toggles.decay && DATA.toggles.decay.on);
+}
+
+async function reload(){ DATA = await apiGetRetry('/api/console'); render(); }
+
+// ---- 写:开关 ----
+async function onToggle(id, k){
+  const el=document.getElementById('tg-'+id); const on=el.checked; const t=DATA.toggles[k];
+  try{
+    if(t.ep){
+      if(k==='decay'){ const th=decayThresholds(); await api(t.ep,{method:'POST',body:Object.assign({enabled:on},th)}); }
+      else await api(t.ep,{method:'POST',body:{enabled:on}});
+    } else if(t.key){ await api('/api/settings',{method:'PUT',body:{[t.key]:on}}); }
+    toast((t.label||k)+' → '+(on?'开':'关')); await reload();
+  }catch(e){ el.checked=!on; toast('失败:'+e.message); }
+}
+
+// ---- 写:数值 ----
+function decayThresholds(){ return {age_days:+gv('decay_age_days'),imp_max:+gv('decay_imp_max'),idle_days:+gv('decay_idle_days'),arousal_max:+gv('decay_arousal_max')}; }
+function gv(key){ const el=document.querySelector(`input[data-num="${key}"]`); return el?el.value:0; }
+async function onNumber(el){
+  const key=el.dataset.num, via=el.dataset.via, val=(stepFor(key)<1)?parseFloat(el.value):parseInt(el.value);
+  try{
+    if(via==='decay'){ await api('/api/memories/decay/toggle',{method:'POST',body:Object.assign({enabled:DATA.toggles.decay.on},decayThresholds())}); }
+    else { await api('/api/settings',{method:'PUT',body:{[key]:val}}); }
+    toast(key+' = '+fmt(key,val)); DATA.numbers[key].value=val;
+  }catch(e){ toast('失败:'+e.message); }
+}
+
+// ---- 预览抽屉 ----
+const PREV = {
+  feel:    {ep:'/api/feel/dry', body:{}},
+  summary: {ep:'/api/summary/dry', body:{}},
+  proactive:{ep:'/api/proactive/dry', body:{}},
+  l2:      {ep:'/api/l2/dry', body:{}},
+  dream:   {ep:'/api/dream/dry', body:{}},
+  decay:   {ep:'/api/memories/decay-dry', body:()=>decayThresholds()},
+};
+async function openPrev(name){
+  const dw=document.getElementById('dw-'+name); const body=dw.querySelector('.drawer-body');
+  const open=dw.classList.toggle('open'); if(!open) return;
+  if(name==='redact'){ return; }
+  const cfg=PREV[name]; if(!cfg) return;
+  body.textContent='载入中…';
+  try{
+    const b = typeof cfg.body==='function'?cfg.body():cfg.body;
+    const j = await api(cfg.ep,{method:'POST',body:b});
+    body.textContent = renderPrev(name,j);
+  }catch(e){ body.textContent='预览失败(代理可能掐了长连接,可重试):'+e.message; }
+}
+function renderPrev(name,j){
+  if(name==='decay'){ const list=(j.candidates||[]).map(c=>`#${c.id} imp${c.importance} ar${c.arousal} 龄${c.age_days}d ${c.is_explicit?'[露]':''} ${c.head}`).join('\n'); return `会归档 ${j.would_archive}/${j.active_total} (${j.pct}%)\n${j.criteria}\n\n${list}`; }
+  return JSON.stringify(j,null,2).slice(0,4000);
+}
+
+// ---- 解锁 sim ----
+async function runSim(){
+  const txt=document.getElementById('sim-input').value.trim(); if(!txt) return;
+  const body=document.getElementById('dw-redact-body'); body.textContent='判定中…';
+  try{ const j=await api('/api/debug/unlock-sim',{method:'POST',body:{message:txt}}); body.textContent=JSON.stringify(j,null,2); }
+  catch(e){ body.textContent='失败:'+e.message; }
+}
+
+// ---- 动作 ----
+async function decayRun(){
+  if(!(DATA.toggles.decay&&DATA.toggles.decay.on)){ toast('先打开「自然衰减」'); return; }
+  const th=decayThresholds();
+  if(!confirm(`按 年龄≥${th.age_days}d · 重要≤${th.imp_max} · 闲置≥${th.idle_days}d · 唤醒<${th.arousal_max} 归档?\n(可逆 · 可复活上批)`)) return;
+  try{ await api('/api/memories/decay/toggle',{method:'POST',body:Object.assign({enabled:true},th)});
+       const j=await api('/api/memories/decay/run',{method:'POST',body:Object.assign({dry_run:false},th)});
+       toast('已归档 '+(j.archived??0)+' 条'); await reload(); }
+  catch(e){ toast('失败:'+e.message); }
+}
+async function decayUndo(){
+  if(!confirm('复活最近一批衰减归档?')) return;
+  try{ const j=await api('/api/memories/decay/undo-last',{method:'POST'}); toast('已复活 '+(j.reactivated??0)+' 条'); await reload(); }
+  catch(e){ toast('失败:'+e.message); }
+}
+async function clearQueue(kind){
+  const ep = kind==='persona'?'/api/persona-suggestions/clear':'/api/l5-candidates/clear';
+  if(!confirm('软清所有待审'+(kind==='persona'?'人设建议':'L5候选')+'?\n(置 ignored · 不删数据 · 可查回)')) return;
+  try{ const j=await api(ep,{method:'POST'}); toast('已软清 '+(j.cleared??0)+' 条'); await reload(); }
+  catch(e){ toast('失败:'+e.message); }
+}
+const MAINT = {
+  'rejudge':{ep:'/api/memories/rejudge-explicit',body:{true_only:true},msg:'重判 is_explicit(后台)?'},
+  'backfill-explicit':{ep:'/api/memories/backfill-explicit',body:{},msg:'关键词回填 is_explicit(后台)?'},
+  'backfill-emotion':{ep:'/api/memories/backfill-emotion',body:{},msg:'回填情绪坐标(后台)?'},
+  'backfill-embeddings':{ep:'/api/admin/backfill-memory-embeddings',body:{},msg:'回填向量 embedding(后台)?'},
+  'cleanup':{ep:'/api/memories/cleanup-fragments',body:{days:30},msg:'硬删 30 天前 layer-1 归档碎片?(衰减归档项已豁免)'},
+};
+async function runMaint(kind){
+  const m=MAINT[kind]; if(!m) return; if(!confirm(m.msg)) return;
+  const st=document.getElementById('ms-'+kind); if(st) st.textContent='触发中…';
+  try{ const j=await api(m.ep,{method:'POST',body:m.body}); if(st) st.textContent=(j.status||j.message||'已触发'); toast((j.deleted!=null)?('删除 '+j.deleted):'已触发'); }
+  catch(e){ if(st) st.textContent='失败'; toast('失败:'+e.message); }
+}
+
+// ---- 绑定 ----
+function bind(){
+  const tgmap={mood_drift:'mood_drift',feel:'feel',drift_skip_mw:'drift_skip_mw',redact:'redact',extract:'extract',summary_quality:'summary_quality',summary_cap:'summary_cap',proactive:'proactive',decay:'decay',dream:'dream',dream_retrievable:'dream_retrievable',l2_today:'l2_today',persona:'persona',image:'image'};
+  Object.keys(tgmap).forEach(id=>{ const el=document.getElementById('tg-'+id); if(el) el.addEventListener('change',()=>onToggle(id,tgmap[id])); });
+  document.querySelectorAll('input[data-num]').forEach(el=>{
+    el.addEventListener('input',()=>{ const v=document.getElementById('val-'+el.dataset.num); if(v) v.textContent=fmt(el.dataset.num,el.value); });
+    el.addEventListener('change',()=>onNumber(el));
+  });
+  document.querySelectorAll('[data-prev]').forEach(b=>b.addEventListener('click',()=>openPrev(b.dataset.prev)));
+  document.querySelectorAll('[data-maint]').forEach(b=>b.addEventListener('click',()=>runMaint(b.dataset.maint)));
+  document.getElementById('sim-go').addEventListener('click',runSim);
+  document.getElementById('decay-run').addEventListener('click',decayRun);
+  document.getElementById('decay-undo').addEventListener('click',decayUndo);
+  document.getElementById('persona-clear').addEventListener('click',()=>clearQueue('persona'));
+  document.getElementById('l5-clear').addEventListener('click',()=>clearQueue('l5'));
+  document.getElementById('dream-run').addEventListener('click',async()=>{ if(!confirm('补做未覆盖的过去日(后台)?'))return; try{const j=await api('/api/dreams/run',{method:'POST',body:{dry_run:false}});toast(j.status||'已触发(后台)');}catch(e){toast('失败:'+e.message);} });
+  document.getElementById('l2-refresh').addEventListener('click',async()=>{ try{await api('/api/l2/refresh',{method:'POST',body:{}});toast('已刷新今日');}catch(e){toast('失败:'+e.message);} });
+  document.getElementById('fold-drift').addEventListener('click',function(){ this.classList.toggle('open'); document.getElementById('foldb-drift').classList.toggle('open'); });
+  document.getElementById('fold-maint').addEventListener('click',function(){ this.classList.toggle('open'); document.getElementById('foldb-maint').classList.toggle('open'); });
+}
+
+(async function(){
+  if(!KEY){ document.getElementById('status-strip').innerHTML='<div class="stat">缺 gateway_key,请从面板进入</div>'; return; }
+  bind();
+  try{ await reload(); }
+  catch(e){ document.getElementById('status-strip').innerHTML='<div class="stat">加载失败:'+e.message+'</div>'; }
+})();
+</script>
+</body>
+</html>

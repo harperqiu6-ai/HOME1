@@ -1,0 +1,60 @@
+/* ============================================================
+   共享主题(金色塔罗) — 全站套娃用
+   设计令牌(CSS 变量)+ 主页塔罗组件。功能页只需覆盖 dashboard.css 的语义变量即可换肤。
+   字体:Cormorant Garamond 已自托管(fonts.css);中文衬线走系统 Songti/SimSun 兜底(Noto Serif SC 太大未打包)。
+   ============================================================ */
+:root{
+  --bg-deep:#080c18; --bg-card:#0f1525; --bg-card-hover:#151d33;
+  --gold:#c5a55a; --gold-light:#e8d5a3; --gold-dim:rgba(197,165,90,.25);
+  --t-primary:#d4cbb8; --t-secondary:#7a8194; --t-dim:#4a5068;
+  --warn:#c87878;
+  --serif:'Cormorant Garamond','Noto Serif SC','Source Han Serif SC','Songti SC','SimSun','Georgia',serif;
+  --sans:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;
+}
+
+/* ---- 主页 landing(嵌在 dashboard #section-home 内)---- */
+#section-home{position:relative;}
+.home-wrap{max-width:760px;margin:0 auto;padding:8px 8px 40px;position:relative;}
+.home-corner{position:absolute;width:46px;height:46px;pointer-events:none;opacity:.16;}
+.home-corner.tl{top:-6px;left:-6px;} .home-corner.tr{top:-6px;right:-6px;transform:scaleX(-1);}
+.home-corner.bl{bottom:-6px;left:-6px;transform:scaleY(-1);} .home-corner.br{bottom:-6px;right:-6px;transform:scale(-1);}
+
+.home-header{padding:30px 0 10px;text-align:center;}
+.home-title{font-family:var(--serif);font-size:30px;font-weight:300;letter-spacing:8px;color:var(--gold-light);margin-bottom:4px;}
+.home-sub{font-family:var(--serif);font-size:13px;letter-spacing:5px;color:var(--t-dim);}
+.home-days{margin-top:12px;font-family:var(--serif);font-size:14px;color:var(--gold);letter-spacing:2px;}
+.home-days b{font-size:22px;font-weight:500;}
+
+.heartbeat-wrap{margin:14px 0;border-radius:4px;overflow:hidden;opacity:.78;}
+.heartbeat-wrap canvas{width:100%;height:54px;display:block;}
+.heartbeat-mood{text-align:center;font-family:var(--serif);font-size:12px;letter-spacing:3px;color:var(--t-secondary);margin:-4px 0 8px;}
+.heartbeat-mood b{color:var(--gold-light);}
+
+.today-wave{position:relative;padding:26px 30px;margin:8px 0 38px;border:.5px solid var(--gold-dim);border-radius:2px;background:linear-gradient(135deg,rgba(15,21,37,.8),rgba(8,12,24,.9));}
+.today-wave::before{content:'';position:absolute;inset:5px;border:.5px solid rgba(197,165,90,.12);border-radius:2px;pointer-events:none;}
+.wave-header{display:flex;align-items:baseline;gap:12px;margin-bottom:6px;}
+.wave-label{font-family:var(--serif);font-size:15px;letter-spacing:5px;color:var(--gold);}
+.wave-label-cn{font-size:11px;color:var(--t-dim);letter-spacing:2px;}
+.wave-date{display:inline-block;margin:10px 0 16px;padding:3px 14px;border:.5px solid var(--t-dim);border-radius:20px;font-size:11px;color:var(--t-secondary);letter-spacing:1px;}
+.wave-date::before{content:'●';font-size:5px;margin-right:8px;vertical-align:1px;color:var(--gold);}
+.wave-quote{font-family:var(--serif);font-size:19px;font-weight:300;line-height:1.9;color:var(--t-primary);font-style:italic;max-width:560px;}
+.wave-author{margin-top:16px;font-size:12px;color:var(--t-dim);letter-spacing:1px;}
+
+.rooms-label{font-family:var(--serif);font-size:12px;letter-spacing:4px;color:var(--t-dim);text-align:center;margin-bottom:18px;}
+.rooms{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:8px;}
+.room{position:relative;height:184px;border:.5px solid var(--gold-dim);border-radius:3px;background:var(--bg-card);cursor:pointer;overflow:hidden;transition:all .4s ease;display:flex;flex-direction:column;align-items:center;justify-content:center;user-select:none;}
+.room::before{content:'';position:absolute;inset:6px;border:.5px solid rgba(197,165,90,.12);border-radius:2px;pointer-events:none;transition:border-color .4s ease;}
+.room:hover{border-color:rgba(197,165,90,.5);background:var(--bg-card-hover);transform:translateY(-5px);box-shadow:0 12px 36px rgba(0,0,0,.4);}
+.room:hover::before{border-color:rgba(197,165,90,.3);}
+.room:hover .room-icon{color:var(--gold);transform:scale(1.08);}
+.room:hover .room-title{color:var(--gold-light);}
+.room-numeral{position:absolute;top:13px;left:50%;transform:translateX(-50%);font-family:var(--serif);font-size:12px;color:var(--t-dim);letter-spacing:2px;}
+.room-icon{font-size:30px;color:var(--t-dim);margin-bottom:14px;transition:all .4s ease;}
+.room-title{font-family:var(--serif);font-size:19px;font-weight:400;color:var(--t-secondary);letter-spacing:5px;transition:color .4s ease;}
+.room-en{font-family:var(--serif);font-size:11px;color:var(--t-dim);letter-spacing:3px;margin-top:5px;font-weight:300;}
+.room-count{position:absolute;bottom:14px;font-family:var(--serif);font-size:11px;color:var(--t-dim);letter-spacing:1px;}
+
+.home-foot{text-align:center;padding:34px 0 10px;border-top:.5px solid rgba(197,165,90,.08);margin-top:30px;}
+.home-foot span{font-family:var(--serif);font-size:12px;color:var(--t-dim);letter-spacing:3px;}
+
+@media(max-width:680px){.rooms{grid-template-columns:repeat(2,1fr);} .home-title{font-size:22px;letter-spacing:4px;} .wave-quote{font-size:16px;}}
