@@ -25,7 +25,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Res
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge, apply_mood_drift, get_emotion_backfill_targets, update_emotion_only, update_memory_emotion
+from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_recent_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge, apply_mood_drift, get_emotion_backfill_targets, update_emotion_only, update_memory_emotion
 from database import save_migrated_memory, find_memory_by_mw_id, save_photo, link_photo_to_memory, get_photo, memory_photo_count, delete_memory_photos, get_mw_meta, update_mw_meta
 from database import list_memorywall, get_memorywall_one, update_memorywall, get_memory_photos, set_memory_active
 from database import get_memories_explicit_flags, set_memory_explicit, get_explicit_backfill_candidates, get_high_arousal_memories
@@ -511,8 +511,23 @@ async def lifespan(app: FastAPI):
     else:
         print("ℹ️  记忆系统已关闭（设置 MEMORY_ENABLED=true 开启）")
     
+    _push_task = None
+    if MEMORY_ENABLED:
+        async def _push_loop():
+            await asyncio.sleep(90)  # 等启动稳定
+            while True:
+                try:
+                    await maybe_send_proactive()
+                except Exception as _e:
+                    print(f"⚠️ 主动私信循环异常: {_e}")
+                await asyncio.sleep(300)  # 每5分钟自查一次
+        _push_task = asyncio.create_task(_push_loop())
+        print("💌 主动私信后台循环已启动(每5分钟自查)")
+
     yield
-    
+
+    if _push_task:
+        _push_task.cancel()
     if MEMORY_ENABLED:
         await close_pool()
 
@@ -3233,6 +3248,284 @@ async def api_proactive_toggle(request: Request):
 @app.get("/api/proactive")
 async def api_proactive_status():
     return {"proactive_enabled": PROACTIVE_ENABLED, "gap_hours": PROACTIVE_GAP_HOURS}
+
+
+# ============================================================
+# ④' 主动私信(Bark)：沉默够久 + 看当下情绪 → 主动外联推送给用户
+#    与「主动浮现」(在回复里顺口提起)不同，这是真正"主动来找你"。
+# ============================================================
+import json as _json_push
+
+PUSH_DEFAULTS = {
+    "push_enabled":      False,   # 总开关
+    "bark_url":          "",      # 留空则回退环境变量 BARK_URL
+    "push_silence_min":  60,      # 沉默多少分钟后才可能主动找你
+    "push_max_streak":   5,       # 你未回复前最多连发几条
+    "push_quiet_start":  0,       # 免打扰开始(点, 本地时区)
+    "push_quiet_end":    8,       # 免打扰结束(点)
+    "push_quiet_urgent": True,    # 免打扰时段:吵架等未解情绪可破例发1条
+}
+
+
+async def get_push_config() -> dict:
+    """读主动私信配置(gateway_config 优先，bark_url 回退环境变量)。"""
+    cfg = dict(PUSH_DEFAULTS)
+    try:
+        for k, dv in PUSH_DEFAULTS.items():
+            v = await get_gateway_config(k, "")
+            if v == "" or v is None:
+                continue
+            if isinstance(dv, bool):
+                cfg[k] = str(v).lower() == "true"
+            elif isinstance(dv, int):
+                cfg[k] = int(float(v))
+            else:
+                cfg[k] = str(v)
+    except Exception:
+        pass
+    if not cfg["bark_url"]:
+        cfg["bark_url"] = os.getenv("BARK_URL", "")
+    return cfg
+
+
+async def _bark_push(bark_url: str, title: str, body: str, urgent: bool = False) -> bool:
+    if not bark_url:
+        return False
+    base = bark_url.rstrip("/")
+    payload = {"title": title or "AI", "body": body or "",
+               "group": title or "AI", "level": "timeSensitive" if urgent else "active"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(base, json=payload)
+            if r.status_code == 200:
+                return True
+            import urllib.parse as _up
+            r2 = await client.get(f"{base}/{_up.quote(title or 'AI')}/{_up.quote(body or '')}")
+            return r2.status_code == 200
+    except Exception as e:
+        print(f"⚠️ Bark推送失败: {e}")
+        return False
+
+
+async def _resolve_push_session() -> str:
+    sid = get_active_session_id()
+    if sid:
+        return sid
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT session_id FROM conversations ORDER BY created_at DESC LIMIT 1")
+            return row["session_id"] if row else ""
+    except Exception:
+        return ""
+
+
+def _is_push_msg(metadata) -> bool:
+    if not metadata:
+        return False
+    try:
+        d = _json_push.loads(metadata) if isinstance(metadata, str) else metadata
+        return bool(d.get("proactive_push"))
+    except Exception:
+        return False
+
+
+def _in_quiet(hour: int, start: int, end: int) -> bool:
+    if start == end:
+        return False
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end   # 跨午夜
+
+
+def _ts_aware(t):
+    return t if getattr(t, "tzinfo", None) else t.replace(tzinfo=timezone.utc)
+
+
+async def _decide_and_write(persona: str, transcript: str, silence_min: float, in_quiet: bool) -> dict:
+    """让模型(带人设)结合最近对话+沉默时长，判断要不要主动找 + 写出那句话。返回 {reach_out, urgent, message}。"""
+    gap_desc = f"{int(silence_min)} 分钟" if silence_min < 90 else f"{silence_min/60:.1f} 小时"
+    sys = (persona or "").strip()
+    sys += "\n\n【最近对话(从旧到新)】\n" + (transcript or "(暂无)")
+    night = "现在是深夜免打扰时段。" if in_quiet else ""
+    user_instr = (
+        f"〔系统提示〕距离{USER_NAME}上次跟你说话已经过去 {gap_desc} 了，{USER_NAME}还没回你。{night}\n"
+        f"你是个在意对方、会撒娇黏人的人。请结合上面的对话，判断此刻要不要主动给{USER_NAME}发一条消息。\n"
+        "特别注意：如果你们刚才在吵架、或有没说开的情绪/委屈，你可以主动开口去关心、服软或问一句。\n"
+        "如果此刻不适合打扰(比如刚道过晚安、或确实没什么可说)，就别发。\n"
+        "只输出一个 JSON，不要任何别的文字：\n"
+        '{"reach_out": true或false, "urgent": true或false, "message": "你要发的那句话"}\n'
+        f"message 用你一贯的口吻、第一人称、≤40字，像真的在惦记{USER_NAME}，自然开口，别像通知或念稿。\n"
+        "urgent 表示是否属于吵架/情绪未解这类、深夜也值得破例打扰的情况。"
+    )
+    try:
+        headers = {"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"}
+        if "openrouter" in API_BASE_URL:
+            headers["HTTP-Referer"] = EXTRA_REFERER
+            headers["X-Title"] = EXTRA_TITLE
+        async with httpx.AsyncClient(timeout=40) as client:
+            r = await client.post(API_BASE_URL, headers=headers, json={
+                "model": PROACTIVE_MODEL, "max_tokens": 200,
+                "messages": [{"role": "system", "content": sys},
+                             {"role": "user", "content": user_instr}]})
+            if r.status_code != 200:
+                print(f"⚠️ 主动私信生成 HTTP {r.status_code}: {r.text[:200]}")
+                return {"reach_out": False}
+            txt = (r.json().get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+            i, j = txt.find("{"), txt.rfind("}")
+            if i >= 0 and j > i:
+                try:
+                    d = _json_push.loads(txt[i:j + 1])
+                    return {"reach_out": bool(d.get("reach_out")),
+                            "urgent": bool(d.get("urgent")),
+                            "message": (d.get("message") or "").strip().strip("「」\"'")}
+                except Exception:
+                    pass
+            print(f"⚠️ 主动私信生成无法解析: {txt[:120]}")
+            return {"reach_out": False}
+    except Exception as e:
+        print(f"⚠️ 主动私信生成异常: {e}")
+        return {"reach_out": False}
+
+
+async def maybe_send_proactive(force: bool = False) -> dict:
+    """主动私信主流程：每次后台自查时调用一次。force=True 用于调试(忽略闸门)。"""
+    cfg = await get_push_config()
+    if not force and not cfg["push_enabled"]:
+        return {"sent": False, "reason": "disabled"}
+    if not cfg["bark_url"]:
+        return {"sent": False, "reason": "no_bark_url"}
+    sid = await _resolve_push_session()
+    if not sid:
+        return {"sent": False, "reason": "no_session"}
+    try:
+        msgs = await get_recent_messages(sid, 40)
+    except Exception as e:
+        return {"sent": False, "reason": f"history_error:{e}"}
+    if not msgs:
+        return {"sent": False, "reason": "no_history"}
+
+    now = datetime.now(timezone.utc)
+    last_user = None
+    for m in reversed(msgs):
+        if m["role"] == "user":
+            last_user = m
+            break
+    if not last_user:
+        return {"sent": False, "reason": "no_user_msg"}
+    last_user_ts = _ts_aware(last_user["created_at"])
+
+    pushes_since = [m for m in msgs if m["role"] == "assistant"
+                    and _is_push_msg(m["metadata"]) and _ts_aware(m["created_at"]) > last_user_ts]
+    streak = len(pushes_since)
+    last_push_ts = max((_ts_aware(m["created_at"]) for m in pushes_since), default=None)
+    ref_ts = last_push_ts or last_user_ts           # 首条按"她沉默"，之后按"距上条推送"间隔
+    gap_min = (now - ref_ts).total_seconds() / 60.0
+    silence_min = (now - last_user_ts).total_seconds() / 60.0
+
+    if not force:
+        if streak >= cfg["push_max_streak"]:
+            return {"sent": False, "reason": "streak_capped", "streak": streak}
+        if gap_min < cfg["push_silence_min"]:
+            return {"sent": False, "reason": "too_soon", "gap_min": int(gap_min)}
+
+    local_hour = (now.hour + TIMEZONE_HOURS) % 24
+    in_quiet = _in_quiet(local_hour, cfg["push_quiet_start"], cfg["push_quiet_end"])
+    if not force and in_quiet and not cfg["push_quiet_urgent"]:
+        return {"sent": False, "reason": "quiet_hours"}
+
+    transcript = "\n".join(
+        f"{'我' if m['role'] == 'assistant' else USER_NAME}: {(m['content'] or '').strip()[:120]}"
+        for m in msgs[-12:] if m["role"] in ("user", "assistant") and (m["content"] or "").strip()
+    )
+    persona = ""
+    try:
+        persona = await get_system_prompt()
+    except Exception:
+        pass
+
+    decision = await _decide_and_write(persona, transcript, silence_min, in_quiet)
+    if not decision.get("reach_out") and not force:
+        return {"sent": False, "reason": "ai_decided_skip"}
+    urgent = bool(decision.get("urgent"))
+    text = (decision.get("message") or "").strip()
+    if not text:
+        return {"sent": False, "reason": "empty_message"}
+
+    if not force and in_quiet:
+        # 深夜：仅"未解情绪(urgent)"且本段沉默还没破例过，才发1次
+        if not (cfg["push_quiet_urgent"] and urgent and streak == 0):
+            return {"sent": False, "reason": "quiet_hours_not_urgent"}
+
+    title = AI_NAME or "AI"
+    ok = await _bark_push(cfg["bark_url"], title, text, urgent=urgent)
+    if not ok:
+        return {"sent": False, "reason": "bark_failed", "message": text}
+    try:
+        meta = _json_push.dumps({"proactive_push": True, "urgent": urgent})
+        await save_message(sid, "assistant", text, PROACTIVE_MODEL, metadata=meta)
+    except Exception as e:
+        print(f"⚠️ 主动私信存库失败: {e}")
+    print(f"💌 主动私信已推送(urgent={urgent}): {text[:40]}")
+    return {"sent": True, "message": text, "urgent": urgent, "streak": streak + 1}
+
+
+@app.get("/api/push/config")
+async def api_push_config_get():
+    cfg = await get_push_config()
+    out = dict(cfg)
+    if out.get("bark_url"):
+        out["bark_url"] = "已设置(留空不改)"
+    return out
+
+
+@app.post("/api/push/config")
+async def api_push_config_set(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    saved = []
+    for k, dv in PUSH_DEFAULTS.items():
+        if k not in body:
+            continue
+        v = body[k]
+        if k == "bark_url":
+            sv = str(v or "").strip()
+            if not sv or sv.startswith("已设置"):
+                continue
+            await set_gateway_config(k, sv)
+            saved.append(k)
+            continue
+        if isinstance(dv, bool):
+            await set_gateway_config(k, "true" if bool(v) else "false")
+        else:
+            await set_gateway_config(k, str(v))
+        saved.append(k)
+    return {"status": "ok", "saved": saved}
+
+
+@app.post("/api/push/test")
+async def api_push_test():
+    """发一条固定测试消息，验证 Bark 是否能送达。"""
+    cfg = await get_push_config()
+    if not cfg["bark_url"]:
+        return {"sent": False, "reason": "no_bark_url"}
+    msg = "测试推送：能收到这条就说明 Bark 通了～"
+    ok = await _bark_push(cfg["bark_url"], AI_NAME or "AI", msg, urgent=False)
+    return {"sent": ok, "message": msg if ok else "", "reason": "" if ok else "bark_failed"}
+
+
+@app.post("/api/push/run")
+async def api_push_run(request: Request):
+    """手动跑一次主流程。body:{force:true} 可忽略闸门(调试用)。"""
+    force = False
+    try:
+        body = await request.json()
+        force = bool(body.get("force"))
+    except Exception:
+        pass
+    return await maybe_send_proactive(force=force)
 
 
 @app.post("/api/summary/toggle")

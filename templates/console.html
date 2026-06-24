@@ -180,6 +180,18 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border:none;border-ra
       <div class="row"><div class="label">浮现间隔(小时)</div><div class="ctl sld"><input type="range" data-num="PROACTIVE_GAP_HOURS" data-via="settings"><span class="val" id="val-PROACTIVE_GAP_HOURS"></span></div></div>
     </div>
 
+    <!-- PUSH 主动私信 -->
+    <div class="panel wide">
+      <div class="panel-h"><span class="en">PUSH</span><span class="cn">主动私信 · 沉默时来找你(Bark)</span><i class="ti ti-bell-ringing"></i></div>
+      <div class="row"><div><div class="label">主动私信总开关</div><div class="hint">你沉默够久后，AI 会按当下气氛主动 Bark 推送给你</div></div><div class="ctl"><label class="tg"><input type="checkbox" id="pp-enabled"><span class="track"></span><span class="knob"></span></label></div></div>
+      <div class="row"><div class="label">Bark 推送地址</div><div class="ctl"><input id="pp-bark" type="text" placeholder="https://api.day.app/你的key/" style="width:280px"></div></div>
+      <div class="row"><div class="label">沉默多久来找你(分钟)</div><div class="ctl"><input id="pp-silence" type="number" min="5" max="1440" style="width:90px"></div></div>
+      <div class="row"><div class="label">你没回前最多发几条</div><div class="ctl"><input id="pp-streak" type="number" min="1" max="20" style="width:90px"></div></div>
+      <div class="row"><div class="label">免打扰时段(点→点)</div><div class="ctl"><input id="pp-qstart" type="number" min="0" max="23" style="width:64px"> → <input id="pp-qend" type="number" min="0" max="23" style="width:64px"></div></div>
+      <div class="row"><div><div class="label">深夜吵架可破例发1次</div><div class="hint">免打扰时段里，若情绪未解(吵架等)允许破例发一条</div></div><div class="ctl"><label class="tg"><input type="checkbox" id="pp-urgent"><span class="track"></span><span class="knob"></span></label></div></div>
+      <div class="row"><div class="hint" id="pp-msg">　</div><div class="ctl"><button class="btn sm" id="pp-save">保存</button><button class="btn sm" id="pp-test">立即测试推送</button></div></div>
+    </div>
+
     <!-- DECAY -->
     <div class="panel wide">
       <div class="panel-h"><span class="en">DECAY</span><span class="cn">精炼 · 遗忘(归档≠删除·可逆)</span><i class="ti ti-hourglass-low"></i></div>
@@ -412,6 +424,48 @@ function bind(){
   try{ await reload(); }
   catch(e){ document.getElementById('status-strip').innerHTML='<div class="stat">加载失败:'+e.message+'</div>'; }
 })();
+
+// ---- 主动私信(PUSH) ----
+async function ppLoad(){
+  try{
+    const c = await api('/api/push/config');
+    document.getElementById('pp-enabled').checked = !!c.push_enabled;
+    const barkEl = document.getElementById('pp-bark');
+    if(c.bark_url && String(c.bark_url).indexOf('已设置')===0){ barkEl.value=''; barkEl.placeholder='已设置(留空=不改)'; }
+    else { barkEl.value = c.bark_url||''; }
+    document.getElementById('pp-silence').value = c.push_silence_min;
+    document.getElementById('pp-streak').value  = c.push_max_streak;
+    document.getElementById('pp-qstart').value  = c.push_quiet_start;
+    document.getElementById('pp-qend').value    = c.push_quiet_end;
+    document.getElementById('pp-urgent').checked = !!c.push_quiet_urgent;
+  }catch(e){}
+}
+async function ppSave(){
+  const body = {
+    push_enabled:     document.getElementById('pp-enabled').checked,
+    push_silence_min: parseInt(document.getElementById('pp-silence').value)||60,
+    push_max_streak:  parseInt(document.getElementById('pp-streak').value)||5,
+    push_quiet_start: parseInt(document.getElementById('pp-qstart').value)||0,
+    push_quiet_end:   parseInt(document.getElementById('pp-qend').value)||8,
+    push_quiet_urgent: document.getElementById('pp-urgent').checked,
+  };
+  const bark = document.getElementById('pp-bark').value.trim();
+  if(bark) body.bark_url = bark;
+  try{ await api('/api/push/config',{method:'POST',body:body}); toast('已保存'); ppLoad(); }
+  catch(e){ toast('保存失败:'+e.message); }
+}
+async function ppTest(){
+  const el=document.getElementById('pp-msg'); el.textContent='测试中…';
+  try{ const j=await api('/api/push/test',{method:'POST',body:{}});
+    el.textContent = j.sent ? '已推送，看你手机~' : ('未发送: '+(j.reason||''));
+    toast(j.sent?'已推送':'未发送:'+(j.reason||''));
+  }catch(e){ el.textContent='失败:'+e.message; toast('失败'); }
+}
+if(KEY){
+  document.getElementById('pp-save').addEventListener('click', ppSave);
+  document.getElementById('pp-test').addEventListener('click', ppTest);
+  ppLoad();
+}
 </script>
 </body>
 </html>
