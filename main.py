@@ -3528,7 +3528,8 @@ async def maybe_send_proactive(force: bool = False) -> dict:
     except Exception:
         pass
 
-    decision = await _decide_and_write(persona, transcript, silence_min, in_quiet)
+    _disp_silence = max(silence_min, cfg["push_silence_min"]) if force else silence_min
+    decision = await _decide_and_write(persona, transcript, _disp_silence, in_quiet)
     if not decision.get("reach_out") and not force:
         return {"sent": False, "reason": "ai_decided_skip"}
     urgent = bool(decision.get("urgent"))

@@ -191,7 +191,7 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border:none;border-ra
       <div class="row"><div class="label">你没回前最多发几条</div><div class="ctl"><input id="pp-streak" type="number" min="1" max="20" style="width:90px"></div></div>
       <div class="row"><div class="label">免打扰时段(点→点)</div><div class="ctl"><input id="pp-qstart" type="number" min="0" max="23" style="width:64px"> → <input id="pp-qend" type="number" min="0" max="23" style="width:64px"></div></div>
       <div class="row"><div><div class="label">深夜吵架可破例发1次</div><div class="hint">免打扰时段里，若情绪未解(吵架等)允许破例发一条</div></div><div class="ctl"><label class="tg"><input type="checkbox" id="pp-urgent"><span class="track"></span><span class="knob"></span></label></div></div>
-      <div class="row"><div class="hint" id="pp-msg">　</div><div class="ctl"><button class="btn sm" id="pp-save">保存</button><button class="btn sm" id="pp-test">立即测试推送</button></div></div>
+      <div class="row"><div class="hint" id="pp-msg">　</div><div class="ctl"><button class="btn sm" id="pp-save">保存</button><button class="btn sm" id="pp-test">立即测试推送</button><button class="btn sm" id="pp-real">试发一条真的</button></div></div>
     </div>
 
     <!-- DECAY -->
@@ -465,9 +465,18 @@ async function ppTest(){
     toast(j.sent?'已推送':'未发送:'+(j.reason||''));
   }catch(e){ el.textContent='失败:'+e.message; toast('失败'); }
 }
+async function ppReal(){
+  const el=document.getElementById('pp-msg'); el.textContent='它在想说什么…(生成中,稍慢)';
+  try{
+    const j=await api('/api/push/run',{method:'POST',body:{force:true}});
+    if(j.sent){ el.textContent='💌 它发了：'+(j.message||'')+'（看手机）'; toast('已发，看手机'); }
+    else { el.textContent='没发出：'+(j.reason||'')+(j.message?('｜生成了：'+j.message):''); toast('未发送:'+(j.reason||'')); }
+  }catch(e){ el.textContent='失败:'+e.message; }
+}
 if(KEY){
   document.getElementById('pp-save').addEventListener('click', ppSave);
   document.getElementById('pp-test').addEventListener('click', ppTest);
+  const _pr=document.getElementById('pp-real'); if(_pr) _pr.addEventListener('click', ppReal);
   ppLoad();
 }
 
