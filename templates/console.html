@@ -174,6 +174,7 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border:none;border-ra
       <div class="panel-h"><span class="en">SURFACING</span><span class="cn">叙事 · 浮现</span><i class="ti ti-quote"></i></div>
       <div class="row"><div><div class="label">保质感摘要</div><div class="hint" id="h-summary_quality"></div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tg-summary_quality"><span class="track"></span><span class="knob"></span></label><button class="btn sm" data-prev="summary">预览▸</button></div></div>
       <div class="row"><div><div class="label">滚动摘要封顶 <span class="hint">早期小结+最近N段·不再无限涨</span></div><div class="hint" id="h-summary_cap"></div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tg-summary_cap"><span class="track"></span><span class="knob"></span></label></div></div>
+      <div class="row"><div class="hint" id="cap-msg" style="white-space:normal">只压缩对话摘要、保留定义性大事，<b>不动记忆库</b>。先「预览」看省多少，满意再「立即封顶」。</div><div class="ctl"><button class="btn sm" id="cap-preview">预览封顶</button><button class="btn sm" id="cap-apply">立即封顶</button></div></div>
       <div class="drawer" id="dw-summary"><div class="drawer-body">点「预览」看新摘要样例(只读)…</div></div>
       <div class="row"><div><div class="label">主动浮现</div><div class="hint" id="h-proactive"></div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tg-proactive"><span class="track"></span><span class="knob"></span></label><button class="btn sm" data-prev="proactive">预览▸</button></div></div>
       <div class="drawer" id="dw-proactive"><div class="drawer-body">点「预览」看开场白样例(6 次 haiku,稍慢)…</div></div>
@@ -465,6 +466,31 @@ if(KEY){
   document.getElementById('pp-save').addEventListener('click', ppSave);
   document.getElementById('pp-test').addEventListener('click', ppTest);
   ppLoad();
+}
+
+// ---- 滚动摘要封顶(立即/预览) ----
+async function capPreview(){
+  const el=document.getElementById('cap-msg'); el.textContent='预览中…';
+  try{
+    const j=await api('/api/summary/cap-preview');
+    if(j.note){ el.textContent=j.note; return; }
+    el.innerHTML='卷前≈<b>'+j.tokens_before+'</b> → 卷后≈<b>'+j.tokens_after+'</b> token（省≈<b>'+j.tokens_saved+'</b>）｜卷 '+j.old_rolled+' 段、留最近 '+j.recent_kept+' 段。<br>早期小结样例：'+((j.early_summary_sample||'').slice(0,140))+'…';
+  }catch(e){ el.textContent='预览失败:'+e.message; }
+}
+async function capApply(){
+  if(!confirm('立即把更早的对话摘要卷成「早期小结」？\n只压缩对话摘要、保留定义性大事，不动你的记忆库。')) return;
+  const el=document.getElementById('cap-msg'); el.textContent='封顶中…';
+  try{
+    const j=await api('/api/summary/cap-apply',{method:'POST',body:{dry_run:false}});
+    if(j.error){ el.textContent='失败:'+j.error; return; }
+    if(j.reason){ el.textContent=j.reason; return; }
+    el.innerHTML='✅ 已封顶：卷了 <b>'+(j.rolled||0)+'</b> 段→早期小结('+(j.early_chars||0)+'字)，保留最近 '+(j.parts_after||0)+' 段，里程碑候选 '+(j.candidates||0)+' 条。可去 OpenRouter 看 token 是否下降。';
+    toast('已封顶');
+  }catch(e){ el.textContent='失败:'+e.message; }
+}
+if(KEY){
+  const _cp=document.getElementById('cap-preview'); if(_cp) _cp.addEventListener('click',capPreview);
+  const _ca=document.getElementById('cap-apply'); if(_ca) _ca.addEventListener('click',capApply);
 }
 </script>
 </body>
