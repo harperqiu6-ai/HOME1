@@ -605,6 +605,18 @@ MEMORY_GUIDANCE = """# 如何使用「检索到的记忆」（这是给你的用
 MW_FULLBODY_MIN_SCORE = float(os.getenv("MW_FULLBODY_MIN_SCORE", "0.65"))
 MW_FULLBODY_MIN_MARGIN = float(os.getenv("MW_FULLBODY_MIN_MARGIN", "0.10"))
 
+# 单条「检索注入」记忆的长度上限（省 token）：超过则截断+省略号。
+# 防止做梦日记/看图描述/迁移来的长记忆整段塞进每一轮上下文。0=不限。回忆墙全文(最强那条)豁免。
+MEMORY_INJECT_CHAR_CAP = int(os.getenv("MEMORY_INJECT_CHAR_CAP", "160"))
+
+
+def _cap_mem(text: str) -> str:
+    """把单条注入记忆截到 MEMORY_INJECT_CHAR_CAP 字以内（保留语义足够的开头）。"""
+    t = (text or "").strip()
+    if MEMORY_INJECT_CHAR_CAP > 0 and len(t) > MEMORY_INJECT_CHAR_CAP:
+        return t[:MEMORY_INJECT_CHAR_CAP].rstrip() + "…"
+    return t
+
 
 async def build_system_prompt_with_memories(user_message: str, drift: bool = True) -> str:
     """
@@ -664,7 +676,7 @@ async def build_system_prompt_with_memories(user_message: str, drift: bool = Tru
             _c = (mem.get('content') or '').strip()
             if not _c:
                 continue  # 空 content 兜底：跳过（双保险，绝不让空行崩注入）
-            memory_lines.append(f"- {date_str}{_c}")
+            memory_lines.append(f"- {date_str}{_cap_mem(_c)}")
         memory_text = "\n".join(memory_lines)
         if _explicit_hits:
             memory_text = (memory_text + "\n\n" if memory_text else "") + EXPLICIT_REDACT_NOTE
@@ -2096,18 +2108,19 @@ async def build_memory_text(user_message: str, drift: bool = True) -> str:
                     mw = json.loads(mw)
                 except Exception:
                     mw = None
-            if mw:  # 回忆墙条目：默认摘要；仅明显最强的那条给全文
+            if mw:  # 回忆墙条目：默认摘要；仅明显最强的那条给全文(豁免长度上限)
                 _t = (mw.get("title") or "").strip()
                 if idx == 0 and top_full_eligible:
                     _txt = (f"【回忆 {_t}】" if _t else "") + (mw.get("body") or "").strip()
                 else:
-                    _txt = (f"【回忆摘要 {_t}】" if _t else "") + ((mw.get("summary") or "").strip() or (mw.get("body") or "").strip())
+                    _body = (mw.get("summary") or "").strip() or (mw.get("body") or "").strip()
+                    _txt = (f"【回忆摘要 {_t}】" if _t else "") + _cap_mem(_body)
                 memory_lines.append(f"- {date_str}{_txt}{_feel}")
-            else:  # 普通事实记忆：本就短，原样
+            else:  # 普通事实记忆：通常短；过长的(梦/看图/迁移)截断省 token
                 _c = (mem.get('content') or '').strip()
                 if not _c:
                     continue  # 空 content 兜底：跳过（检索已排除，这里双保险，绝不让空行崩注入）
-                memory_lines.append(f"- {date_str}{_c}{_feel}")
+                memory_lines.append(f"- {date_str}{_cap_mem(_c)}{_feel}")
 
         print(f"📚 注入 {len(memories)} 条记忆（全文资格={top_full_eligible}, top={top_score:.3f}/2nd={second_score:.3f}）" + (f" +收敛{len(_explicit_hits)}条露骨" if _explicit_hits else ""))
         header = "【从过往对话中检索到的相关记忆】（这是你记得的背景，自然融进回应，别整段复述、别像念稿）\n"
