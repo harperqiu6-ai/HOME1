@@ -606,46 +606,62 @@ MEMORY_GUIDANCE = """# 如何使用「检索到的记忆」（这是给你的用
 MW_FULLBODY_MIN_SCORE = float(os.getenv("MW_FULLBODY_MIN_SCORE", "0.65"))
 MW_FULLBODY_MIN_MARGIN = float(os.getenv("MW_FULLBODY_MIN_MARGIN", "0.10"))
 
-# 单条「检索注入」记忆的长度上限（省 token）：超过则只取**与本轮查询最相关**的片段。
+# 单条「检索注入」记忆的长度上限（省 token）：超过则围绕命中关键词取**多个相关片段**拼接。
 # 防止做梦日记/看图描述/迁移来的长记忆(一天可能 800+字)整段塞进每一轮上下文。0=不限。回忆墙全文(最强那条)豁免。
-MEMORY_INJECT_CHAR_CAP = int(os.getenv("MEMORY_INJECT_CHAR_CAP", "200"))
+MEMORY_INJECT_CHAR_CAP = int(os.getenv("MEMORY_INJECT_CHAR_CAP", "260"))
+
+
+def _find_all(hay: str, needle: str) -> list:
+    out, start = [], 0
+    if not needle:
+        return out
+    while True:
+        i = hay.find(needle, start)
+        if i < 0:
+            break
+        out.append(i)
+        start = i + len(needle)
+    return out
 
 
 def _mem_snippet(text: str, keywords=None) -> str:
-    """把长记忆压到 MEMORY_INJECT_CHAR_CAP 字以内：
-    优先截取**与本轮查询最相关**的片段——围绕命中关键词最密集的窗口，前后各留点上下文、加省略号；
-    无任何关键词命中时（纯语义命中）才退化为取开头。短记忆原样返回。"""
+    """把长记忆压到 MEMORY_INJECT_CHAR_CAP 字以内，但**围绕所有命中关键词的多个片段各取一小段拼起来**
+    （用 … 连接），保证同一条长记忆里**分散在不同位置的多个相关事实都能被带出来**，不会因只取单个窗口而断章。
+    无任何关键词命中时退化为取开头。短记忆原样返回。"""
     t = (text or "").strip()
     cap = MEMORY_INJECT_CHAR_CAP
     if cap <= 0 or len(t) <= cap:
         return t
     kws = [str(k) for k in (keywords or []) if k]
-    if not kws:
-        return t[:cap].rstrip() + "…"
     low = t.lower()
-    positions = []
-    for kw in kws:
-        k = kw.lower()
-        s = 0
-        while True:
-            i = low.find(k, s)
-            if i < 0:
-                break
-            positions.append(i)
-            s = i + len(k)
+    positions = sorted(set(i for kw in kws for i in _find_all(low, kw.lower())))
     if not positions:
         return t[:cap].rstrip() + "…"   # 纯语义命中、字面对不上 → 退回取开头
-    positions.sort()
-    lead = cap // 4                      # 命中点前留约 1/4 窗口的上下文
-    best_start, best_count = 0, -1
+    # 围绕每个命中位置取 ±pad 的小窗，相邻/重叠的窗合并
+    pad = 45
+    spans = []
     for p in positions:
-        st = max(0, p - lead)
-        c = sum(1 for q in positions if st <= q < st + cap)   # 该窗口覆盖多少个命中
-        if c > best_count:
-            best_count, best_start = c, st
-    end = min(len(t), best_start + cap)
-    snip = t[best_start:end].strip()
-    return ("…" if best_start > 0 else "") + snip + ("…" if end < len(t) else "")
+        s, e = max(0, p - pad), min(len(t), p + pad)
+        if spans and s <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], e)
+        else:
+            spans.append([s, e])
+    # 按出现顺序纳入各窗，总长封顶 cap（超了就截断最后一窗）
+    chosen, used = [], 0
+    for s, e in spans:
+        if used >= cap:
+            break
+        if used + (e - s) > cap:
+            e = s + (cap - used)
+        chosen.append((s, e))
+        used += (e - s)
+    res = ""
+    for idx, (s, e) in enumerate(chosen):
+        seg = t[s:e].strip()
+        res = (("…" if s > 0 else "") + seg) if idx == 0 else (res + "…" + seg)
+    if chosen and chosen[-1][1] < len(t):
+        res += "…"
+    return res
 
 
 async def build_system_prompt_with_memories(user_message: str, drift: bool = True) -> str:
