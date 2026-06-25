@@ -241,7 +241,8 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border:none;border-ra
         <div class="maint-row"><div><div class="mlabel">情绪 valence/arousal 回填</div><div class="mhint">给未打标记忆补情绪坐标(后台)</div></div><div class="mctl"><button class="btn sm" data-maint="backfill-emotion">运行</button><span class="maint-status" id="ms-backfill-emotion"></span></div></div>
         <div class="maint-row"><div><div class="mlabel">向量 embedding 回填</div><div class="mhint">给缺向量的记忆补 embedding(后台)</div></div><div class="mctl"><button class="btn sm" data-maint="backfill-embeddings">运行</button><span class="maint-status" id="ms-backfill-embeddings"></span></div></div>
         <div class="maint-row"><div><div class="mlabel">清理归档碎片</div><div class="mhint">硬删 30 天前的 layer-1 归档碎片(衰减归档项已豁免)</div></div><div class="mctl"><button class="btn sm warn" data-maint="cleanup">清理</button><span class="maint-status" id="ms-cleanup"></span></div></div>
-        <div class="maint-row"><div><div class="mlabel">记忆拆分 <span class="hint">长记忆拆成多条·只拆不改写·可撤销</span></div><div class="mhint" id="split-msg">把"几天揉一段"的长记忆拆成独立短记忆，召回更准、不断章。先预览再运行。</div></div><div class="mctl"><button class="btn sm" id="split-preview">预览</button><button class="btn sm" id="split-run">运行</button><button class="btn sm warn" id="split-undo">撤销</button></div></div>
+        <div class="maint-row"><div><div class="mlabel">记忆拆分 <span class="hint">长记忆拆成多条·只拆不改写·可撤销</span></div><div class="mhint" id="split-msg">把"几天揉一段"的长记忆拆成独立短记忆，召回更准、不断章。先预览再运行。</div></div><div class="mctl"><button class="btn sm" id="split-preview">预览</button><button class="btn sm" id="split-run">运行</button><button class="btn sm warn" id="split-undo">全部撤销</button></div></div>
+        <div class="maint-row"><div><div class="mlabel">撤销单条拆分 <span class="hint">只退某一条</span></div><div class="mhint" id="split-one-msg">在记忆页(勾"显示归档")找到那条原记忆的 #ID 填这里，复活它、收起它拆出来的小条</div></div><div class="mctl"><input id="split-one-id" type="number" placeholder="原记忆ID" style="width:110px"><button class="btn sm" id="split-one-go">撤销这条</button></div></div>
         <div class="maint-row"><div><div class="mlabel">记忆巩固 consolidate<span class="badge off-eng">旧引擎 · 禁用</span></div><div class="mhint">早期合并引擎,已被分层/做梦取代,留档不跑</div></div><div class="mctl"><button class="btn sm" disabled>已禁用</button></div></div>
       </div>
     </div>
@@ -537,10 +538,22 @@ async function splitUndo(){
     toast(j.error?'失败':'已撤销');
   }catch(e){ el.textContent='失败:'+e.message; }
 }
+async function splitUndoOne(){
+  const v=(document.getElementById('split-one-id').value||'').trim();
+  if(!v){ toast('请先填原记忆ID'); return; }
+  if(!confirm('撤销 #'+v+' 的拆分？\n复活这条原记忆，收起它拆出来的小条。')) return;
+  const el=document.getElementById('split-one-msg'); el.textContent='撤销中…';
+  try{
+    const j=await api('/api/admin/split-memories/undo-one',{method:'POST',body:{original_id:parseInt(v)}});
+    el.textContent = j.error ? ('失败:'+j.error) : ('✅ 已复活 #'+j.original_id+'，收起拆出来的 '+j.children_archived+' 条');
+    toast(j.error?'失败':'已撤销这条');
+  }catch(e){ el.textContent='失败:'+e.message; }
+}
 if(KEY){
   const a=document.getElementById('split-preview'); if(a) a.addEventListener('click',splitPreview);
   const b=document.getElementById('split-run'); if(b) b.addEventListener('click',splitRun);
   const c=document.getElementById('split-undo'); if(c) c.addEventListener('click',splitUndo);
+  const d=document.getElementById('split-one-go'); if(d) d.addEventListener('click',splitUndoOne);
 }
 </script>
 </body>

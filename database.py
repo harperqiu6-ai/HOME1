@@ -851,6 +851,19 @@ async def undo_split(original_id: int, child_ids: list):
             await conn.execute("UPDATE memories SET is_active = FALSE WHERE id = ANY($1::int[])", list(child_ids))
 
 
+async def undo_split_one(original_id: int) -> int:
+    """撤销单条拆分：原记忆复活，它拆出来的子记忆(merged_from=[original_id])全部停用。返回收起的子记忆数。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE memories SET is_active = TRUE WHERE id = $1", original_id)
+        res = await conn.execute(
+            "UPDATE memories SET is_active = FALSE WHERE merged_from = $1::int[]", [original_id])
+        try:
+            return int(str(res).split()[-1])
+        except Exception:
+            return 0
+
+
 async def save_image_memory(content: str, source_session: str = "", photos=None,
                             importance: int = 5, valence: float = 0.0, arousal: float = 0.4) -> int:
     """看图记忆:存一条文字描述记忆 + 关联图片(memory_photos,长期可取 /api/photos/id)。返回 memory_id。

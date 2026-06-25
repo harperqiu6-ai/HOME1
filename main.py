@@ -29,7 +29,7 @@ from database import init_tables, close_pool, save_message, search_memories, sav
 from database import save_migrated_memory, find_memory_by_mw_id, save_photo, link_photo_to_memory, get_photo, memory_photo_count, delete_memory_photos, get_mw_meta, update_mw_meta
 from database import list_memorywall, get_memorywall_one, update_memorywall, get_memory_photos, set_memory_active
 from database import get_memories_explicit_flags, set_memory_explicit, get_explicit_backfill_candidates, get_high_arousal_memories
-from database import get_long_memories, split_memory_into, undo_split
+from database import get_long_memories, split_memory_into, undo_split, undo_split_one
 from database import get_decay_candidates, count_active_memories, deactivate_memories, archive_decayed_memories, reactivate_decayed_memories
 from database import count_explicit_memories, clear_persona_suggestions, clear_l5_candidates, get_current_mood
 from database import save_dream, get_dream, list_dreams, get_dream_dates, get_memorywall_dates, delete_dream_memories
@@ -3748,6 +3748,21 @@ async def api_split_memories_undo():
             print(f"⚠️ 撤销拆分 {item.get('original_id')} 失败: {e}")
     await set_gateway_config("last_split_batch", "")
     return {"status": "ok", "restored": restored}
+
+
+@app.post("/api/admin/split-memories/undo-one")
+async def api_split_memories_undo_one(request: Request):
+    """撤销单条拆分：复活原记忆 + 收起它拆出来的子记忆。body:{original_id}。"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        oid = int(body.get("original_id"))
+    except Exception:
+        return {"error": "需要 original_id（数字）"}
+    n = await undo_split_one(oid)
+    return {"status": "ok", "original_id": oid, "children_archived": n}
 
 
 @app.post("/api/summary/toggle")
