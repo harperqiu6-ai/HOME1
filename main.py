@@ -25,7 +25,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Res
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_recent_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge, apply_mood_drift, get_emotion_backfill_targets, update_emotion_only, update_memory_emotion
+from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_recent_messages, extract_search_keywords, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge, apply_mood_drift, get_emotion_backfill_targets, update_emotion_only, update_memory_emotion
 from database import save_migrated_memory, find_memory_by_mw_id, save_photo, link_photo_to_memory, get_photo, memory_photo_count, delete_memory_photos, get_mw_meta, update_mw_meta
 from database import list_memorywall, get_memorywall_one, update_memorywall, get_memory_photos, set_memory_active
 from database import get_memories_explicit_flags, set_memory_explicit, get_explicit_backfill_candidates, get_high_arousal_memories
@@ -605,17 +605,46 @@ MEMORY_GUIDANCE = """# 如何使用「检索到的记忆」（这是给你的用
 MW_FULLBODY_MIN_SCORE = float(os.getenv("MW_FULLBODY_MIN_SCORE", "0.65"))
 MW_FULLBODY_MIN_MARGIN = float(os.getenv("MW_FULLBODY_MIN_MARGIN", "0.10"))
 
-# 单条「检索注入」记忆的长度上限（省 token）：超过则截断+省略号。
-# 防止做梦日记/看图描述/迁移来的长记忆整段塞进每一轮上下文。0=不限。回忆墙全文(最强那条)豁免。
-MEMORY_INJECT_CHAR_CAP = int(os.getenv("MEMORY_INJECT_CHAR_CAP", "160"))
+# 单条「检索注入」记忆的长度上限（省 token）：超过则只取**与本轮查询最相关**的片段。
+# 防止做梦日记/看图描述/迁移来的长记忆(一天可能 800+字)整段塞进每一轮上下文。0=不限。回忆墙全文(最强那条)豁免。
+MEMORY_INJECT_CHAR_CAP = int(os.getenv("MEMORY_INJECT_CHAR_CAP", "200"))
 
 
-def _cap_mem(text: str) -> str:
-    """把单条注入记忆截到 MEMORY_INJECT_CHAR_CAP 字以内（保留语义足够的开头）。"""
+def _mem_snippet(text: str, keywords=None) -> str:
+    """把长记忆压到 MEMORY_INJECT_CHAR_CAP 字以内：
+    优先截取**与本轮查询最相关**的片段——围绕命中关键词最密集的窗口，前后各留点上下文、加省略号；
+    无任何关键词命中时（纯语义命中）才退化为取开头。短记忆原样返回。"""
     t = (text or "").strip()
-    if MEMORY_INJECT_CHAR_CAP > 0 and len(t) > MEMORY_INJECT_CHAR_CAP:
-        return t[:MEMORY_INJECT_CHAR_CAP].rstrip() + "…"
-    return t
+    cap = MEMORY_INJECT_CHAR_CAP
+    if cap <= 0 or len(t) <= cap:
+        return t
+    kws = [str(k) for k in (keywords or []) if k]
+    if not kws:
+        return t[:cap].rstrip() + "…"
+    low = t.lower()
+    positions = []
+    for kw in kws:
+        k = kw.lower()
+        s = 0
+        while True:
+            i = low.find(k, s)
+            if i < 0:
+                break
+            positions.append(i)
+            s = i + len(k)
+    if not positions:
+        return t[:cap].rstrip() + "…"   # 纯语义命中、字面对不上 → 退回取开头
+    positions.sort()
+    lead = cap // 4                      # 命中点前留约 1/4 窗口的上下文
+    best_start, best_count = 0, -1
+    for p in positions:
+        st = max(0, p - lead)
+        c = sum(1 for q in positions if st <= q < st + cap)   # 该窗口覆盖多少个命中
+        if c > best_count:
+            best_count, best_start = c, st
+    end = min(len(t), best_start + cap)
+    snip = t[best_start:end].strip()
+    return ("…" if best_start > 0 else "") + snip + ("…" if end < len(t) else "")
 
 
 async def build_system_prompt_with_memories(user_message: str, drift: bool = True) -> str:
@@ -662,6 +691,7 @@ async def build_system_prompt_with_memories(user_message: str, drift: bool = Tru
                 print(f"⚠️ 心情漂移调度失败: {_e}")
         
         # 格式化记忆文本（带日期，帮助模型判断新旧）
+        _kws = extract_search_keywords(user_message)
         memory_lines = []
         for mem in memories:
             date_str = ""
@@ -676,7 +706,7 @@ async def build_system_prompt_with_memories(user_message: str, drift: bool = Tru
             _c = (mem.get('content') or '').strip()
             if not _c:
                 continue  # 空 content 兜底：跳过（双保险，绝不让空行崩注入）
-            memory_lines.append(f"- {date_str}{_cap_mem(_c)}")
+            memory_lines.append(f"- {date_str}{_mem_snippet(_c, _kws)}")
         memory_text = "\n".join(memory_lines)
         if _explicit_hits:
             memory_text = (memory_text + "\n\n" if memory_text else "") + EXPLICIT_REDACT_NOTE
@@ -2089,6 +2119,7 @@ async def build_memory_text(user_message: str, drift: bool = True) -> str:
             and (len(memories) == 1 or (top_score - second_score) >= MW_FULLBODY_MIN_MARGIN)
         )
 
+        _kws = extract_search_keywords(user_message)
         memory_lines = []
         for idx, mem in enumerate(memories):
             date_str = ""
@@ -2114,13 +2145,13 @@ async def build_memory_text(user_message: str, drift: bool = True) -> str:
                     _txt = (f"【回忆 {_t}】" if _t else "") + (mw.get("body") or "").strip()
                 else:
                     _body = (mw.get("summary") or "").strip() or (mw.get("body") or "").strip()
-                    _txt = (f"【回忆摘要 {_t}】" if _t else "") + _cap_mem(_body)
+                    _txt = (f"【回忆摘要 {_t}】" if _t else "") + _mem_snippet(_body, _kws)
                 memory_lines.append(f"- {date_str}{_txt}{_feel}")
-            else:  # 普通事实记忆：通常短；过长的(梦/看图/迁移)截断省 token
+            else:  # 普通事实记忆：通常短；过长的(梦/看图/迁移)取最相关片段省 token
                 _c = (mem.get('content') or '').strip()
                 if not _c:
                     continue  # 空 content 兜底：跳过（检索已排除，这里双保险，绝不让空行崩注入）
-                memory_lines.append(f"- {date_str}{_cap_mem(_c)}{_feel}")
+                memory_lines.append(f"- {date_str}{_mem_snippet(_c, _kws)}{_feel}")
 
         print(f"📚 注入 {len(memories)} 条记忆（全文资格={top_full_eligible}, top={top_score:.3f}/2nd={second_score:.3f}）" + (f" +收敛{len(_explicit_hits)}条露骨" if _explicit_hits else ""))
         header = "【从过往对话中检索到的相关记忆】（这是你记得的背景，自然融进回应，别整段复述、别像念稿）\n"
