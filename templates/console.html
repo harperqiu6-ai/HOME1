@@ -189,6 +189,7 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border:none;border-ra
       <div class="row"><div class="label">Bark 推送地址</div><div class="ctl"><input id="pp-bark" type="text" placeholder="https://api.day.app/你的key/" style="width:280px"></div></div>
       <div class="row"><div class="label">沉默多久来找你(分钟)</div><div class="ctl"><input id="pp-silence" type="number" min="5" max="1440" style="width:90px"></div></div>
       <div class="row"><div class="label">你没回前最多发几条</div><div class="ctl"><input id="pp-streak" type="number" min="1" max="20" style="width:90px"></div></div>
+      <div class="row"><div><div class="label">主动概率(随性)</div><div class="hint">到点后每次检查掷骰子，0.25≈25%才来；越小越随缘、越大越主动</div></div><div class="ctl"><input id="pp-prob" type="number" min="0" max="1" step="0.05" style="width:90px"></div></div>
       <div class="row"><div class="label">免打扰时段(点→点)</div><div class="ctl"><input id="pp-qstart" type="number" min="0" max="23" style="width:64px"> → <input id="pp-qend" type="number" min="0" max="23" style="width:64px"></div></div>
       <div class="row"><div><div class="label">深夜吵架可破例发1次</div><div class="hint">免打扰时段里，若情绪未解(吵架等)允许破例发一条</div></div><div class="ctl"><label class="tg"><input type="checkbox" id="pp-urgent"><span class="track"></span><span class="knob"></span></label></div></div>
       <div class="row"><div class="hint" id="pp-msg">　</div><div class="ctl"><button class="btn sm" id="pp-save">保存</button><button class="btn sm" id="pp-test">立即测试推送</button><button class="btn sm" id="pp-real">试发一条真的</button></div></div>
@@ -439,6 +440,7 @@ async function ppLoad(){
     else { barkEl.value = c.bark_url||''; }
     document.getElementById('pp-silence').value = c.push_silence_min;
     document.getElementById('pp-streak').value  = c.push_max_streak;
+    document.getElementById('pp-prob').value    = c.push_probability;
     document.getElementById('pp-qstart').value  = c.push_quiet_start;
     document.getElementById('pp-qend').value    = c.push_quiet_end;
     document.getElementById('pp-urgent').checked = !!c.push_quiet_urgent;
@@ -449,6 +451,7 @@ async function ppSave(){
     push_enabled:     document.getElementById('pp-enabled').checked,
     push_silence_min: parseInt(document.getElementById('pp-silence').value)||60,
     push_max_streak:  parseInt(document.getElementById('pp-streak').value)||5,
+    push_probability: parseFloat(document.getElementById('pp-prob').value)||0.25,
     push_quiet_start: parseInt(document.getElementById('pp-qstart').value)||0,
     push_quiet_end:   parseInt(document.getElementById('pp-qend').value)||8,
     push_quiet_urgent: document.getElementById('pp-urgent').checked,

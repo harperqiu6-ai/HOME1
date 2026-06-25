@@ -3348,6 +3348,7 @@ PUSH_DEFAULTS = {
     "push_quiet_start":  0,       # 免打扰开始(点, 本地时区)
     "push_quiet_end":    8,       # 免打扰结束(点)
     "push_quiet_urgent": True,    # 免打扰时段:吵架等未解情绪可破例发1条
+    "push_probability":  0.25,    # 投骰子:到时间后每次检查有此概率才"动念"去找你(越小越随性)
 }
 
 
@@ -3361,6 +3362,8 @@ async def get_push_config() -> dict:
                 continue
             if isinstance(dv, bool):
                 cfg[k] = str(v).lower() == "true"
+            elif isinstance(dv, float):
+                cfg[k] = float(v)
             elif isinstance(dv, int):
                 cfg[k] = int(float(v))
             else:
@@ -3517,6 +3520,10 @@ async def maybe_send_proactive(force: bool = False) -> dict:
             return {"sent": False, "reason": "streak_capped", "streak": streak}
         if gap_min < cfg["push_silence_min"]:
             return {"sent": False, "reason": "too_soon", "gap_min": int(gap_min)}
+        # 🎲 投骰子：到时间后也不是每次都来——掷中了才"动念"去问 LLM 要不要发，制造随性/看心情的感觉
+        import random as _rnd
+        if _rnd.random() > float(cfg.get("push_probability", 0.25)):
+            return {"sent": False, "reason": "dice_skip"}
 
     local_hour = (now.hour + TIMEZONE_HOURS) % 24
     in_quiet = _in_quiet(local_hour, cfg["push_quiet_start"], cfg["push_quiet_end"])
