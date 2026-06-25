@@ -3447,7 +3447,9 @@ async def _decide_and_write(persona: str, transcript: str, silence_min: float, i
         "【铁律】只能基于上面真实出现过的内容来写，**绝对不要编造没发生的事**：\n"
         "  · 没吵架、没说过重话，就绝不能出现「别生气 / 我说得不好听 / 对不起 / 原谅我」这类；\n"
         "  · 不要凭空假设对方在生气难过、或你做错了什么；\n"
-        "  · 拿不准就用最轻最自然的方式：顺着刚才聊的话题、或单纯说句惦记、问一句近况；\n"
+        "  · 拿不准就用最轻最自然的方式：顺着刚才聊的话题、或单纯说句惦记；\n"
+        f"  · **若{USER_NAME}刚说过某事「做完了/搞定了/结束了/不忙了」，绝不能再问那件事忙不忙、进展如何**——"
+        "要顺着说就该是「辛苦啦，终于弄完啦」「那现在能歇会儿了吧」这类，承接她说的结果，别答非所问；\n"
         "  · 如果刚才你说过「等下来找你 / 一会儿问你某事」，就真的接着那个说。\n"
         "只有当上面对话里**确实**有没说开的争执/情绪时，才用关心或服软的语气(这时 urgent=true)。\n"
         "如果此刻确实没什么好说、或刚道过别/晚安，就别发(reach_out=false)。\n"
@@ -3537,7 +3539,8 @@ async def maybe_send_proactive(force: bool = False) -> dict:
         return {"sent": False, "reason": "quiet_hours"}
 
     transcript = "\n".join(
-        f"{'我' if m['role'] == 'assistant' else USER_NAME}: {(m['content'] or '').strip()[:120]}"
+        # 你最近那句话给模型看全文(≤400字)，其余仍截120字省 token
+        f"{'我' if m['role'] == 'assistant' else USER_NAME}: {(m['content'] or '').strip()[:400 if m is last_user else 120]}"
         for m in msgs[-12:] if m["role"] in ("user", "assistant") and (m["content"] or "").strip()
     )
     persona = ""
