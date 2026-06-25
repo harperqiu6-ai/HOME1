@@ -794,6 +794,63 @@ async def save_memory(content: str, importance: int = 5, source_session: str = "
                 print(f"⚠️ 记忆 {row['id']} embedding自动计算失败: {e}")
 
 
+async def get_long_memories(min_len: int = 300, limit: int = 500):
+    """取活跃、非回忆墙、超长的普通记忆(供拆分)。按长度降序。返回 [{id, content, importance, valence, arousal, is_explicit, created_at}]"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, content, importance, valence, arousal, is_explicit, created_at
+               FROM memories
+               WHERE is_active = TRUE AND mw_meta IS NULL
+                 AND content IS NOT NULL AND char_length(btrim(content)) > $1
+               ORDER BY char_length(content) DESC
+               LIMIT $2""",
+            min_len, limit)
+        return [dict(r) for r in rows]
+
+
+async def split_memory_into(original_id: int, contents: list) -> list:
+    """把 original_id 拆成多条新短记忆：继承原 importance/情绪/**创建日期**，各自算向量，
+    并用 merged_from 记录来源；原记忆置 is_active=FALSE(软停用，可撤销)。返回新 id 列表。"""
+    pool = await get_pool()
+    new_ids = []
+    async with pool.acquire() as conn:
+        orig = await conn.fetchrow(
+            "SELECT importance, source_session, valence, arousal, is_explicit, created_at FROM memories WHERE id=$1",
+            original_id)
+        if not orig:
+            return []
+        for c in contents:
+            c = (c or "").strip()
+            if not c:
+                continue
+            row = await conn.fetchrow(
+                """INSERT INTO memories (content, importance, source_session, valence, arousal, is_explicit, created_at, merged_from)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id""",
+                c, orig["importance"], orig["source_session"], orig["valence"], orig["arousal"],
+                bool(orig["is_explicit"]), orig["created_at"], [original_id])
+            nid = row["id"]
+            new_ids.append(nid)
+            if MEMORY_VECTOR_ENABLED:
+                try:
+                    emb = await compute_embedding(c)
+                    if emb:
+                        await save_memory_embedding(conn, nid, emb)
+                except Exception as e:
+                    print(f"⚠️ 拆分子记忆 {nid} 向量失败: {e}")
+        await conn.execute("UPDATE memories SET is_active = FALSE WHERE id = $1", original_id)
+    return new_ids
+
+
+async def undo_split(original_id: int, child_ids: list):
+    """撤销拆分：原记忆复活(is_active=TRUE)，拆出来的子记忆停用(is_active=FALSE，软删可再复活)。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE memories SET is_active = TRUE WHERE id = $1", original_id)
+        if child_ids:
+            await conn.execute("UPDATE memories SET is_active = FALSE WHERE id = ANY($1::int[])", list(child_ids))
+
+
 async def save_image_memory(content: str, source_session: str = "", photos=None,
                             importance: int = 5, valence: float = 0.0, arousal: float = 0.4) -> int:
     """看图记忆:存一条文字描述记忆 + 关联图片(memory_photos,长期可取 /api/photos/id)。返回 memory_id。

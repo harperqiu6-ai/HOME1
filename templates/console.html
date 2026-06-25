@@ -241,6 +241,7 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border:none;border-ra
         <div class="maint-row"><div><div class="mlabel">情绪 valence/arousal 回填</div><div class="mhint">给未打标记忆补情绪坐标(后台)</div></div><div class="mctl"><button class="btn sm" data-maint="backfill-emotion">运行</button><span class="maint-status" id="ms-backfill-emotion"></span></div></div>
         <div class="maint-row"><div><div class="mlabel">向量 embedding 回填</div><div class="mhint">给缺向量的记忆补 embedding(后台)</div></div><div class="mctl"><button class="btn sm" data-maint="backfill-embeddings">运行</button><span class="maint-status" id="ms-backfill-embeddings"></span></div></div>
         <div class="maint-row"><div><div class="mlabel">清理归档碎片</div><div class="mhint">硬删 30 天前的 layer-1 归档碎片(衰减归档项已豁免)</div></div><div class="mctl"><button class="btn sm warn" data-maint="cleanup">清理</button><span class="maint-status" id="ms-cleanup"></span></div></div>
+        <div class="maint-row"><div><div class="mlabel">记忆拆分 <span class="hint">长记忆拆成多条·只拆不改写·可撤销</span></div><div class="mhint" id="split-msg">把"几天揉一段"的长记忆拆成独立短记忆，召回更准、不断章。先预览再运行。</div></div><div class="mctl"><button class="btn sm" id="split-preview">预览</button><button class="btn sm" id="split-run">运行</button><button class="btn sm warn" id="split-undo">撤销</button></div></div>
         <div class="maint-row"><div><div class="mlabel">记忆巩固 consolidate<span class="badge off-eng">旧引擎 · 禁用</span></div><div class="mhint">早期合并引擎,已被分层/做梦取代,留档不跑</div></div><div class="mctl"><button class="btn sm" disabled>已禁用</button></div></div>
       </div>
     </div>
@@ -492,6 +493,54 @@ async function capApply(){
 if(KEY){
   const _cp=document.getElementById('cap-preview'); if(_cp) _cp.addEventListener('click',capPreview);
   const _ca=document.getElementById('cap-apply'); if(_ca) _ca.addEventListener('click',capApply);
+}
+
+// ---- 记忆拆分 ----
+let _splitTimer=null;
+async function splitPreview(){
+  const el=document.getElementById('split-msg'); el.textContent='预览中(调模型,稍慢)…';
+  try{
+    const j=await api('/api/admin/split-memories',{method:'POST',body:{dry_run:true,min_len:300}});
+    if(j.error){ el.textContent='失败:'+j.error; return; }
+    let s='共 '+j.long_count+' 条长记忆(>'+j.min_len+'字)。';
+    (j.samples||[]).forEach(x=>{ s+=' ｜ #'+x.id+'('+x.orig_len+'字)→拆成 '+x.split_into+' 条'; });
+    el.textContent=s + (j.long_count? '　满意就点「运行」':'');
+  }catch(e){ el.textContent='失败:'+e.message; }
+}
+async function splitRun(){
+  if(!confirm('开始拆分长记忆？\n只拆不改写；原记忆会备份(软停用)，可一键撤销。')) return;
+  const el=document.getElementById('split-msg'); el.textContent='启动中…';
+  try{
+    const j=await api('/api/admin/split-memories',{method:'POST',body:{dry_run:false,min_len:300}});
+    if(j.error){ el.textContent='失败:'+j.error; return; }
+    if(j.status==='done'){ el.textContent=j.message; return; }
+    el.textContent='拆分中 0/'+j.total+'…(页面别关)';
+    _splitTimer=setInterval(splitPoll,2000);
+  }catch(e){ el.textContent='失败:'+e.message; }
+}
+async function splitPoll(){
+  try{
+    const j=await api('/api/admin/split-memories/status');
+    const el=document.getElementById('split-msg');
+    if(j.running){ el.textContent='拆分中 '+j.done+'/'+j.total+'，已新增 '+j.new_count+' 条…'; return; }
+    clearInterval(_splitTimer); _splitTimer=null;
+    el.textContent = j.error ? ('出错:'+j.error) : ('✅ 完成：处理 '+j.done+' 条，新增 '+j.new_count+' 条短记忆。不满意可点「撤销」。');
+    toast('拆分完成');
+  }catch(e){}
+}
+async function splitUndo(){
+  if(!confirm('撤销上一次拆分？\n原长记忆全部复活，拆出来的短记忆停用。')) return;
+  const el=document.getElementById('split-msg'); el.textContent='撤销中…';
+  try{
+    const j=await api('/api/admin/split-memories/undo',{method:'POST',body:{}});
+    el.textContent = j.error ? ('失败:'+j.error) : ('✅ 已撤销：复活 '+j.restored+' 条原记忆');
+    toast(j.error?'失败':'已撤销');
+  }catch(e){ el.textContent='失败:'+e.message; }
+}
+if(KEY){
+  const a=document.getElementById('split-preview'); if(a) a.addEventListener('click',splitPreview);
+  const b=document.getElementById('split-run'); if(b) b.addEventListener('click',splitRun);
+  const c=document.getElementById('split-undo'); if(c) c.addEventListener('click',splitUndo);
 }
 </script>
 </body>

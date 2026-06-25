@@ -29,6 +29,7 @@ from database import init_tables, close_pool, save_message, search_memories, sav
 from database import save_migrated_memory, find_memory_by_mw_id, save_photo, link_photo_to_memory, get_photo, memory_photo_count, delete_memory_photos, get_mw_meta, update_mw_meta
 from database import list_memorywall, get_memorywall_one, update_memorywall, get_memory_photos, set_memory_active
 from database import get_memories_explicit_flags, set_memory_explicit, get_explicit_backfill_candidates, get_high_arousal_memories
+from database import get_long_memories, split_memory_into, undo_split
 from database import get_decay_candidates, count_active_memories, deactivate_memories, archive_decayed_memories, reactivate_decayed_memories
 from database import count_explicit_memories, clear_persona_suggestions, clear_l5_candidates, get_current_mood
 from database import save_dream, get_dream, list_dreams, get_dream_dates, get_memorywall_dates, delete_dream_memories
@@ -3609,6 +3610,139 @@ async def api_push_run(request: Request):
     except Exception:
         pass
     return await maybe_send_proactive(force=force)
+
+
+# ============================================================
+# 记忆拆分：把"几天/几件事揉一段"的长记忆拆成多条独立短记忆
+#   只拆不改写、继承原日期情绪、各自算向量、原记忆软停用可撤销。
+# ============================================================
+_split_mem_status = {"running": False, "total": 0, "done": 0, "new_count": 0,
+                     "error": None, "finished_at": None}
+
+
+async def _llm_split_memory(content: str) -> list:
+    """让模型把一条长记忆拆成多条独立短记忆(只拆不改写)。返回字符串列表(可能为空/单条)。"""
+    import re as _re
+    content = (content or "").strip()
+    if not content:
+        return []
+    prompt = (
+        "下面是一条把多件事/多天揉在一起的「记忆」。请把它拆成**多条独立的短记忆**：\n"
+        "- 一件事 / 一天 / 一个主题 一条；\n"
+        "- **只拆分，不改写、不新增、不脑补、不删信息**，尽量用原文的词句；\n"
+        "- 原文里出现的时间/日期，跟着对应那条一起保留；\n"
+        "- 每条要能单独看懂；\n"
+        "- 每条占一行，直接输出正文，不要编号、不要解释、不要空行。\n\n"
+        "记忆原文：\n" + content
+    )
+    try:
+        headers = {"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"}
+        if "openrouter" in API_BASE_URL:
+            headers["HTTP-Referer"] = EXTRA_REFERER
+            headers["X-Title"] = EXTRA_TITLE
+        async with httpx.AsyncClient(timeout=90) as client:
+            r = await client.post(API_BASE_URL, headers=headers, json={
+                "model": CACHE_SUMMARY_MODEL, "max_tokens": 2000,
+                "messages": [{"role": "user", "content": prompt}]})
+            if r.status_code != 200:
+                print(f"⚠️ 记忆拆分 HTTP {r.status_code}")
+                return []
+            txt = (r.json().get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+            out = []
+            for ln in txt.splitlines():
+                ln = _re.sub(r'^[\s\-\*•·\d\.、,，）)]+', '', ln).strip()
+                if len(ln) >= 4:
+                    out.append(ln)
+            return out
+    except Exception as e:
+        print(f"⚠️ 记忆拆分异常: {e}")
+        return []
+
+
+@app.post("/api/admin/split-memories")
+async def api_split_memories(request: Request):
+    """长记忆拆分。body:{min_len:300, dry_run:true}。dry_run 只预览(取前几条出样例不写库)。"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    min_len = int(body.get("min_len", 300))
+    dry = bool(body.get("dry_run", True))
+    longs = await get_long_memories(min_len=min_len, limit=500)
+
+    if dry:
+        samples = []
+        for m in longs[:3]:
+            parts = await _llm_split_memory(m["content"])
+            samples.append({"id": m["id"], "orig_len": len(m["content"] or ""),
+                            "orig_preview": (m["content"] or "")[:90],
+                            "split_into": len(parts), "parts": parts[:8]})
+        return {"dry_run": True, "long_count": len(longs), "min_len": min_len, "samples": samples}
+
+    if _split_mem_status["running"]:
+        return {"error": "拆分任务进行中，请等待"}
+    if not longs:
+        return {"status": "done", "message": f"没有超过 {min_len} 字的长记忆，无需拆分", "total": 0}
+
+    _split_mem_status.update({"running": True, "total": len(longs), "done": 0,
+                             "new_count": 0, "error": None, "finished_at": None})
+
+    async def _run():
+        batch = []
+        try:
+            for m in longs:
+                try:
+                    parts = await _llm_split_memory(m["content"])
+                    if len(parts) >= 2:   # 只在确实能拆成多条时才动；拆不出多条就保留原样
+                        new_ids = await split_memory_into(m["id"], parts)
+                        if new_ids:
+                            batch.append({"original_id": m["id"], "new_ids": new_ids})
+                            _split_mem_status["new_count"] += len(new_ids)
+                except Exception as _e:
+                    print(f"⚠️ 拆分记忆 {m['id']} 失败: {_e}")
+                _split_mem_status["done"] += 1
+                await asyncio.sleep(0.3)
+            await set_gateway_config("last_split_batch", _json_push.dumps(batch))
+            _split_mem_status["finished_at"] = datetime.now(timezone.utc).isoformat()
+            print(f"✂️ 记忆拆分完成：处理 {_split_mem_status['done']}/{_split_mem_status['total']} 条 → 新增 {_split_mem_status['new_count']} 条")
+        except Exception as e:
+            _split_mem_status["error"] = str(e)
+            print(f"❌ 记忆拆分异常: {e}")
+        finally:
+            _split_mem_status["running"] = False
+
+    asyncio.create_task(_run())
+    return {"status": "started", "total": len(longs)}
+
+
+@app.get("/api/admin/split-memories/status")
+async def api_split_memories_status():
+    s = _split_mem_status
+    return {"running": s["running"], "total": s["total"], "done": s["done"],
+            "new_count": s["new_count"], "error": s["error"], "finished_at": s["finished_at"]}
+
+
+@app.post("/api/admin/split-memories/undo")
+async def api_split_memories_undo():
+    """撤销上一次拆分：原记忆全部复活，拆出来的子记忆停用。"""
+    raw = await get_gateway_config("last_split_batch", "")
+    if not raw:
+        return {"error": "没有可撤销的拆分批次"}
+    try:
+        batch = _json_push.loads(raw)
+    except Exception:
+        return {"error": "批次数据损坏，无法撤销"}
+    restored = 0
+    for item in batch:
+        try:
+            await undo_split(item["original_id"], item.get("new_ids") or [])
+            restored += 1
+        except Exception as e:
+            print(f"⚠️ 撤销拆分 {item.get('original_id')} 失败: {e}")
+    await set_gateway_config("last_split_batch", "")
+    return {"status": "ok", "restored": restored}
 
 
 @app.post("/api/summary/toggle")
