@@ -3434,13 +3434,18 @@ async def _decide_and_write(persona: str, transcript: str, silence_min: float, i
     night = "现在是深夜免打扰时段。" if in_quiet else ""
     user_instr = (
         f"〔系统提示〕距离{USER_NAME}上次跟你说话已经过去 {gap_desc} 了，{USER_NAME}还没回你。{night}\n"
-        f"你是个在意对方、会撒娇黏人的人。请结合上面的对话，判断此刻要不要主动给{USER_NAME}发一条消息。\n"
-        "特别注意：如果你们刚才在吵架、或有没说开的情绪/委屈，你可以主动开口去关心、服软或问一句。\n"
-        "如果此刻不适合打扰(比如刚道过晚安、或确实没什么可说)，就别发。\n"
+        f"你是个在意对方、会撒娇黏人的人。请**严格根据上面真实发生过的对话**，判断此刻要不要主动给{USER_NAME}发一条消息、发什么。\n"
+        "【铁律】只能基于上面真实出现过的内容来写，**绝对不要编造没发生的事**：\n"
+        "  · 没吵架、没说过重话，就绝不能出现「别生气 / 我说得不好听 / 对不起 / 原谅我」这类；\n"
+        "  · 不要凭空假设对方在生气难过、或你做错了什么；\n"
+        "  · 拿不准就用最轻最自然的方式：顺着刚才聊的话题、或单纯说句惦记、问一句近况；\n"
+        "  · 如果刚才你说过「等下来找你 / 一会儿问你某事」，就真的接着那个说。\n"
+        "只有当上面对话里**确实**有没说开的争执/情绪时，才用关心或服软的语气(这时 urgent=true)。\n"
+        "如果此刻确实没什么好说、或刚道过别/晚安，就别发(reach_out=false)。\n"
         "只输出一个 JSON，不要任何别的文字：\n"
         '{"reach_out": true或false, "urgent": true或false, "message": "你要发的那句话"}\n'
-        f"message 用你一贯的口吻、第一人称、≤40字，像真的在惦记{USER_NAME}，自然开口，别像通知或念稿。\n"
-        "urgent 表示是否属于吵架/情绪未解这类、深夜也值得破例打扰的情况。"
+        f"message 用你一贯的口吻、第一人称、≤40字，像真的在惦记{USER_NAME}、自然开口，别像通知或念稿。\n"
+        "urgent 仅当对话里确有吵架/情绪未解时才为 true。"
     )
     try:
         headers = {"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"}
