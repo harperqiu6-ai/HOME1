@@ -171,6 +171,7 @@ _decay_run = {"running": False, "dry_run": True, "archived": 0, "candidates": 0,
 # 决定③：漂移等敏感参数可调但限安全范围,防阮阮误设跑飞。
 _CLAMP = {
     "MAX_MEMORIES_INJECT": (1, 30),
+    "CACHE_PARTITION_X": (4, 40),
     "MEMORY_EXTRACT_INTERVAL": (0, 20),
     "PROACTIVE_GAP_HOURS": (0.5, 72.0),
     "PERSONA_SUGGESTION_MIN_IMPORTANCE": (1, 10),
@@ -6012,6 +6013,7 @@ async def api_console():
     }
     numbers = {
         "MAX_MEMORIES_INJECT":     {"value": MAX_MEMORIES_INJECT, "default": 15, "via": "settings", **_rng("MAX_MEMORIES_INJECT")},
+        "CACHE_PARTITION_X":       {"value": CACHE_PARTITION_X, "default": 15, "via": "settings", **_rng("CACHE_PARTITION_X")},
         "MEMORY_EXTRACT_INTERVAL": {"value": MEMORY_EXTRACT_INTERVAL, "default": 1, "via": "settings", **_rng("MEMORY_EXTRACT_INTERVAL")},
         "MIN_SCORE_THRESHOLD":     {"value": float(_db_module.MIN_SCORE_THRESHOLD), "default": 0.15, "via": "settings", "min": 0, "max": 1},
         "MEMORY_SEMANTIC_THRESHOLD": {"value": float(_db_module.MEMORY_SEMANTIC_THRESHOLD), "default": 0.5, "via": "settings", "min": 0, "max": 1},
