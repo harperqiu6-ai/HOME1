@@ -3349,6 +3349,7 @@ PUSH_DEFAULTS = {
     "push_quiet_end":    8,       # 免打扰结束(点)
     "push_quiet_urgent": True,    # 免打扰时段:吵架等未解情绪可破例发1条
     "push_probability":  0.25,    # 投骰子:到时间后每次检查有此概率才"动念"去找你(越小越随性)
+    "push_icon":         "https://pic1.imgdb.cn/item/6a3ce18bbb21102f81d40039.jpg",  # 推送图标(公网直链,需 iOS15+;留空=默认图标)
 }
 
 
@@ -3375,19 +3376,24 @@ async def get_push_config() -> dict:
     return cfg
 
 
-async def _bark_push(bark_url: str, title: str, body: str, urgent: bool = False) -> bool:
+async def _bark_push(bark_url: str, title: str, body: str, urgent: bool = False, icon: str = "") -> bool:
     if not bark_url:
         return False
     base = bark_url.rstrip("/")
     payload = {"title": title or "AI", "body": body or "",
                "group": title or "AI", "level": "timeSensitive" if urgent else "active"}
+    if icon:
+        payload["icon"] = icon
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post(base, json=payload)
             if r.status_code == 200:
                 return True
             import urllib.parse as _up
-            r2 = await client.get(f"{base}/{_up.quote(title or 'AI')}/{_up.quote(body or '')}")
+            url = f"{base}/{_up.quote(title or 'AI')}/{_up.quote(body or '')}"
+            if icon:
+                url += f"?icon={_up.quote(icon, safe=':/')}"
+            r2 = await client.get(url)
             return r2.status_code == 200
     except Exception as e:
         print(f"⚠️ Bark推送失败: {e}")
@@ -3555,7 +3561,7 @@ async def maybe_send_proactive(force: bool = False) -> dict:
             return {"sent": False, "reason": "quiet_hours_not_urgent"}
 
     title = AI_NAME or "AI"
-    ok = await _bark_push(cfg["bark_url"], title, text, urgent=urgent)
+    ok = await _bark_push(cfg["bark_url"], title, text, urgent=urgent, icon=cfg.get("push_icon", ""))
     if not ok:
         return {"sent": False, "reason": "bark_failed", "message": text}
     try:
@@ -3609,7 +3615,7 @@ async def api_push_test():
     if not cfg["bark_url"]:
         return {"sent": False, "reason": "no_bark_url"}
     msg = "测试推送：能收到这条就说明 Bark 通了～"
-    ok = await _bark_push(cfg["bark_url"], AI_NAME or "AI", msg, urgent=False)
+    ok = await _bark_push(cfg["bark_url"], AI_NAME or "AI", msg, urgent=False, icon=cfg.get("push_icon", ""))
     return {"sent": ok, "message": msg if ok else "", "reason": "" if ok else "bark_failed"}
 
 
