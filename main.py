@@ -147,8 +147,8 @@ DREAM_MODEL = os.getenv("DREAM_MODEL", "") or CACHE_SUMMARY_MODEL
 # ③-2 做梦开关：DREAM_ENABLED 总开关；DREAM_RETRIEVABLE 每篇梦顺带写一条可检索回忆墙条目(默认关，已废弃不用)
 DREAM_ENABLED = os.getenv("DREAM_ENABLED", "true").lower() == "true"
 DREAM_RETRIEVABLE = os.getenv("DREAM_RETRIEVABLE", "false").lower() == "true"
-# 做梦概率化：不是每天都做梦。投骰子(默认40%)，或当天平均情绪唤起(arousal)够高(默认>=0.6)则强制做梦。
-DREAM_PROBABILITY = float(os.getenv("DREAM_PROBABILITY", "0.4"))
+# 做梦概率化：不是每天都做梦。投骰子(默认25%)，或当天平均情绪唤起(arousal)够高(默认>=0.6)则强制做梦。
+DREAM_PROBABILITY = float(os.getenv("DREAM_PROBABILITY", "0.25"))
 DREAM_AROUSAL_FORCE_THRESHOLD = float(os.getenv("DREAM_AROUSAL_FORCE_THRESHOLD", "0.6"))
 # 滚动摘要封顶：摘要区 = 前言 +〔早期小结〕+ 最近N段。段数超 N+B → 后台把最老B段卷进早期小结(默认关到验收)
 SUMMARY_CAP_ENABLED = os.getenv("SUMMARY_CAP_ENABLED", "false").lower() == "true"
