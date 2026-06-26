@@ -326,6 +326,9 @@ async def init_tables():
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_memory_photos_memory ON memory_photos (memory_id);
         """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_photos_md5 ON memory_photos (md5(data));
+        """)
 
         # 人设建议（A4）：提取识别出的"行为/相处偏好"不进记忆池，收集到这里供主理人贴 persona
         await conn.execute("""
@@ -881,6 +884,10 @@ async def save_image_memory(content: str, source_session: str = "", photos=None,
             if not data:
                 continue
             try:
+                dup = await conn.fetchval(
+                    "SELECT 1 FROM memory_photos WHERE md5(data) = md5($1) LIMIT 1", data)
+                if dup:
+                    continue  # 同一张图已经存过，跳过重复存储
                 await conn.execute(
                     "INSERT INTO memory_photos (memory_id, original_name, mime, data) VALUES ($1, $2, $3, $4)",
                     mid, "chat_image", (mime or 'image/png'), data)
