@@ -245,6 +245,7 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border:none;border-ra
         <div class="maint-row"><div><div class="mlabel">记忆拆分 <span class="hint">长记忆拆成多条·只拆不改写·可撤销</span></div><div class="mhint" id="split-msg">把"几天揉一段"的长记忆拆成独立短记忆，召回更准、不断章。先预览再运行。</div></div><div class="mctl"><button class="btn sm" id="split-preview">预览</button><button class="btn sm" id="split-run">运行</button><button class="btn sm warn" id="split-undo">全部撤销</button></div></div>
         <div class="maint-row"><div><div class="mlabel">撤销单条拆分 <span class="hint">只退某一条</span></div><div class="mhint" id="split-one-msg">在记忆页(勾"显示归档")找到那条原记忆的 #ID 填这里，复活它、收起它拆出来的小条</div></div><div class="mctl"><input id="split-one-id" type="number" placeholder="原记忆ID" style="width:110px"><button class="btn sm" id="split-one-go">撤销这条</button></div></div>
         <div class="maint-row"><div><div class="mlabel">记忆巩固 consolidate<span class="badge off-eng">旧引擎 · 禁用</span></div><div class="mhint">早期合并引擎,已被分层/做梦取代,留档不跑</div></div><div class="mctl"><button class="btn sm" disabled>已禁用</button></div></div>
+        <div class="maint-row"><div><div class="mlabel">数据库用量自查</div><div class="mhint" id="storage-msg">查各表大小 + memory_photos 有没有重复/孤儿图片堆积(只读,不改数据)</div></div><div class="mctl"><button class="btn sm" id="storage-check">检查</button></div></div>
       </div>
     </div>
 
@@ -421,6 +422,21 @@ function bind(){
   document.getElementById('l2-refresh').addEventListener('click',async()=>{ try{await api('/api/l2/refresh',{method:'POST',body:{}});toast('已刷新今日');}catch(e){toast('失败:'+e.message);} });
   document.getElementById('fold-drift').addEventListener('click',function(){ this.classList.toggle('open'); document.getElementById('foldb-drift').classList.toggle('open'); });
   document.getElementById('fold-maint').addEventListener('click',function(){ this.classList.toggle('open'); document.getElementById('foldb-maint').classList.toggle('open'); });
+  document.getElementById('storage-check').addEventListener('click', storageCheck);
+}
+
+async function storageCheck(){
+  const el = document.getElementById('storage-msg');
+  el.textContent = '查询中…';
+  try{
+    const j = await api('/api/debug/storage');
+    const top = (j.tables||[]).slice(0,4).map(t=>`${t.name} ${t.size}`).join(' · ');
+    let line = `数据库总大小 ${j.db_size} ｜ ${top}`;
+    if(j.duplicate_photo_groups > 0){ line += ` ｜ ⚠️发现 ${j.duplicate_photo_groups} 组重复图片`; }
+    if(j.orphan_photo_count > 0){ line += ` ｜ ⚠️${j.orphan_photo_count} 张孤儿图片(对应记忆已不存在)`; }
+    if(j.duplicate_photo_groups === 0 && j.orphan_photo_count === 0){ line += ' ｜ ✅ 没有异常堆积'; }
+    el.textContent = line;
+  }catch(e){ el.textContent = '检查失败:'+e.message; }
 }
 
 (async function(){

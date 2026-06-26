@@ -5227,6 +5227,41 @@ async def api_debug_token_breakdown(message: str = "宝贝我到家了"):
     }
 
 
+@app.get("/api/debug/storage")
+async def api_debug_storage():
+    """数据库占用情况(只读):各表大小 + memory_photos 重复/孤儿图片检测，方便定期自查不被图片塞满。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        db_size = await conn.fetchval("SELECT pg_size_pretty(pg_database_size(current_database()))")
+        tables = await conn.fetch("""
+            SELECT table_name AS name,
+                   pg_size_pretty(pg_total_relation_size(quote_ident(table_name))) AS size,
+                   pg_total_relation_size(quote_ident(table_name)) AS bytes
+            FROM information_schema.tables
+            WHERE table_schema='public'
+            ORDER BY bytes DESC
+        """)
+        photo_count = await conn.fetchval("SELECT COUNT(*) FROM memory_photos")
+        photo_size = await conn.fetchval("SELECT pg_size_pretty(COALESCE(SUM(length(data)),0)) FROM memory_photos")
+        dup_groups = await conn.fetchval("""
+            SELECT COUNT(*) FROM (
+                SELECT md5(data) FROM memory_photos GROUP BY md5(data) HAVING COUNT(*) > 1
+            ) t
+        """)
+        orphan_photos = await conn.fetchval("""
+            SELECT COUNT(*) FROM memory_photos mp
+            WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = mp.memory_id)
+        """)
+    return {
+        "db_size": db_size,
+        "tables": [{"name": t["name"], "size": t["size"]} for t in tables],
+        "photo_count": photo_count,
+        "photo_size": photo_size,
+        "duplicate_photo_groups": dup_groups,
+        "orphan_photo_count": orphan_photos,
+    }
+
+
 @app.post("/api/debug/memory-gate")
 async def api_debug_memory_gate(request: Request):
     """只读演示 ②/① 露骨语境闸：给一条 user 消息，返回检索原始命中(arousal/score) +
