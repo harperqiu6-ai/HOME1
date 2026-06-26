@@ -1136,6 +1136,18 @@ async def get_dream_dates() -> set:
         return {str(r["dream_date"]) for r in rows}
 
 
+async def get_memorywall_summary_by_date(date_s: str) -> str:
+    """取某个事件日期的回忆墙当日总结(mw_meta.summary)，给"昨日桥"用——优先用真实记录，不用梦。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT mw_meta->>'summary' AS summary FROM memories "
+            "WHERE mw_meta IS NOT NULL AND is_active = TRUE AND event_date = $1::date "
+            "ORDER BY created_at DESC LIMIT 1",
+            date_s)
+        return (row["summary"] or "").strip() if row else ""
+
+
 async def get_memorywall_dates() -> set:
     """回忆墙已覆盖的事件日期集合（YYYY-MM-DD），做梦时跳过这些日子。"""
     pool = await get_pool()

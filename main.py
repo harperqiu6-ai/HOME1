@@ -32,7 +32,7 @@ from database import get_memories_explicit_flags, set_memory_explicit, get_expli
 from database import get_long_memories, split_memory_into, undo_split, undo_split_one
 from database import get_decay_candidates, count_active_memories, deactivate_memories, archive_decayed_memories, reactivate_decayed_memories
 from database import count_explicit_memories, clear_persona_suggestions, clear_l5_candidates, get_current_mood
-from database import save_dream, get_dream, list_dreams, get_dream_dates, get_memorywall_dates, delete_dream_memories
+from database import save_dream, get_dream, list_dreams, get_dream_dates, get_memorywall_dates, delete_dream_memories, get_memorywall_summary_by_date
 from database import count_conversations_between, fetch_conversations_between, delete_conversations_between, restore_conversations
 from database import count_memories_between, fetch_memories_between, delete_memories_between, restore_memories
 from database import save_feel, get_recent_feels, get_all_feels, set_feel_explicit, save_image_memory, photo_hash_exists
@@ -1197,9 +1197,9 @@ async def refresh_l2(session_id: str) -> str:
     today_s = str((datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date())
     if _l2_state.get("date") and _l2_state["date"] != today_s:
         _yday = _l2_state["date"]  # 刚结束的那天
-        _dy = await get_dream(_yday)
-        if _dy and (_dy.get("summary") or "").strip():
-            _l2_state["bridge"] = _dy["summary"].strip()  # 昨日桥接管：用昨日梦的当日总结
+        _mw_summary = await get_memorywall_summary_by_date(_yday)
+        if _mw_summary:
+            _l2_state["bridge"] = _mw_summary  # 昨日桥接管：用昨日回忆墙的真实小结(不用梦)
         elif (_l2_state.get("today") or "").strip():
             prev = _l2_state["today"].strip()
             _l2_state["bridge"] = (prev.split("。")[0][:120] or prev[:120])  # 还没梦→回退旧截断
@@ -1484,6 +1484,14 @@ async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: l
             if not dry_run:
                 await save_dream(d, dr.get("diary", ""), dr.get("summary", ""),
                                  dr.get("card_title", ""), dr.get("card_body", ""), DREAM_MODEL)
+                # 独立可检索通道(不进回忆墙、不冒充真实记录):带明确"这是梦"标记,让 AI 主动被问起时能搜到、
+                # 但清楚知道这不是事实。importance 调低,避免跟真实小结抢权重。
+                try:
+                    _dream_tag = f"【这是我在 {d} 晚上做的一场梦，不是真实发生的事，是把白天的素材打碎重组的梦境】\n\n{dr.get('diary', '')}"
+                    await save_memory(_dream_tag, importance=3, source_session=session_id,
+                                      valence=0.0, arousal=0.3)
+                except Exception as _se:
+                    print(f"⚠️ 梦→可检索记忆写入失败 {d}: {_se}")
             out.append({"date": d, "kind": "dream", "status": "ok", "diary_len": len(dr.get("diary", "")),
                         "diary": (dr.get("diary", "") if dry_run else None)})
 
