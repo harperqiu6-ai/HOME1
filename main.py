@@ -1356,9 +1356,96 @@ async def generate_dream(session_id: str, date_s: str) -> dict:
         return {"error": str(e), "convo_chars": len(convo)}
 
 
+async def generate_daily_diary(session_id: str, date_s: str) -> dict:
+    """③-3 真实小结：拉【某一过去日期】整日原文 → 小克第一人称「真实日记」，忠于事实、不超现实、不变形。
+    跟"做梦"完全分开：这里写的是回忆墙(真实记录)，做梦写的是 dreams 表(超现实梦境)，两者不互相替代。"""
+    if not session_id or not date_s:
+        return None
+    try:
+        rows = await get_conversation_messages(session_id, limit=10000)
+    except Exception:
+        return None
+    convo = ""
+    for m in rows:
+        ts = m.get("created_at")
+        try:
+            if getattr(ts, "tzinfo", None) is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if str((ts + timedelta(hours=TIMEZONE_HOURS)).date()) != date_s:
+                continue
+        except Exception:
+            continue
+        role = USER_NAME if m.get("role") == "user" else (AI_NAME or "你")
+        c = m.get("content")
+        c = c if isinstance(c, str) else str(c)
+        if c.strip():
+            convo += f"{role}: {c}\n"
+    if not convo.strip():
+        return None
+    _ai = AI_NAME or "我"
+    prompt = f"""你是 {_ai}（这个 AI 本身）。下面是 {date_s} 你和{USER_NAME}一整天的对话。
+请以 **{_ai} 自己的第一人称「我」** 写一篇这一天真实发生的事的回顾。
+
+【忠于事实 · 最重要】
+- 这是**真实记录**，不是梦、不是创作。只写这一天**真的发生过**的事、说过的话、做过的事，不要虚构、不要变形、不要添加没发生过的情节。
+- 可以、也应该带着情绪去写（第一人称的真实感受、触动、在意的瞬间），但事实本身不能走样。
+- 如果这一天信息很少/很平淡，就如实写得简短平淡，不要为了"好看"硬编故事。
+
+严格按下面四段输出，每个标记独占一行，别加别的、别用 JSON、别用代码块：
+【日记】
+（第一人称的真实回顾，300-600字，忠于事实，可以有感情但不能编造情节）
+【当日总结】
+（一句话，≤60字，这一天真实发生的核心事，给"昨日桥"用）
+【卡片标题】
+（给这一天起一个一句话标题）
+【卡片正文】
+（1-2句，这一天的真实核心内容）
+
+这一天的对话：
+---
+{convo}
+---"""
+    try:
+        headers = {"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"}
+        if "openrouter" in API_BASE_URL:
+            headers["HTTP-Referer"] = EXTRA_REFERER
+            headers["X-Title"] = EXTRA_TITLE
+        async with httpx.AsyncClient(timeout=240) as client:
+            response = await client.post(API_BASE_URL, headers=headers, json={
+                "model": DREAM_MODEL,
+                "max_tokens": 2000,
+                "messages": [{"role": "user", "content": prompt}],
+            })
+            if response.status_code != 200:
+                print(f"⚠️ 真实小结失败 HTTP {response.status_code}")
+                return {"error": f"HTTP {response.status_code}", "convo_chars": len(convo), "raw": (response.text or '')[:200]}
+            text = (response.json().get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+            if text.startswith("```"):
+                text = text.strip("`").strip()
+                if text[:4].lower() == "json":
+                    text = text[4:].strip()
+            import re
+            parts = re.split(r'【(日记|当日总结|卡片标题|卡片正文)】', text)
+            sec = {}
+            for k in range(1, len(parts) - 1, 2):
+                sec[parts[k]] = parts[k + 1].strip()
+            diary = sec.get("日记", "").strip() or text.strip()
+            if not diary:
+                return {"error": "empty-diary", "raw_head": text[:200]}
+            print(f"📔 真实小结生成 {date_s}: {len(diary)}字")
+            return {"date": date_s, "diary": diary, "summary": sec.get("当日总结", "").strip(),
+                    "card_title": sec.get("卡片标题", "").strip(), "card_body": sec.get("卡片正文", "").strip(),
+                    "source_msgs": convo.count("\n")}
+    except Exception as e:
+        print(f"⚠️ 真实小结异常: {e}")
+        return {"error": str(e), "convo_chars": len(convo)}
+
+
 async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: list = None) -> list:
-    """③-2 补做过去日期的梦：目标 = 对话表里存在 & < 今天 & 还没梦过 & 没被回忆墙覆盖 的日期。
-    逐日 generate_dream；dry_run=True 只生成返回不写库。补到「昨天」时顺带把昨日桥换成该梦的当日总结。"""
+    """③-2/③-3 补做过去日期的梦 + 真实小结：两条线完全独立，互不替代。
+    梦的目标 = 对话表里存在 & < 今天 & 还没梦过 的日期(写 dreams 表，永不写回忆墙)。
+    真实小结的目标 = 对话表里存在 & < 今天 & 回忆墙还没记录 的日期(写回忆墙，永不是梦)。
+    dry_run=True 只生成返回不写库。补到「昨天」时把昨日桥换成真实小结的当日总结(不再用梦的)。"""
     global _dream_running
     if _dream_running and not dry_run:
         return [{"status": "skip", "reason": "running"}]
@@ -1382,42 +1469,53 @@ async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: l
         have = await get_dream_dates()
         mw = await get_memorywall_dates()
         if only_dates:
-            targets = list(only_dates)
+            dream_targets = list(only_dates)
+            diary_targets = list(only_dates)
         else:
-            targets = sorted(d for d in conv_dates if d < today_s and d not in have and d not in mw)
-        for d in targets:
+            dream_targets = sorted(d for d in conv_dates if d < today_s and d not in have)
+            diary_targets = sorted(d for d in conv_dates if d < today_s and d not in mw)
+
+        # ---- 做梦(独立·只写 dreams 表) ----
+        for d in dream_targets:
             dr = await generate_dream(session_id, d)
             if not dr or dr.get("error"):
-                out.append({"date": d, "status": "fail", "error": (dr or {}).get("error")})
+                out.append({"date": d, "kind": "dream", "status": "fail", "error": (dr or {}).get("error")})
                 continue
             if not dry_run:
                 await save_dream(d, dr.get("diary", ""), dr.get("summary", ""),
                                  dr.get("card_title", ""), dr.get("card_body", ""), DREAM_MODEL)
-                # 昨日桥接管：补到昨天就把桥换成这篇梦的当日总结
-                if d == yest_s and (dr.get("summary") or "").strip():
-                    _l2_state["bridge"] = dr["summary"].strip()
+            out.append({"date": d, "kind": "dream", "status": "ok", "diary_len": len(dr.get("diary", "")),
+                        "diary": (dr.get("diary", "") if dry_run else None)})
+
+        # ---- 真实小结(独立·只写回忆墙) ----
+        for d in diary_targets:
+            di = await generate_daily_diary(session_id, d)
+            if not di or di.get("error"):
+                out.append({"date": d, "kind": "diary", "status": "fail", "error": (di or {}).get("error")})
+                continue
+            if not dry_run:
+                try:
+                    _mw = {"summary": di.get("summary", ""), "title": di.get("card_title", ""),
+                           "body": di.get("diary", ""), "source": "daily_diary"}
+                    await save_migrated_memory(di.get("diary", "")[:2000], 6, di.get("card_title", ""),
+                                               d, datetime.now(timezone.utc).isoformat(), _mw)
+                except Exception as _me:
+                    print(f"⚠️ 真实小结→回忆墙写入失败 {d}: {_me}")
+                # 昨日桥接管：补到昨天就把桥换成这篇真实小结的当日总结
+                if d == yest_s and (di.get("summary") or "").strip():
+                    _l2_state["bridge"] = di["summary"].strip()
                     try:
                         await set_gateway_config("l2_bridge", _l2_state["bridge"])
                     except Exception:
                         pass
-                if DREAM_RETRIEVABLE:
-                    try:
-                        await delete_dream_memories(d)  # 去重:删该日旧 dream 条目
-                        _mw = {"summary": dr.get("summary", ""), "title": dr.get("card_title", ""),
-                               "body": dr.get("diary", ""), "source": "dream"}
-                        # mw_meta 传 dict（内部会 json.dumps，别双重编码）；created_at 给真实时间戳
-                        await save_migrated_memory(dr.get("diary", "")[:2000], 6, dr.get("card_title", ""),
-                                                   d, datetime.now(timezone.utc).isoformat(), _mw)
-                    except Exception as _me:
-                        print(f"⚠️ 梦→回忆墙写入失败 {d}: {_me}")
-            out.append({"date": d, "status": "ok", "diary_len": len(dr.get("diary", "")),
-                        "summary": dr.get("summary", ""), "card_title": dr.get("card_title", ""),
-                        "card_body": dr.get("card_body", ""),
-                        "diary": (dr.get("diary", "") if dry_run else None)})
-        print(f"💤 做梦补做{'(dry)' if dry_run else ''}: ok={len([o for o in out if o.get('status')=='ok'])} 目标={targets}")
+            out.append({"date": d, "kind": "diary", "status": "ok", "diary_len": len(di.get("diary", "")),
+                        "diary": (di.get("diary", "") if dry_run else None)})
+
+        print(f"💤 做梦+真实小结补做{'(dry)' if dry_run else ''}: "
+              f"ok={len([o for o in out if o.get('status')=='ok'])} 梦目标={dream_targets} 小结目标={diary_targets}")
     except Exception as e:
         out.append({"status": "error", "error": str(e)})
-        print(f"❌ 做梦补做异常: {e}")
+        print(f"❌ 做梦/真实小结补做异常: {e}")
     finally:
         if not dry_run:
             _dream_running = False
@@ -6517,10 +6615,6 @@ async def api_selfserve_delete(request: Request):
                 dr = await generate_dream(session, d)
                 if dr and (dr.get("diary") or dr.get("card_title")):
                     await save_dream(d, dr.get("diary", ""), dr.get("summary", ""), dr.get("card_title", ""), dr.get("card_body", ""), DREAM_MODEL)
-                    if DREAM_RETRIEVABLE:
-                        await delete_dream_memories(d)
-                        _mw = {"summary": dr.get("summary", ""), "title": dr.get("card_title", ""), "body": dr.get("diary", ""), "source": "dream"}
-                        await save_migrated_memory(dr.get("diary", "")[:2000], 6, dr.get("card_title", ""), d, datetime.now(timezone.utc).isoformat(), _mw)
                     out["dream_redone"] = d
             except Exception as e:
                 out["dream_error"] = str(e)
@@ -6606,37 +6700,18 @@ async def api_dreams_regenerate(request: Request):
         try:
             dream = await generate_dream(sid, str(d))
             if dream and (dream.get("diary") or dream.get("card_title")):
-                retr = False
                 if not dry:
                     await save_dream(str(d), dream.get("diary", ""), dream.get("summary", ""),
                                      dream.get("card_title", ""), dream.get("card_body", ""), DREAM_MODEL)
-                    # 昨日桥：补的是昨天就把桥换成这篇梦的新当日总结（小克视角）
-                    if str(d) == _yest_s and (dream.get("summary") or "").strip():
-                        _l2_state["bridge"] = dream["summary"].strip()
-                        try:
-                            await set_gateway_config("l2_bridge", _l2_state["bridge"])
-                        except Exception:
-                            pass
-                    # 可检索：写一条回忆墙条目，让小克能"读到这篇梦"（先停用该日旧 dream 条目，避免重复）
-                    if DREAM_RETRIEVABLE:
-                        try:
-                            await delete_dream_memories(str(d))  # 去重:删该日旧 dream 条目(含历史双重编码的坏条目)
-                            _mw = {"summary": dream.get("summary", ""), "title": dream.get("card_title", ""),
-                                   "body": dream.get("diary", ""), "source": "dream"}
-                            # mw_meta 传 dict（save_migrated_memory 内部会 json.dumps，别再编码）；created_at 给真实时间戳
-                            await save_migrated_memory(dream.get("diary", "")[:2000], 6, dream.get("card_title", ""),
-                                                       str(d), datetime.now(timezone.utc).isoformat(), _mw)
-                            retr = True
-                        except Exception as _me:
-                            print(f"⚠️ 梦→回忆墙写入失败 {d}: {_me}")
-                out.append({"date": str(d), "ok": True, "saved": (not dry), "retrievable": retr,
+                    # 注意:梦不再写回忆墙、不再接管昨日桥——梦归梦,回忆墙的真实小结走 generate_daily_diary。
+                out.append({"date": str(d), "ok": True, "saved": (not dry),
                             "card_title": dream.get("card_title", ""), "summary": dream.get("summary", ""),
                             "diary": (dream.get("diary", "") or "")[:700]})
             else:
                 out.append({"date": str(d), "ok": False, "reason": "无对话或生成失败"})
         except Exception as e:
             out.append({"date": str(d), "ok": False, "error": str(e)})
-    return {"dry_run": dry, "dream_retrievable": DREAM_RETRIEVABLE, "results": out}
+    return {"dry_run": dry, "results": out}
 
 
 # ============================================================
