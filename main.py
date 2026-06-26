@@ -35,7 +35,7 @@ from database import count_explicit_memories, clear_persona_suggestions, clear_l
 from database import save_dream, get_dream, list_dreams, get_dream_dates, get_memorywall_dates, delete_dream_memories
 from database import count_conversations_between, fetch_conversations_between, delete_conversations_between, restore_conversations
 from database import count_memories_between, fetch_memories_between, delete_memories_between, restore_memories
-from database import save_feel, get_recent_feels, get_all_feels, set_feel_explicit, save_image_memory
+from database import save_feel, get_recent_feels, get_all_feels, set_feel_explicit, save_image_memory, photo_hash_exists
 from database import count_conversations_since, delete_conversations_since, count_memories_since, delete_memories_since
 from database import save_persona_suggestion, list_persona_suggestions, update_persona_suggestion, save_l5_candidate, list_l5_candidates, update_l5_candidate, get_l5_candidate
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
@@ -1693,16 +1693,21 @@ async def describe_images(data_uris: list) -> str:
 
 
 async def _save_image_memory_bg(session_id: str, images: list):
-    """看图记忆(后台·铁律):描述图 → 存「阮阮发来一张照片:…」记忆 + 关联图片(下轮可检索记得,/api/photos/id 长期可取)。"""
+    """看图记忆(后台·铁律):描述图 → 存「阮阮发来一张照片:…」记忆 + 关联图片(下轮可检索记得,/api/photos/id 长期可取)。
+    去重:同一张图(按内容)如果在之前的轮次里已经存过,这一轮跳过(不重复描述、不重复写记忆),
+    避免同一张图在对话里反复出现/被引用时,每轮都生成一条几乎一样的"看图记忆"。"""
     if not images:
         return
     try:
-        desc = await describe_images(images)
         photos = []
         for u in images[:3]:
             mime, data = _decode_data_uri(u)
-            if data:
+            if data and not await photo_hash_exists(data):
                 photos.append((mime, data))
+        if not photos:
+            print("🖼️ 看图记忆跳过：本轮图片都已存过(去重)")
+            return
+        desc = await describe_images(images)
         content = f"{USER_NAME}发来一张照片" + ("，画面是：" + desc if desc else "（暂未描述）")
         mid = await save_image_memory(content, source_session=session_id, photos=photos, importance=5, arousal=0.4)
         print(f"🖼️ 看图记忆已存 #{mid}（{len(photos)}图）: {desc[:40]}")

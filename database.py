@@ -867,6 +867,16 @@ async def undo_split_one(original_id: int) -> int:
             return 0
 
 
+async def photo_hash_exists(data: bytes) -> bool:
+    """检查这张图片(按内容)是否已经存在 memory_photos 里，用于看图记忆去重(避免同一张图反复触发记忆+描述调用)。"""
+    if not data:
+        return False
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchval("SELECT 1 FROM memory_photos WHERE md5(data) = md5($1) LIMIT 1", data)
+        return bool(row)
+
+
 async def save_image_memory(content: str, source_session: str = "", photos=None,
                             importance: int = 5, valence: float = 0.0, arousal: float = 0.4) -> int:
     """看图记忆:存一条文字描述记忆 + 关联图片(memory_photos,长期可取 /api/photos/id)。返回 memory_id。
