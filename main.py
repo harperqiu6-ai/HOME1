@@ -32,7 +32,7 @@ from database import get_memories_explicit_flags, set_memory_explicit, get_expli
 from database import get_long_memories, split_memory_into, undo_split, undo_split_one
 from database import get_decay_candidates, count_active_memories, deactivate_memories, archive_decayed_memories, reactivate_decayed_memories
 from database import count_explicit_memories, clear_persona_suggestions, clear_l5_candidates, get_current_mood
-from database import save_dream, get_dream, list_dreams, get_dream_dates, get_memorywall_dates, delete_dream_memories, get_memorywall_summary_by_date
+from database import save_dream, get_dream, list_dreams, get_dream_dates, get_memorywall_dates, delete_dream_memories, get_memorywall_summary_by_date, get_avg_arousal_for_date, get_fragment_ids_for_date
 from database import count_conversations_between, fetch_conversations_between, delete_conversations_between, restore_conversations
 from database import count_memories_between, fetch_memories_between, delete_memories_between, restore_memories
 from database import save_feel, get_recent_feels, get_all_feels, set_feel_explicit, save_image_memory, photo_hash_exists
@@ -144,9 +144,12 @@ CACHE_SUMMARY_MODEL = os.getenv("CACHE_SUMMARY_MODEL", "anthropic/claude-haiku-4
 SUMMARY_QUALITY_ENABLED = os.getenv("SUMMARY_QUALITY_ENABLED", "false").lower() == "true"
 # ③-2 做梦用的模型：默认同摘要模型(haiku,数字证明能保质感)；要更浓质感可 env 调成主力模型
 DREAM_MODEL = os.getenv("DREAM_MODEL", "") or CACHE_SUMMARY_MODEL
-# ③-2 做梦开关：DREAM_ENABLED 总开关；DREAM_RETRIEVABLE 每篇梦顺带写一条可检索回忆墙条目(默认关)
+# ③-2 做梦开关：DREAM_ENABLED 总开关；DREAM_RETRIEVABLE 每篇梦顺带写一条可检索回忆墙条目(默认关，已废弃不用)
 DREAM_ENABLED = os.getenv("DREAM_ENABLED", "true").lower() == "true"
 DREAM_RETRIEVABLE = os.getenv("DREAM_RETRIEVABLE", "false").lower() == "true"
+# 做梦概率化：不是每天都做梦。投骰子(默认40%)，或当天平均情绪唤起(arousal)够高(默认>=0.6)则强制做梦。
+DREAM_PROBABILITY = float(os.getenv("DREAM_PROBABILITY", "0.4"))
+DREAM_AROUSAL_FORCE_THRESHOLD = float(os.getenv("DREAM_AROUSAL_FORCE_THRESHOLD", "0.6"))
 # 滚动摘要封顶：摘要区 = 前言 +〔早期小结〕+ 最近N段。段数超 N+B → 后台把最老B段卷进早期小结(默认关到验收)
 SUMMARY_CAP_ENABLED = os.getenv("SUMMARY_CAP_ENABLED", "false").lower() == "true"
 SUMMARY_CAP_N = int(os.getenv("SUMMARY_CAP_N", "8"))
@@ -1447,6 +1450,7 @@ async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: l
     真实小结的目标 = 对话表里存在 & < 今天 & 回忆墙还没记录 的日期(写回忆墙，永不是梦)。
     dry_run=True 只生成返回不写库。补到「昨天」时把昨日桥换成真实小结的当日总结(不再用梦的)。"""
     global _dream_running
+    import random
     if _dream_running and not dry_run:
         return [{"status": "skip", "reason": "running"}]
     out = []
@@ -1475,8 +1479,15 @@ async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: l
             dream_targets = sorted(d for d in conv_dates if d < today_s and d not in have)
             diary_targets = sorted(d for d in conv_dates if d < today_s and d not in mw)
 
-        # ---- 做梦(独立·只写 dreams 表) ----
+        # ---- 做梦(独立·只写 dreams 表；不是每天都做，投骰子+情绪兜底) ----
         for d in dream_targets:
+            if not only_dates:
+                _avg_a = await get_avg_arousal_for_date(d)
+                _forced = _avg_a is not None and _avg_a >= DREAM_AROUSAL_FORCE_THRESHOLD
+                if not _forced and random.random() >= DREAM_PROBABILITY:
+                    out.append({"date": d, "kind": "dream", "status": "skip",
+                                "reason": f"投骰子未中且情绪不够高(avg_arousal={_avg_a})"})
+                    continue
             dr = await generate_dream(session_id, d)
             if not dr or dr.get("error"):
                 out.append({"date": d, "kind": "dream", "status": "fail", "error": (dr or {}).get("error")})
@@ -1510,6 +1521,14 @@ async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: l
                                                d, datetime.now(timezone.utc).isoformat(), _mw)
                 except Exception as _me:
                     print(f"⚠️ 真实小结→回忆墙写入失败 {d}: {_me}")
+                # 回忆墙已经覆盖这天了，当天的碎片就是冗余(占检索名额、内容重复)→ 归档(可逆，不是删除)
+                try:
+                    _frag_ids = await get_fragment_ids_for_date(d)
+                    if _frag_ids:
+                        await archive_decayed_memories(_frag_ids)
+                        print(f"🗂️ 回忆墙覆盖{d}后归档{len(_frag_ids)}条当天碎片(可逆)")
+                except Exception as _ae:
+                    print(f"⚠️ 归档{d}碎片失败: {_ae}")
                 # 昨日桥接管：补到昨天就把桥换成这篇真实小结的当日总结
                 if d == yest_s and (di.get("summary") or "").strip():
                     _l2_state["bridge"] = di["summary"].strip()

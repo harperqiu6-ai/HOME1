@@ -1136,6 +1136,46 @@ async def get_dream_dates() -> set:
         return {str(r["dream_date"]) for r in rows}
 
 
+async def get_avg_arousal_for_date(date_s) -> float:
+    """某个本地日期当天活跃记忆的平均 arousal，供"做梦"决定要不要强制触发(情绪够高就不掷骰子了)。
+    没有数据返回 None。"""
+    local_tz = dt_timezone(timedelta(hours=TIMEZONE_HOURS))
+    if isinstance(date_s, str):
+        y, m, d = (int(x) for x in date_s.split("-"))
+    else:
+        y, m, d = date_s.year, date_s.month, date_s.day
+    start_utc = datetime(y, m, d, tzinfo=local_tz).astimezone(dt_timezone.utc)
+    end_utc = start_utc + timedelta(days=1)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT AVG(arousal)::float AS a FROM memories "
+            "WHERE is_active = TRUE AND created_at >= $1 AND created_at < $2",
+            start_utc, end_utc)
+        return row["a"] if row and row["a"] is not None else None
+
+
+async def get_fragment_ids_for_date(date_s) -> list:
+    """某个本地日期当天、还活跃的 layer1 碎片 id 列表(排除做梦写的可检索条目)，
+    供回忆墙生成后归档当天碎片用(回忆墙已经覆盖,碎片留着只是冗余,占检索名额)。"""
+    local_tz = dt_timezone(timedelta(hours=TIMEZONE_HOURS))
+    if isinstance(date_s, str):
+        y, m, d = (int(x) for x in date_s.split("-"))
+    else:
+        y, m, d = date_s.year, date_s.month, date_s.day
+    start_utc = datetime(y, m, d, tzinfo=local_tz).astimezone(dt_timezone.utc)
+    end_utc = start_utc + timedelta(days=1)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id FROM memories "
+            "WHERE layer = 1 AND is_active = TRUE AND mw_meta IS NULL "
+            "AND created_at >= $1 AND created_at < $2 "
+            "AND content NOT LIKE '%晚上做的一场梦，不是真实发生的事%'",
+            start_utc, end_utc)
+        return [r["id"] for r in rows]
+
+
 async def get_memorywall_summary_by_date(date_s: str) -> str:
     """取某个事件日期的回忆墙当日总结(mw_meta.summary)，给"昨日桥"用——优先用真实记录，不用梦。"""
     pool = await get_pool()
