@@ -1496,7 +1496,8 @@ async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: l
             if not dry_run:
                 try:
                     _mw = {"summary": di.get("summary", ""), "title": di.get("card_title", ""),
-                           "body": di.get("diary", ""), "source": "daily_diary"}
+                           "body": di.get("diary", ""), "source": "daily_diary",
+                           "author": "xiaoke", "author_cn": (AI_NAME or "V")}
                     await save_migrated_memory(di.get("diary", "")[:2000], 6, di.get("card_title", ""),
                                                d, datetime.now(timezone.utc).isoformat(), _mw)
                 except Exception as _me:
