@@ -2146,6 +2146,24 @@ async def get_conversation_messages(session_id: str, limit: int = 100):
         return [dict(r) for r in rows]
 
 
+async def get_all_conversations_for_date(date_s) -> list:
+    """某个本地日期当天、**所有对话线**的消息(按时间正序，带 session_id)。
+    供回忆墙日记"跨线合读"用：让当天 RP 线等其它线的内容也折进同一篇当日回忆墙。"""
+    local_tz = dt_timezone(timedelta(hours=TIMEZONE_HOURS))
+    y, m, d = (int(x) for x in str(date_s).split("-"))
+    start_utc = datetime(y, m, d, tzinfo=local_tz).astimezone(dt_timezone.utc)
+    end_utc = start_utc + timedelta(days=1)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT session_id, role, content, metadata, created_at
+            FROM conversations
+            WHERE created_at >= $1 AND created_at < $2
+            ORDER BY created_at ASC
+        """, start_utc, end_utc)
+        return [dict(r) for r in rows]
+
+
 # ============================================================
 # 分区缓存状态管理
 # ============================================================

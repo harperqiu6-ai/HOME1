@@ -17,6 +17,7 @@ import json
 import uuid
 import asyncio
 import secrets
+import contextvars
 import httpx
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
@@ -32,7 +33,7 @@ from database import get_memories_explicit_flags, set_memory_explicit, get_expli
 from database import get_long_memories, split_memory_into, undo_split, undo_split_one
 from database import get_decay_candidates, count_active_memories, deactivate_memories, archive_decayed_memories, reactivate_decayed_memories
 from database import count_explicit_memories, clear_persona_suggestions, clear_l5_candidates, get_current_mood
-from database import save_dream, get_dream, list_dreams, get_dream_dates, get_memorywall_dates, delete_dream_memories, get_memorywall_summary_by_date, get_avg_arousal_for_date, get_fragment_ids_for_date
+from database import save_dream, get_dream, list_dreams, get_dream_dates, get_memorywall_dates, delete_dream_memories, get_memorywall_summary_by_date, get_avg_arousal_for_date, get_fragment_ids_for_date, get_all_conversations_for_date
 from database import count_conversations_between, fetch_conversations_between, delete_conversations_between, restore_conversations
 from database import count_memories_between, fetch_memories_between, delete_memories_between, restore_memories
 from database import save_feel, get_recent_feels, get_all_feels, set_feel_explicit, save_image_memory, photo_hash_exists
@@ -194,8 +195,12 @@ CACHE_PARTITION_TRIGGER = os.getenv("CACHE_PARTITION_TRIGGER", "rounds")  # roun
 CACHE_PARTITION_WINDOW = int(os.getenv("CACHE_PARTITION_WINDOW", "30"))  # 时间窗口（分钟），仅 trigger=time 时生效
 PARTITION_SESSION_ID = os.getenv("PARTITION_SESSION_ID", "")
 
+# 每请求对话线：客户端用 X-Session-Line 头指定走哪条线(如 main/rp)，用 contextvars 存，
+# 同一请求里派生的 async 后台任务会自动继承；没传头就回落到全局 PARTITION_SESSION_ID(老行为完全不变)。
+_request_session_line = contextvars.ContextVar("request_session_line", default=None)
+
 def get_active_session_id() -> str:
-    return PARTITION_SESSION_ID
+    return _request_session_line.get() or PARTITION_SESSION_ID
 
 # 时区偏移（小时），用于记忆注入时的日期显示，默认 UTC+8
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
@@ -1365,19 +1370,13 @@ async def generate_daily_diary(session_id: str, date_s: str) -> dict:
     if not session_id or not date_s:
         return None
     try:
-        rows = await get_conversation_messages(session_id, limit=10000)
+        # 回忆墙跨线合读：当天**所有线**(主线+RP线等)的对话一起读，让 RP 那天写的也折进同一篇当日回忆墙。
+        # 查询已按当天本地日界限框定，下面无需再逐条判日期。
+        rows = await get_all_conversations_for_date(date_s)
     except Exception:
         return None
     convo = ""
     for m in rows:
-        ts = m.get("created_at")
-        try:
-            if getattr(ts, "tzinfo", None) is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            if str((ts + timedelta(hours=TIMEZONE_HOURS)).date()) != date_s:
-                continue
-        except Exception:
-            continue
         role = USER_NAME if m.get("role") == "user" else (AI_NAME or "你")
         c = m.get("content")
         c = c if isinstance(c, str) else str(c)
@@ -2433,8 +2432,10 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
                 except Exception:
                     pass
                 try:
-                    asyncio.create_task(maybe_run_dreams(session_id))
-                    print(f"💤 做梦懒触发：新的一天 {_today_local}，后台补做过去日")
+                    # 做梦/回忆墙永远钉在主线(全局 PARTITION_SESSION_ID)，rp 等其它线绝不生成日记/梦
+                    _dream_sid = PARTITION_SESSION_ID or session_id
+                    asyncio.create_task(maybe_run_dreams(_dream_sid))
+                    print(f"💤 做梦懒触发：新的一天 {_today_local}，后台补做过去日(线={_dream_sid})")
                 except Exception as _de:
                     print(f"⚠️ 做梦调度失败: {_de}")
 
@@ -2620,6 +2621,16 @@ async def chat_completions(request: Request):
     # ---------- 检测是否应跳过对话存储 ----------
     # 客户端通过header显式声明（如标题生成等辅助请求）
     skip_conversation_log = request.headers.get("X-Skip-Conversation-Log", "").lower() == "true"
+
+    # ---------- 每请求对话线 X-Session-Line（KELIVO 不同助手带不同头 → 走不同线）----------
+    # 只允许简单字符当线名(防注入怪 session_id)；没传/为空就不设，get_active_session_id() 回落全局(老行为不变)
+    _line = (request.headers.get("X-Session-Line", "") or "").strip()
+    if _line:
+        import re as _re
+        if _re.fullmatch(r"[A-Za-z0-9_-]{1,32}", _line):
+            _request_session_line.set(_line)
+        else:
+            print(f"⚠️ 忽略非法 X-Session-Line: {_line!r}")
     
     # ---------- 提取用户最新消息 ----------
     user_message = ""
