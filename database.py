@@ -782,9 +782,11 @@ async def save_memory(content: str, importance: int = 5, source_session: str = "
         # 情绪① 夹紧到合法范围（arousal 默认 0.2 兼作地板，避免后续衰减乘到 0 退化）
         _val = max(-1.0, min(1.0, float(valence if valence is not None else 0.0)))
         _aro = max(0.0, min(1.0, float(arousal if arousal is not None else 0.2)))
+        # 实时写入的碎片：event_date 直接落本地"今天"，供回忆墙生成后按事件日归档当天碎片用
+        _event_date = (datetime.now(dt_timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date()
         row = await conn.fetchrow(
-            "INSERT INTO memories (content, importance, source_session, valence, arousal, is_explicit) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
-            content, importance, source_session, _val, _aro, bool(is_explicit),
+            "INSERT INTO memories (content, importance, source_session, valence, arousal, is_explicit, event_date) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+            content, importance, source_session, _val, _aro, bool(is_explicit), _event_date,
         )
         
         # MEMORY_VECTOR_ENABLED 时自动计算 embedding
@@ -1157,16 +1159,25 @@ async def get_avg_arousal_for_date(date_s) -> float:
 
 async def get_fragment_ids_for_date(date_s) -> list:
     """某个本地日期当天、还活跃的 layer1 碎片 id 列表(排除做梦写的可检索条目)，
-    供回忆墙生成后归档当天碎片用(回忆墙已经覆盖,碎片留着只是冗余,占检索名额)。"""
+    供回忆墙生成后归档当天碎片用(回忆墙已经覆盖,碎片留着只是冗余,占检索名额)。
+    匹配口径：event_date有值就按它(历史导入数据的真实事件日，created_at是导入时间不可信)；
+    event_date为空(老的实时碎片，写入时没补这个字段)才退回按created_at落在本地这一天判断。"""
     date_str = date_s if isinstance(date_s, str) else str(date_s)
+    local_tz = dt_timezone(timedelta(hours=TIMEZONE_HOURS))
+    if isinstance(date_s, str):
+        y, m, d = (int(x) for x in date_s.split("-"))
+    else:
+        y, m, d = date_s.year, date_s.month, date_s.day
+    start_utc = datetime(y, m, d, tzinfo=local_tz).astimezone(dt_timezone.utc)
+    end_utc = start_utc + timedelta(days=1)
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT id FROM memories "
             "WHERE layer = 1 AND is_active = TRUE AND mw_meta IS NULL "
-            "AND event_date = $1::date "
+            "AND (event_date = $1::date OR (event_date IS NULL AND created_at >= $2 AND created_at < $3)) "
             "AND content NOT LIKE '%晚上做的一场梦，不是真实发生的事%'",
-            date_str)
+            date_str, start_utc, end_utc)
         return [r["id"] for r in rows]
 
 
