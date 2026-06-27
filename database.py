@@ -1158,21 +1158,15 @@ async def get_avg_arousal_for_date(date_s) -> float:
 async def get_fragment_ids_for_date(date_s) -> list:
     """某个本地日期当天、还活跃的 layer1 碎片 id 列表(排除做梦写的可检索条目)，
     供回忆墙生成后归档当天碎片用(回忆墙已经覆盖,碎片留着只是冗余,占检索名额)。"""
-    local_tz = dt_timezone(timedelta(hours=TIMEZONE_HOURS))
-    if isinstance(date_s, str):
-        y, m, d = (int(x) for x in date_s.split("-"))
-    else:
-        y, m, d = date_s.year, date_s.month, date_s.day
-    start_utc = datetime(y, m, d, tzinfo=local_tz).astimezone(dt_timezone.utc)
-    end_utc = start_utc + timedelta(days=1)
+    date_str = date_s if isinstance(date_s, str) else str(date_s)
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT id FROM memories "
             "WHERE layer = 1 AND is_active = TRUE AND mw_meta IS NULL "
-            "AND created_at >= $1 AND created_at < $2 "
+            "AND event_date = $1::date "
             "AND content NOT LIKE '%晚上做的一场梦，不是真实发生的事%'",
-            start_utc, end_utc)
+            date_str)
         return [r["id"] for r in rows]
 
 
