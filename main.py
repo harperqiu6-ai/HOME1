@@ -195,9 +195,6 @@ CACHE_PARTITION_TRIGGER = os.getenv("CACHE_PARTITION_TRIGGER", "rounds")  # roun
 CACHE_PARTITION_WINDOW = int(os.getenv("CACHE_PARTITION_WINDOW", "30"))  # 时间窗口（分钟），仅 trigger=time 时生效
 PARTITION_SESSION_ID = os.getenv("PARTITION_SESSION_ID", "")
 
-# 子线(rp)借主线"近况背景"时，逐字尾巴只取最近 N 轮(中间段靠主线摘要+记忆库召回)。0=全取(不限)。
-MAIN_BG_TAIL_ROUNDS = int(os.getenv("MAIN_BG_TAIL_ROUNDS", "9"))
-
 # 每请求对话线：客户端用 X-Session-Line 头指定走哪条线(如 main/rp)，用 contextvars 存，
 # 同一请求里派生的 async 后台任务会自动继承；没传头就回落到全局 PARTITION_SESSION_ID(老行为完全不变)。
 _request_session_line = contextvars.ContextVar("request_session_line", default=None)
@@ -1875,9 +1872,7 @@ async def _compose_main_background() -> str:
         a_start = st.get("a_start_round") or 0
         rows = await get_conversation_messages(main_sid, limit=10000)
         rnds = group_by_rounds([{"role": r.get("role"), "content": (r.get("content") or "")} for r in rows])
-        # 借主线逐字尾巴：只取「a_start 之后」里**最近 MAIN_BG_TAIL_ROUNDS 轮**(省token,中间段靠摘要+记忆库召回)
-        _tail_all = rnds[a_start:] if a_start < len(rnds) else []
-        tail_rounds = _tail_all[-MAIN_BG_TAIL_ROUNDS:] if MAIN_BG_TAIL_ROUNDS > 0 else _tail_all
+        tail_rounds = rnds[a_start:] if a_start < len(rnds) else []
         tail_txt = ""
         for rnd in tail_rounds:
             for m in rnd:
