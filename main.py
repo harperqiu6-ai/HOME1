@@ -195,6 +195,9 @@ CACHE_PARTITION_TRIGGER = os.getenv("CACHE_PARTITION_TRIGGER", "rounds")  # roun
 CACHE_PARTITION_WINDOW = int(os.getenv("CACHE_PARTITION_WINDOW", "30"))  # 时间窗口（分钟），仅 trigger=time 时生效
 PARTITION_SESSION_ID = os.getenv("PARTITION_SESSION_ID", "")
 
+# 子线(rp)借主线"近况背景"时，逐字尾巴只取最近 N 轮(中间段靠主线摘要+记忆库召回)。0=全取。
+MAIN_BG_TAIL_ROUNDS = int(os.getenv("MAIN_BG_TAIL_ROUNDS", "9"))
+
 # 每请求对话线：客户端用 X-Session-Line 头指定走哪条线(如 main/rp)，用 contextvars 存，
 # 同一请求里派生的 async 后台任务会自动继承；没传头就回落到全局 PARTITION_SESSION_ID(老行为完全不变)。
 _request_session_line = contextvars.ContextVar("request_session_line", default=None)
@@ -1859,6 +1862,48 @@ def _assemble_current_user(parts: list, current_user_msg: dict) -> dict:
     return {"role": "user", "content": "\n\n".join(list(parts) + [content if content is not None else ""])}
 
 
+async def _compose_main_background() -> str:
+    """非主线(如 rp)专用：实时读主线(PARTITION_SESSION_ID)的【当前摘要 + 最近N轮逐字尾巴】拼成一段文本，
+    供拼进人设(同一system块,不新增缓存断点)，让 V 在子线也实时知道主线最近(含今天)的事，零时差。主线自己返回空。"""
+    main_sid = PARTITION_SESSION_ID
+    if not main_sid or get_active_session_id() == main_sid:
+        return ""
+    try:
+        st = await get_session_cache_state(main_sid)
+        parts = st.get("summary_parts") or []
+        early = (st.get("early_summary") or "").strip()
+        a_start = st.get("a_start_round") or 0
+        rows = await get_conversation_messages(main_sid, limit=10000)
+        rnds = group_by_rounds([{"role": r.get("role"), "content": (r.get("content") or "")} for r in rows])
+        _tail_all = rnds[a_start:] if a_start < len(rnds) else []
+        tail_rounds = _tail_all[-MAIN_BG_TAIL_ROUNDS:] if MAIN_BG_TAIL_ROUNDS > 0 else _tail_all
+        tail_txt = ""
+        for rnd in tail_rounds:
+            for m in rnd:
+                c = (m.get("content") or "").strip()
+                if c:
+                    role = USER_NAME if m.get("role") == "user" else (AI_NAME or "我")
+                    tail_txt += f"{role}: {c}\n"
+        seg = []
+        if early:
+            seg.append("〔更早〕" + early)
+        if parts:
+            seg.append("\n".join(parts))
+        body = "\n".join(seg).strip()
+        if not body and not tail_txt.strip():
+            return ""
+        out = (f"\n\n【主线近况——这是同一个你和{USER_NAME}在主线最近的真实对话，"
+               f"在这条线里也要记得这些、保持连续，别像换了个人或停在过去】\n")
+        if body:
+            out += body + "\n"
+        if tail_txt.strip():
+            out += "最近逐字对话：\n" + tail_txt
+        return out.rstrip()
+    except Exception as _e:
+        print(f"⚠️ 主线近况背景组装失败: {_e}")
+        return ""
+
+
 async def build_partitioned_messages(
     session_id: str,
     all_messages: list,
@@ -1953,6 +1998,10 @@ async def build_partitioned_messages(
             asyncio.create_task(_bg_summary_cap(session_id))
     
     # 拼装messages
+    # 主线近况：非主线(rp)把主线摘要+最近N轮逐字【拼进人设文本】(同一system块,不新增缓存断点/不新增消息,避免超4断点上限→502)
+    _mbg = await _compose_main_background()
+    if _mbg:
+        base_prompt = (base_prompt or "") + _mbg
     result = []
     if base_prompt:
         result.append({
@@ -2041,6 +2090,10 @@ async def _build_basic_cached(
     drift: bool = True,
 ) -> list:
     """基础版prompt caching（历史不够分区时的降级模式）"""
+    # 主线近况：非主线(rp)把主线摘要+最近N轮逐字【拼进人设文本】(同一system块,不新增缓存断点/不新增消息,避免超4断点上限→502)
+    _mbg = await _compose_main_background()
+    if _mbg:
+        base_prompt = (base_prompt or "") + _mbg
     result = []
     if base_prompt:
         result.append({
