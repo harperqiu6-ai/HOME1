@@ -2146,6 +2146,18 @@ async def get_conversation_messages(session_id: str, limit: int = 100):
         return [dict(r) for r in rows]
 
 
+async def archive_line_conversations(session_id: str) -> dict:
+    """把某条线的对话整体挪到一个带时间戳的归档线(可逆软归档，不是真删)，原线随之清空。
+    给"归档RP"用：原文离开活跃线→不再占 token，但仍在库里可找回。返回 {moved, archive_session_id}。"""
+    archive_id = f"{session_id}__archive__{datetime.now(dt_timezone.utc).strftime('%Y%m%d%H%M%S')}"
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE conversations SET session_id = $1 WHERE session_id = $2",
+            archive_id, session_id)
+    return {"moved": _rowcount(res), "archive_session_id": archive_id}
+
+
 async def get_all_conversations_for_date(date_s) -> list:
     """某个本地日期当天、**所有对话线**的消息(按时间正序，带 session_id)。
     供回忆墙日记"跨线合读"用：让当天 RP 线等其它线的内容也折进同一篇当日回忆墙。"""

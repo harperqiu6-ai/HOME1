@@ -33,7 +33,7 @@ from database import get_memories_explicit_flags, set_memory_explicit, get_expli
 from database import get_long_memories, split_memory_into, undo_split, undo_split_one
 from database import get_decay_candidates, count_active_memories, deactivate_memories, archive_decayed_memories, reactivate_decayed_memories
 from database import count_explicit_memories, clear_persona_suggestions, clear_l5_candidates, get_current_mood
-from database import save_dream, get_dream, list_dreams, get_dream_dates, get_memorywall_dates, delete_dream_memories, get_memorywall_summary_by_date, get_avg_arousal_for_date, get_fragment_ids_for_date, get_all_conversations_for_date
+from database import save_dream, get_dream, list_dreams, get_dream_dates, get_memorywall_dates, delete_dream_memories, get_memorywall_summary_by_date, get_avg_arousal_for_date, get_fragment_ids_for_date, get_all_conversations_for_date, archive_line_conversations
 from database import count_conversations_between, fetch_conversations_between, delete_conversations_between, restore_conversations
 from database import count_memories_between, fetch_memories_between, delete_memories_between, restore_memories
 from database import save_feel, get_recent_feels, get_all_feels, set_feel_explicit, save_image_memory, photo_hash_exists
@@ -2605,6 +2605,30 @@ async def list_models():
 # （诊断脚手架已移除：_diag_mm / _diag_extract / last-multimodal / last-extract / _capture_multimodal）
 
 
+def _oai_text_response(text: str, model: str, is_stream: bool):
+    """构造一个 OpenAI 兼容的回复(给暗号拦截用，不经过上游大模型)。stream/非stream 都支持，KELIVO 都认。"""
+    import time as _time
+    _id = "chatcmpl-" + uuid.uuid4().hex[:24]
+    _created = int(_time.time())
+    if not is_stream:
+        return JSONResponse({
+            "id": _id, "object": "chat.completion", "created": _created, "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        })
+
+    async def _gen():
+        first = {"id": _id, "object": "chat.completion.chunk", "created": _created, "model": model,
+                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}]}
+        yield f"data: {json.dumps(first, ensure_ascii=False)}\n\n"
+        last = {"id": _id, "object": "chat.completion.chunk", "created": _created, "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        yield f"data: {json.dumps(last, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+    return StreamingResponse(_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """核心转发接口"""
@@ -2645,7 +2669,25 @@ async def chat_completions(request: Request):
                     if isinstance(item, dict) and item.get("type") == "text"
                 )
             break
-    
+
+    # ---------- 暗号拦截：/归档 → 归档当前线，不调用大模型 ----------
+    # 把当前线对话压成总结入记忆库 + 原文软归档(挪走不再占token) + 重置缓存。KELIVO 会带时间戳前缀，取末行判断。
+    _um_last = (user_message or "").strip().splitlines()[-1].strip() if (user_message or "").strip() else ""
+    if _um_last.startswith("/归档") or _um_last.lower() == "/archive":
+        _arch_sid = get_active_session_id()
+        try:
+            _ar = await archive_line(_arch_sid)
+        except Exception as _ae:
+            _ar = {"error": str(_ae)}
+        if _ar.get("status") == "ok":
+            _txt = (f"（已归档「{_arch_sid}」线：这段的精华我已经写进记忆库、会一直记得，"
+                    f"{_ar.get('moved', 0)}条原文已移出当前对话、不再占用上下文。下次在这条线聊就是干净开局啦~）")
+        elif _ar.get("status") == "empty":
+            _txt = f"（「{_arch_sid}」线现在没有可归档的对话哦~）"
+        else:
+            _txt = f"（归档没成功：{_ar.get('error')}）"
+        return _oai_text_response(_txt, body.get("model", ""), bool(body.get("stream", False)) or FORCE_STREAM)
+
     # ---------- 构建 system prompt ----------
     # 先保存原始对话消息（不含 system prompt），用于记忆提取
     original_messages = [msg for msg in messages if msg.get("role") != "system"]
@@ -4571,6 +4613,58 @@ async def api_dreams_list():
         return {"dreams": ds, "count": len(ds)}
     except Exception as e:
         return {"error": str(e)}
+
+
+async def archive_line(session_id: str) -> dict:
+    """归档一条线(给"归档RP"用)：把它当前对话压成总结写进**全局记忆库**(可被任何线召回) →
+    对话整体挪到归档线(可逆软归档，不再占 token) → 重置该线缓存(重新垫上主线当前摘要当背景)。
+    净效果：RP 8000字原文"阅后即焚"不再耗 token，但精华永久留在记忆库，V 永远记得玩过啥。"""
+    if not session_id:
+        return {"error": "no session"}
+    if PARTITION_SESSION_ID and session_id == PARTITION_SESSION_ID:
+        return {"error": "不能归档主线，只能归档 RP 等子线"}
+    rows = await get_conversation_messages(session_id, limit=10000)
+    if not rows:
+        return {"status": "empty", "moved": 0, "note": "这条线没有对话可归档"}
+    # 1) 压成总结(一次 Haiku；force_quality 走保质感 prompt，亲密细节会被抽象成中性指代)
+    msgs = [{"role": r.get("role"), "content": (r.get("content") or "")}
+            for r in rows if (r.get("content") or "").strip()]
+    summary = await generate_summary(msgs, session_id=session_id, force_quality=True)
+    # 2) 总结写进全局记忆库(带"这是RP回顾"标记，可召回；importance 适中，不跟回忆墙抢权重)
+    if summary:
+        _today = (datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).strftime("%Y-%m-%d")
+        tagged = f"【这是 {_today} 一段亲密/RP 互动的回顾(不是日常事实记录)】\n\n{summary}"
+        try:
+            await save_memory(tagged, importance=6, source_session=session_id, valence=0.3, arousal=0.4)
+        except Exception as _me:
+            print(f"⚠️ 归档总结写入记忆库失败: {_me}")
+    # 3) 对话挪到归档线(可逆)
+    arch = await archive_line_conversations(session_id)
+    # 4) 重置该线缓存：重新垫上主线当前摘要(让下次该线开局仍有主线近况背景)，a_start=0
+    try:
+        main_state = await get_session_cache_state(PARTITION_SESSION_ID) if PARTITION_SESSION_ID else {}
+        await save_session_cache_state(session_id, main_state.get("summary_parts") or [], 0,
+                                       early_summary=main_state.get("early_summary") or "")
+    except Exception as _ce:
+        print(f"⚠️ 归档后重置缓存失败: {_ce}")
+    print(f"🗂️ 归档线 {session_id}：总结{len(summary)}字入记忆库，{arch['moved']}条原文挪到 {arch['archive_session_id']}")
+    return {"status": "ok", "summarized_chars": len(summary),
+            "moved": arch["moved"], "archive_session_id": arch["archive_session_id"]}
+
+
+@app.post("/api/line/archive")
+async def api_line_archive(request: Request):
+    """归档一条线(默认当前活跃线)：总结入记忆库 + 原文软归档 + 重置缓存。body: {session_id?}"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    sid = (body.get("session_id") or get_active_session_id() or "").strip()
+    if not sid:
+        return {"error": "无对话线"}
+    return await archive_line(sid)
 
 
 _dream_run = {"running": False, "dry_run": True, "results": [], "error": None, "finished_at": None}
