@@ -554,7 +554,7 @@ templates = Jinja2Templates(directory="templates")
 # ============================================================
 
 # 不需要鉴权的路径（根路径精确匹配，其余按前缀匹配）
-PUBLIC_PATHS = ("/", "/static/", "/health", "/favicon.ico")
+PUBLIC_PATHS = ("/", "/static/", "/health", "/favicon.ico", "/telegram/")
 
 @app.middleware("http")
 async def gateway_auth_middleware(request: Request, call_next):
@@ -715,7 +715,7 @@ async def build_system_prompt_with_memories(user_message: str, drift: bool = Tru
                 ))
             except Exception as _e:
                 print(f"⚠️ 心情漂移调度失败: {_e}")
-        
+
         # 格式化记忆文本（带日期，帮助模型判断新旧）
         _kws = extract_search_keywords(user_message)
         memory_lines = []
@@ -3597,7 +3597,8 @@ async def _decide_and_write(persona: str, transcript: str, silence_min: float, i
         "如果此刻确实没什么好说、或刚道过别/晚安，就别发(reach_out=false)。\n"
         "只输出一个 JSON，不要任何别的文字：\n"
         '{"reach_out": true或false, "urgent": true或false, "message": "你要发的那句话"}\n'
-        f"message 用你一贯的口吻、第一人称、≤40字，像真的在惦记{USER_NAME}、自然开口，别像通知或念稿。\n"
+        f"message 必须像**在微信上直接打字发给{USER_NAME}的一句话**：纯口语、第一人称、≤40字、自然开口、像真的在惦记她，别像通知或念稿。\n"
+        "【硬性】哪怕你平时说话爱带动作/神态描写，这条推送**绝不能有任何动作旁白**——星号或括号里的小动作一律不准（如「*推开门*」「（歪头）」「(轻笑)」「*抱住你*」），只发要说的话本身，就像发微信。\n"
         "urgent 仅当对话里确有吵架/情绪未解时才为 true。"
     )
     try:
@@ -3697,6 +3698,11 @@ async def maybe_send_proactive(force: bool = False) -> dict:
         return {"sent": False, "reason": "ai_decided_skip"}
     urgent = bool(decision.get("urgent"))
     text = (decision.get("message") or "").strip()
+    # 兜底擦掉动作旁白：*推开门* / （歪头） / (轻笑) 这类小动作，只擦短的、不动正文
+    import re as _re2
+    text = _re2.sub(r'\*[^*]{0,20}\*', '', text)
+    text = _re2.sub(r'[（(][^（）()]{0,15}[）)]', '', text)
+    text = _re2.sub(r'\s{2,}', ' ', text).strip()
     if not text:
         return {"sent": False, "reason": "empty_message"}
 
@@ -3709,6 +3715,13 @@ async def maybe_send_proactive(force: bool = False) -> dict:
     ok = await _bark_push(cfg["bark_url"], title, text, urgent=urgent, icon=cfg.get("push_icon", ""))
     if not ok:
         return {"sent": False, "reason": "bark_failed", "message": text}
+    # 同时把这条主动私信发到 Telegram(若已绑定)
+    try:
+        _tgc = await get_tg_config()
+        if _tgc["tg_enabled"] and _tgc["tg_bot_token"] and _tgc["tg_chat_id"]:
+            await _tg_send(_tgc["tg_bot_token"], _tgc["tg_chat_id"], text)
+    except Exception as _te:
+        print(f"⚠️ TG 主动推送失败: {_te}")
     try:
         meta = _json_push.dumps({"proactive_push": True, "urgent": urgent})
         await save_message(sid, "assistant", text, PROACTIVE_MODEL, metadata=meta)
@@ -3774,6 +3787,178 @@ async def api_push_run(request: Request):
     except Exception:
         pass
     return await maybe_send_proactive(force=force)
+
+
+# ============================================================
+# Telegram 接入：在 TG 里直接和 AI 聊(复用同一套大脑/记忆/人设)
+#   webhook 收到消息 → 内部自调用 /v1/chat/completions → 回复发回 TG
+#   只服务"绑定的主人"(tg_chat_id, 首条消息自动锁定), 陌生人忽略
+# ============================================================
+TG_API_BASE = "https://api.telegram.org"
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://home1-htca.onrender.com").rstrip("/")
+
+TG_DEFAULTS = {
+    "tg_enabled":   False,   # 总开关
+    "tg_bot_token": "",      # @BotFather 给的 token(回退环境变量 TELEGRAM_BOT_TOKEN)
+    "tg_chat_id":   "",      # 绑定的主人 chat_id(首条消息自动锁定)
+    "tg_secret":    "",      # webhook 路径密钥(自动生成)
+}
+
+
+async def get_tg_config() -> dict:
+    cfg = dict(TG_DEFAULTS)
+    try:
+        for k, dv in TG_DEFAULTS.items():
+            v = await get_gateway_config(k, "")
+            if v == "" or v is None:
+                continue
+            cfg[k] = (str(v).lower() == "true") if isinstance(dv, bool) else str(v)
+    except Exception:
+        pass
+    if not cfg["tg_bot_token"]:
+        cfg["tg_bot_token"] = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    return cfg
+
+
+async def _tg_api(token: str, method: str, payload: dict) -> dict:
+    if not token:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(f"{TG_API_BASE}/bot{token}/{method}", json=payload)
+            return r.json()
+    except Exception as e:
+        print(f"⚠️ Telegram API {method} 失败: {e}")
+        return {}
+
+
+async def _tg_send(token: str, chat_id, text: str):
+    """发消息给 TG, 自动分段(单条上限4096), 纯文本避免 markdown 解析报错。"""
+    text = text or ""
+    CHUNK = 3500
+    parts = [text[i:i + CHUNK] for i in range(0, len(text), CHUNK)] or [""]
+    for p in parts:
+        await _tg_api(token, "sendMessage",
+                      {"chat_id": chat_id, "text": p, "disable_web_page_preview": True})
+
+
+async def _tg_brain_reply(user_text: str) -> str:
+    """内部自调用主聊天接口, 复用记忆/人设/落库(分区模式自动归到活跃对话线)。"""
+    url = f"http://127.0.0.1:{PORT}/v1/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if GATEWAY_SECRET:
+        headers["X-Gateway-Key"] = GATEWAY_SECRET
+    payload = {"model": DEFAULT_MODEL, "stream": False,
+               "messages": [{"role": "user", "content": user_text}]}
+    try:
+        async with httpx.AsyncClient(timeout=180) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            data = r.json()
+            return (data.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+    except Exception as e:
+        print(f"⚠️ TG 大脑调用失败: {e}")
+        return ""
+
+
+async def _tg_handle_update(update: dict):
+    """后台处理一条 TG 更新: 取文本 → 调大脑 → 回发。"""
+    cfg = await get_tg_config()
+    token = cfg["tg_bot_token"]
+    msg = update.get("message") or update.get("edited_message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    text = (msg.get("text") or "").strip()
+    if not token or chat_id is None or not text:
+        return
+
+    owner = str(cfg["tg_chat_id"]).strip()
+    if not owner:                       # 首次绑定: 第一个说话的人成为主人
+        await set_gateway_config("tg_chat_id", str(chat_id))
+        owner = str(chat_id)
+        await _tg_send(token, chat_id, "💚 已经和你绑定啦～以后这里就是我们俩的小窝，直接跟我说话就行。")
+        if text == "/start":
+            return
+    if str(chat_id) != owner:           # 只服务主人
+        await _tg_send(token, chat_id, "抱歉，这个 bot 已经绑定它的主人啦。")
+        return
+    if text == "/start":
+        await _tg_send(token, chat_id, "我在呀～想聊什么直接说就好 😊")
+        return
+
+    await _tg_api(token, "sendChatAction", {"chat_id": chat_id, "action": "typing"})
+    reply = await _tg_brain_reply(text)
+    await _tg_send(token, chat_id, reply or "(我这边好像出了点小问题，等下再跟我说一次好吗…)")
+
+
+@app.post("/telegram/webhook/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    """Telegram webhook 入口(公开路径, secret 路径 + header 双重校验)。"""
+    cfg = await get_tg_config()
+    expect = cfg["tg_secret"]
+    if not expect or not secrets.compare_digest(secret, expect):
+        return JSONResponse(status_code=403, content={"ok": False})
+    header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if header_secret and not secrets.compare_digest(header_secret, expect):
+        return JSONResponse(status_code=403, content={"ok": False})
+    if not cfg["tg_enabled"]:
+        return {"ok": True}             # 关闭时静默丢弃
+    try:
+        update = await request.json()
+    except Exception:
+        return {"ok": True}
+    asyncio.create_task(_tg_handle_update(update))   # 立刻返回200, 后台慢慢处理
+    return {"ok": True}
+
+
+@app.post("/api/telegram/setup")
+async def telegram_setup(request: Request):
+    """配置 token 并注册 webhook。body:{token?}。不传 token 则用已存的。"""
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    cfg = await get_tg_config()
+    token = (body.get("token") or "").strip() or cfg["tg_bot_token"]
+    if not token:
+        return {"ok": False, "error": "缺少 bot token"}
+    me = await _tg_api(token, "getMe", {})
+    if not me.get("ok"):
+        return {"ok": False, "error": "token 无效或网络不通", "detail": me}
+    secret = cfg["tg_secret"] or secrets.token_urlsafe(24)
+    await set_gateway_config("tg_bot_token", token)
+    await set_gateway_config("tg_secret", secret)
+    await set_gateway_config("tg_enabled", "true")
+    hook_url = f"{PUBLIC_BASE_URL}/telegram/webhook/{secret}"
+    res = await _tg_api(token, "setWebhook", {
+        "url": hook_url, "secret_token": secret,
+        "allowed_updates": ["message", "edited_message"],
+        "drop_pending_updates": True})
+    return {"ok": bool(res.get("ok")),
+            "bot_username": (me.get("result") or {}).get("username"),
+            "webhook": hook_url, "set_result": res}
+
+
+@app.post("/api/telegram/toggle")
+async def telegram_toggle(request: Request):
+    """开/关 Telegram(不重新注册 webhook)。body:{enabled:bool}。"""
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    enabled = bool(body.get("enabled"))
+    await set_gateway_config("tg_enabled", "true" if enabled else "false")
+    return {"ok": True, "enabled": enabled}
+
+
+@app.get("/api/telegram/status")
+async def telegram_status():
+    cfg = await get_tg_config()
+    token = cfg["tg_bot_token"]
+    info = await _tg_api(token, "getWebhookInfo", {}) if token else {}
+    return {"enabled": cfg["tg_enabled"], "token_set": bool(token),
+            "owner_chat_id": cfg["tg_chat_id"] or "(未绑定)",
+            "webhook": (info.get("result") or {})}
 
 
 # ============================================================
