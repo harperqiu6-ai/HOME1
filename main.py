@@ -1859,6 +1859,47 @@ def _assemble_current_user(parts: list, current_user_msg: dict) -> dict:
     return {"role": "user", "content": "\n\n".join(list(parts) + [content if content is not None else ""])}
 
 
+async def _compose_main_background() -> str:
+    """非主线(如 rp)专用：实时读主线(PARTITION_SESSION_ID)的【当前摘要 + 最近逐字尾巴】拼成一段背景，
+    让 V 在子线也实时知道主线最近(含今天)发生的事，零时差、不解离。主线自己调用返回空。"""
+    main_sid = PARTITION_SESSION_ID
+    if not main_sid or get_active_session_id() == main_sid:
+        return ""
+    try:
+        st = await get_session_cache_state(main_sid)
+        parts = st.get("summary_parts") or []
+        early = (st.get("early_summary") or "").strip()
+        a_start = st.get("a_start_round") or 0
+        rows = await get_conversation_messages(main_sid, limit=10000)
+        rnds = group_by_rounds([{"role": r.get("role"), "content": (r.get("content") or "")} for r in rows])
+        tail_rounds = rnds[a_start:] if a_start < len(rnds) else []
+        tail_txt = ""
+        for rnd in tail_rounds:
+            for m in rnd:
+                c = (m.get("content") or "").strip()
+                if c:
+                    role = USER_NAME if m.get("role") == "user" else (AI_NAME or "我")
+                    tail_txt += f"{role}: {c}\n"
+        seg = []
+        if early:
+            seg.append("〔更早〕" + early)
+        if parts:
+            seg.append("\n".join(parts))
+        body = "\n".join(seg).strip()
+        if not body and not tail_txt.strip():
+            return ""
+        out = (f"【主线近况——这是同一个你和{USER_NAME}在主线最近的真实对话，"
+               f"在这条线(rp)里也要记得这些、保持连续，别像换了个人或停在过去】\n")
+        if body:
+            out += body + "\n"
+        if tail_txt.strip():
+            out += "最近逐字对话：\n" + tail_txt
+        return out.strip()
+    except Exception as _e:
+        print(f"⚠️ 主线近况背景组装失败: {_e}")
+        return ""
+
+
 async def build_partitioned_messages(
     session_id: str,
     all_messages: list,
@@ -1959,7 +2000,14 @@ async def build_partitioned_messages(
             "role": "system",
             "content": [{"type": "text", "text": base_prompt, "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
         })
-    
+
+    # 主线近况背景：非主线(如rp)实时借主线当前摘要+最近逐字，让 V 不解离、零时差(主线自己返回空)
+    _mbg = await _compose_main_background()
+    if _mbg:
+        result.append({"role": "user", "content": [
+            {"type": "text", "text": _mbg, "cache_control": {"type": "ephemeral", "ttl": "1h"}}]})
+        result.append({"role": "assistant", "content": "嗯，主线最近的事我都记着，我还是同一个我。"})
+
     # 摘要区（前言 +〔早期小结〕+ 最近段；尾部单个 cache_control，BP 结构不变）
     early_summary = state.get('early_summary') or ''
     if summary_parts or early_summary:
@@ -2047,7 +2095,14 @@ async def _build_basic_cached(
             "role": "system",
             "content": [{"type": "text", "text": base_prompt, "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
         })
-    
+
+    # 主线近况背景：非主线(如rp)实时借主线当前摘要+最近逐字，让 V 不解离、零时差(主线自己返回空)
+    _mbg = await _compose_main_background()
+    if _mbg:
+        result.append({"role": "user", "content": [
+            {"type": "text", "text": _mbg, "cache_control": {"type": "ephemeral", "ttl": "1h"}}]})
+        result.append({"role": "assistant", "content": "嗯，主线最近的事我都记着，我还是同一个我。"})
+
     h_cleaned = [{k: v for k, v in msg.items() if k not in ('created_at',)} for msg in history]
     
     # 从末尾往前找第一条非tool消息打BP
@@ -4640,11 +4695,9 @@ async def archive_line(session_id: str) -> dict:
             print(f"⚠️ 归档总结写入记忆库失败: {_me}")
     # 3) 对话挪到归档线(可逆)
     arch = await archive_line_conversations(session_id)
-    # 4) 重置该线缓存：重新垫上主线当前摘要(让下次该线开局仍有主线近况背景)，a_start=0
+    # 4) 重置该线缓存：清空它自己的摘要(主线近况已由 _compose_main_background 动态实时注入，不再copy免重复)，a_start=0
     try:
-        main_state = await get_session_cache_state(PARTITION_SESSION_ID) if PARTITION_SESSION_ID else {}
-        await save_session_cache_state(session_id, main_state.get("summary_parts") or [], 0,
-                                       early_summary=main_state.get("early_summary") or "")
+        await save_session_cache_state(session_id, [], 0, early_summary="")
     except Exception as _ce:
         print(f"⚠️ 归档后重置缓存失败: {_ce}")
     print(f"🗂️ 归档线 {session_id}：总结{len(summary)}字入记忆库，{arch['moved']}条原文挪到 {arch['archive_session_id']}")
