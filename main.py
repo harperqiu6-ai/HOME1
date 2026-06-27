@@ -1904,6 +1904,18 @@ async def _compose_main_background() -> str:
         return ""
 
 
+def _compose_identity_anchor() -> str:
+    """非主线(rp)专用：在当前消息最贴近生成点处塞一句强身份锚，防止 V 写长RP时认错人/写得泛。主线返回空。"""
+    main_sid = PARTITION_SESSION_ID
+    if not main_sid or get_active_session_id() == main_sid:
+        return ""
+    _u = USER_NAME or "对方"
+    _a = AI_NAME or "你"
+    return (f"【贴身提醒·别认错人】你现在是 {_a}，正在和 {_u} 亲密互动。"
+            f"务必记住她是谁、你俩真实的关系和专属历史(见上文人设/档案/记忆)，"
+            f"写出带你俩温度和细节的内容，别写成跟陌生人的泛泛剧情，更别搞错她的名字。")
+
+
 async def build_partitioned_messages(
     session_id: str,
     all_messages: list,
@@ -2072,6 +2084,11 @@ async def build_partitioned_messages(
             if mem_text:
                 parts.append(mem_text)
 
+        # 贴身身份锚(非主线rp)：离生成点最近，强提醒别认错人/别写泛，治冷启动写跑偏
+        _anchor = _compose_identity_anchor()
+        if _anchor:
+            parts.append(_anchor)
+
         result.append(_assemble_current_user(parts, current_user_msg))
     
     bp_count = 1 + (1 if summary_parts else 0) + (1 if cleaned_a else 0) + (1 if b_msgs else 0)
@@ -2133,6 +2150,11 @@ async def _build_basic_cached(
             mem_text = await build_memory_text(user_message, drift=drift)
             if mem_text:
                 parts.append(mem_text)
+
+        # 贴身身份锚(非主线rp)：离生成点最近，强提醒别认错人/别写泛，治冷启动写跑偏
+        _anchor = _compose_identity_anchor()
+        if _anchor:
+            parts.append(_anchor)
 
         result.append(_assemble_current_user(parts, current_user_msg))
     
