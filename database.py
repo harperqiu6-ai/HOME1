@@ -1193,7 +1193,7 @@ async def get_memorywall_dates() -> set:
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT DISTINCT event_date FROM memories WHERE mw_meta IS NOT NULL AND event_date IS NOT NULL")
+            "SELECT DISTINCT event_date FROM memories WHERE mw_meta IS NOT NULL AND event_date IS NOT NULL AND is_active = TRUE")
         return {str(r["event_date"]) for r in rows if r["event_date"]}
 
 
