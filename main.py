@@ -1873,10 +1873,10 @@ def _is_rp_line() -> bool:
 
 
 async def _compose_main_background() -> str:
-    """rp(亲密)线专用：实时读主线(PARTITION_SESSION_ID)的【当前摘要 + 最近N轮逐字尾巴】拼成一段文本，
+    """所有子线(rp/tg)通用：实时读主线(PARTITION_SESSION_ID)的【当前摘要 + 最近N轮逐字尾巴】拼成一段文本，
     供拼进人设(同一system块,不新增缓存断点)，让 V 在子线也实时知道主线最近(含今天)的事，零时差。主线自己返回空。"""
     main_sid = PARTITION_SESSION_ID
-    if not _is_rp_line():           # 借主线背景/身份锚只对 rp(亲密)线生效, main/tg 都不触发
+    if not main_sid or get_active_session_id() == main_sid:   # 任何非主线(rp/tg)都借主线近况,消除时差;只有主线自己返回空
         return ""
     try:
         st = await get_session_cache_state(main_sid)
