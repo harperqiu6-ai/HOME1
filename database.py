@@ -1716,33 +1716,68 @@ async def search_memories_hybrid(query: str, limit: int = 10):
     async with pool.acquire() as conn:
         candidates = {}  # id -> {content, importance, created_at, kw_score, similarity}
         
-        # ---- 关键词路 ----
-        if keywords:
-            case_parts = []
-            params = []
-            for i, kw in enumerate(keywords):
-                case_parts.append(f"CASE WHEN content ILIKE '%' || ${i+1} || '%' THEN 1 ELSE 0 END")
-                params.append(kw)
-            
-            hit_count_expr = " + ".join(case_parts)
-            max_hits = len(keywords)
-            where_parts = [f"content ILIKE '%' || ${i+1} || '%'" for i in range(len(keywords))]
-            where_clause = f"is_active = TRUE AND ({' OR '.join(where_parts)})"
-            
-            limit_idx = len(keywords) + 1
+        # ---- 关键词路（IDF 降噪：踢时间指示词 + 踢高频字 + 按稀有度加权）----
+        # 与纯关键词模式 search_memories 一致：避免"你/记/得/吗"这类大白话高频字
+        # 把真正相关的稀有词（如"鸟"）挤出候选池。详见 search_memories 同段注释。
+        kw_list = [k for k in keywords if k not in TIME_DEIXIS]
+        if kw_list:
+            N = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE is_active = TRUE") or 1
+            df_sel = ", ".join(
+                f"SUM(CASE WHEN content ILIKE '%' || ${i+1} || '%' THEN 1 ELSE 0 END) AS df{i}"
+                for i in range(len(kw_list))
+            )
+            df_row = await conn.fetchrow(
+                f"SELECT {df_sel} FROM memories WHERE is_active = TRUE", *kw_list
+            )
+            common_cut = max(2, int(N * SEARCH_COMMON_FRAC))
+            kept = []        # [(kw, idf)] 参与匹配+加权
+            dropped = []     # [(kw, df)] 高频被剔除
+            idf_of = {}
+            for i, kw in enumerate(kw_list):
+                df = df_row[f"df{i}"] or 0
+                idf = math.log((N + 1.0) / (df + 1.0)) + 1.0
+                idf_of[kw] = (df, idf)
+                if df > common_cut:
+                    dropped.append((kw, df))
+                else:
+                    kept.append((kw, idf))
+            if not kept:
+                # 整句都是高频词 → 只保留最稀有的一个兜底（语义路再补）
+                rarest = min(kw_list, key=lambda k: idf_of[k][0])
+                kept = [(rarest, idf_of[rarest][1])]
+                dropped = [(k, idf_of[k][0]) for k in kw_list if k != rarest]
+
+            params = [kw for kw, _ in kept]
+            sum_w = sum(w for _, w in kept) or 1.0
+            hit_count_expr = " + ".join(
+                f"CASE WHEN content ILIKE '%' || ${i+1} || '%' THEN 1 ELSE 0 END"
+                for i in range(len(kept))
+            )
+            # IDF 加权得分（除以权重和归到 0-1，后续再 min-max 与语义路同尺度归一化）
+            whit_expr = " + ".join(
+                f"{w:.4f}*(CASE WHEN content ILIKE '%' || ${i+1} || '%' THEN 1 ELSE 0 END)"
+                for i, (kw, w) in enumerate(kept)
+            )
+            where_clause = "is_active = TRUE AND (" + " OR ".join(
+                f"content ILIKE '%' || ${i+1} || '%'" for i in range(len(kept))
+            ) + ")"
+            limit_idx = len(kept) + 1
             params.append(limit * 3)
-            
+
             kw_sql = f"""
                 SELECT id, content, importance, created_at,
                        ({hit_count_expr}) AS hit_count,
-                       ({hit_count_expr})::float / {max_hits}.0 AS kw_score
+                       (({whit_expr}) / {sum_w:.4f}) AS kw_score
                 FROM memories
                 WHERE {where_clause}
                 ORDER BY kw_score DESC
                 LIMIT ${limit_idx}
             """
             kw_rows = await conn.fetch(kw_sql, *params)
-            
+
+            if dropped:
+                print(f"   🧹 关键词降噪: 留{[k for k,_ in kept][:8]} 丢{[k for k,_ in dropped][:8]}")
+
             for r in kw_rows:
                 candidates[r['id']] = {
                     'content': r['content'],
