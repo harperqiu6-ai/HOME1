@@ -210,6 +210,9 @@ def get_active_session_id() -> str:
 # 当前轮贴身注入(不进缓存/不进历史)。没传头就空(老行为不变，长回复)。TG 走 short=微信风格。
 _request_reply_style = contextvars.ContextVar("request_reply_style", default="")
 
+# 每请求是否辅助请求(标题生成等带 X-Skip-Conversation-Log)：辅助请求不消费 TG 近况小抄,留给真正的对话轮。
+_request_skip_log = contextvars.ContextVar("request_skip_log", default=False)
+
 # 时区偏移（小时），用于记忆注入时的日期显示，默认 UTC+8
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
 
@@ -1916,19 +1919,22 @@ async def _compose_main_background() -> str:
 
 
 async def _compose_tg_digest_for_main() -> str:
-    """主线(KELIVO)专用：读 TG 用 /同步 递来的近况小抄(中性梗概),作当前轮背景注入,实现 TG→主线零时差。
-    仅主线、且小抄在新鲜期内(TG_DIGEST_TTL_HOURS)才注入;过期靠记忆库召回。塞进当前轮(不进缓存块/不污染历史)。"""
+    """主线(KELIVO)专用：读 TG /同步 递来的近况小抄,塞当前轮【一次】然后清掉(一次性消费,不反复占token)。
+    仅主线、非辅助请求、且小抄新鲜(TG_DIGEST_TTL_HOURS内)才注入;读到就清(无论新旧),过期清掉但不注入(靠记忆库)。不进缓存块/不污染历史。"""
     if PARTITION_SESSION_ID and get_active_session_id() != PARTITION_SESSION_ID:
+        return ""
+    if _request_skip_log.get():          # 标题生成等辅助请求不消费,留给真正的对话轮
         return ""
     try:
         dig = (await get_gateway_config("tg_digest", "")).strip()
         if not dig:
             return ""
+        await set_gateway_config("tg_digest", "")    # 一次性:这一轮消费掉,之后不再注入
         ts = (await get_gateway_config("tg_digest_ts", "")).strip()
         if ts:
             try:
                 if (datetime.now(timezone.utc).timestamp() - float(ts)) > TG_DIGEST_TTL_HOURS * 3600:
-                    return ""
+                    return ""                        # 太旧:清掉但不注入,靠记忆库召回
             except Exception:
                 pass
         at = (await get_gateway_config("tg_digest_at", "")).strip()
@@ -2786,6 +2792,7 @@ async def chat_completions(request: Request):
     # ---------- 检测是否应跳过对话存储 ----------
     # 客户端通过header显式声明（如标题生成等辅助请求）
     skip_conversation_log = request.headers.get("X-Skip-Conversation-Log", "").lower() == "true"
+    _request_skip_log.set(skip_conversation_log)   # 供 TG 近况小抄判断:辅助请求不消费
 
     # ---------- 每请求对话线 X-Session-Line（KELIVO 不同助手带不同头 → 走不同线）----------
     # 只允许简单字符当线名(防注入怪 session_id)；没传/为空就不设，get_active_session_id() 回落全局(老行为不变)
