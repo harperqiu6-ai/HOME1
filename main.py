@@ -205,6 +205,10 @@ _request_session_line = contextvars.ContextVar("request_session_line", default=N
 def get_active_session_id() -> str:
     return _request_session_line.get() or PARTITION_SESSION_ID
 
+# 每请求回复风格：客户端用 X-Reply-Style 头指定(如 short)，用 contextvars 存，
+# 当前轮贴身注入(不进缓存/不进历史)。没传头就空(老行为不变，长回复)。TG 走 short=微信风格。
+_request_reply_style = contextvars.ContextVar("request_reply_style", default="")
+
 # 时区偏移（小时），用于记忆注入时的日期显示，默认 UTC+8
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
 
@@ -1916,6 +1920,16 @@ def _compose_identity_anchor() -> str:
             f"写出带你俩温度和细节的内容，别写成跟陌生人的泛泛剧情，更别搞错她的名字。")
 
 
+def _compose_reply_style_anchor() -> str:
+    """按请求头 X-Reply-Style 给当前轮塞一句话风提醒(贴身、不进缓存/历史)。short=像发微信。空头返回空(长回复,老行为)。"""
+    style = (_request_reply_style.get() or "").strip().lower()
+    if style == "short":
+        return ("【这条走即时聊天·像发微信】回复要短、口语、自然，通常1~3句话就够；"
+                "别长篇大论、别分段写小作文、别罗列。该撒娇撒娇、该接话接话，像真人秒回那样。"
+                "情绪/语气照旧是你自己，只是话说短点。")
+    return ""
+
+
 async def build_partitioned_messages(
     session_id: str,
     all_messages: list,
@@ -2089,6 +2103,11 @@ async def build_partitioned_messages(
         if _anchor:
             parts.append(_anchor)
 
+        # 话风提醒(如 TG=微信短回复)：离生成点最近，只对带 X-Reply-Style 头的请求生效
+        _style_anchor = _compose_reply_style_anchor()
+        if _style_anchor:
+            parts.append(_style_anchor)
+
         result.append(_assemble_current_user(parts, current_user_msg))
     
     bp_count = 1 + (1 if summary_parts else 0) + (1 if cleaned_a else 0) + (1 if b_msgs else 0)
@@ -2155,6 +2174,11 @@ async def _build_basic_cached(
         _anchor = _compose_identity_anchor()
         if _anchor:
             parts.append(_anchor)
+
+        # 话风提醒(如 TG=微信短回复)：离生成点最近，只对带 X-Reply-Style 头的请求生效
+        _style_anchor = _compose_reply_style_anchor()
+        if _style_anchor:
+            parts.append(_style_anchor)
 
         result.append(_assemble_current_user(parts, current_user_msg))
     
@@ -2730,7 +2754,12 @@ async def chat_completions(request: Request):
             _request_session_line.set(_line)
         else:
             print(f"⚠️ 忽略非法 X-Session-Line: {_line!r}")
-    
+
+    # ---------- 每请求回复风格 X-Reply-Style（TG 带 short → 微信风格短回复）----------
+    _style = (request.headers.get("X-Reply-Style", "") or "").strip()
+    if _style:
+        _request_reply_style.set(_style)
+
     # ---------- 提取用户最新消息 ----------
     user_message = ""
     for msg in reversed(messages):
@@ -3962,7 +3991,7 @@ async def _tg_send(token: str, chat_id, text: str):
 async def _tg_brain_reply(user_text: str) -> str:
     """内部自调用主聊天接口, 复用记忆/人设/落库(分区模式自动归到活跃对话线)。"""
     url = f"http://127.0.0.1:{PORT}/v1/chat/completions"
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "X-Reply-Style": "short"}  # TG=微信风格短回复
     if GATEWAY_SECRET:
         headers["X-Gateway-Key"] = GATEWAY_SECRET
     payload = {"model": DEFAULT_MODEL, "stream": False,
