@@ -1924,13 +1924,13 @@ def _compose_reply_style_anchor() -> str:
     """按请求头 X-Reply-Style 给当前轮塞一句话风提醒(贴身、不进缓存/历史)。short=像发微信。空头返回空(长回复,老行为)。"""
     style = (_request_reply_style.get() or "").strip().lower()
     if style == "short":
-        return ("【这条走即时聊天·像真人发微信·一定要有活人感!!!】"
-                "像真人在那头一句一句打字那样回：每句都短，十几二十个字，甚至四五个字都行；"
-                "一句没说完的就换行拆成下一句接着说，可以连着发四五句。"
-                "口语、随意、自然，像秒回——别长篇大论、别写成一整段、别分点罗列、别用*动作旁白*或（括号神态）。"
-                "情绪语气还是你自己，该撒娇撒娇、该接话接话。"
-                "【硬要求】每一小句单独占一行(换行分隔)，方便像微信那样一条条蹦出来；"
-                "总共最多五六句就收住，别越说越长，尤其【绝对不要】在最后一句憋一大段长话。")
+        return ("【这条走即时聊天·像真人发微信·自然别刻意】"
+                "像真人随手发微信那样回：话少、随口、点到为止。"
+                "大多数时候一两句就够了——【别为了短而硬凑句数、别把一件事拆成好几句蹦】，那样很刻意、很假。"
+                "短句口语，十来个字最舒服；只有真的还有话想说才多发一两句，没有就别凑。"
+                "别长篇大论、别整段说教、别罗列、别用*动作旁白*或（括号神态）。"
+                "情绪语气还是你自己，该撒娇撒娇、该接话接话，就是话别多、别绕。"
+                "万一确实要分几句说，每句单独占一行。")
     return ""
 
 
@@ -4069,7 +4069,7 @@ async def _tg_brain_reply(user_text: str) -> str:
     headers = {"Content-Type": "application/json", "X-Reply-Style": "short"}  # TG=微信风格短回复
     if GATEWAY_SECRET:
         headers["X-Gateway-Key"] = GATEWAY_SECRET
-    payload = {"model": DEFAULT_MODEL, "stream": False,
+    payload = {"model": DEFAULT_MODEL, "stream": False, "max_tokens": 180,  # 硬上限兜底:TG话短
                "messages": [{"role": "user", "content": user_text}]}
     try:
         async with httpx.AsyncClient(timeout=180) as client:
