@@ -195,6 +195,14 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border:none;border-ra
       <div class="row"><div class="hint" id="pp-msg">　</div><div class="ctl"><button class="btn sm" id="pp-save">保存</button><button class="btn sm" id="pp-test">立即测试推送</button><button class="btn sm" id="pp-real">试发一条真的</button></div></div>
     </div>
 
+    <!-- TELEGRAM 在 TG 里直接聊 -->
+    <div class="panel wide">
+      <div class="panel-h"><span class="en">TELEGRAM</span><span class="cn">在 Telegram 里直接和我聊</span><i class="ti ti-brand-telegram"></i></div>
+      <div class="row"><div><div class="label">Telegram 总开关</div><div class="hint" id="tgc-stat">连接后在 TG 里直接对话，和 Kelivo 共用同一套记忆/人设；主动私信也会发到 TG</div></div><div class="ctl"><label class="tg"><input type="checkbox" id="tgc-enabled"><span class="track"></span><span class="knob"></span></label></div></div>
+      <div class="row"><div class="label">Bot Token</div><div class="ctl"><input id="tgc-token" type="text" placeholder="@BotFather 给的 token（已设置则留空）" style="width:300px"></div></div>
+      <div class="row"><div class="hint" id="tgc-msg">　</div><div class="ctl"><button class="btn sm" id="tgc-connect">连接 / 注册 webhook</button><button class="btn sm" id="tgc-refresh">刷新状态</button></div></div>
+    </div>
+
     <!-- DECAY -->
     <div class="panel wide">
       <div class="panel-h"><span class="en">DECAY</span><span class="cn">精炼 · 遗忘(归档≠删除·可逆)</span><i class="ti ti-hourglass-low"></i></div>
@@ -497,6 +505,45 @@ if(KEY){
   document.getElementById('pp-test').addEventListener('click', ppTest);
   const _pr=document.getElementById('pp-real'); if(_pr) _pr.addEventListener('click', ppReal);
   ppLoad();
+}
+
+// ---- Telegram ----
+async function tgLoad(){
+  try{
+    const s = await api('/api/telegram/status');
+    document.getElementById('tgc-enabled').checked = !!s.enabled;
+    const tok = document.getElementById('tgc-token');
+    if(s.token_set){ tok.value=''; tok.placeholder='已设置(留空=不改)'; }
+    const wh = s.webhook||{};
+    const owner = s.owner_chat_id||'(未绑定)';
+    let line = s.token_set ? ('✅ 已配置 ｜ 绑定主人: '+owner) : '未配置 token';
+    if(wh.url){ line += ' ｜ webhook 已挂'; }
+    if(wh.last_error_message){ line += ' ｜ ⚠️'+wh.last_error_message; }
+    document.getElementById('tgc-stat').textContent = line;
+  }catch(e){ document.getElementById('tgc-stat').textContent='状态加载失败:'+e.message; }
+}
+async function tgConnect(){
+  const el=document.getElementById('tgc-msg'); el.textContent='连接中…(校验 token + 注册 webhook)';
+  const body={};
+  const tok=document.getElementById('tgc-token').value.trim();
+  if(tok) body.token=tok;
+  try{
+    const j=await api('/api/telegram/setup',{method:'POST',body:body});
+    if(j.ok){ el.textContent='✅ 连接成功！bot: @'+(j.bot_username||'')+'。去 TG 里给它发条消息试试~'; toast('已连接'); }
+    else { el.textContent='❌ 失败：'+(j.error||JSON.stringify(j.set_result||j)); toast('失败'); }
+    tgLoad();
+  }catch(e){ el.textContent='失败:'+e.message; toast('失败'); }
+}
+async function tgToggle(){
+  const en=document.getElementById('tgc-enabled').checked;
+  try{ await api('/api/telegram/toggle',{method:'POST',body:{enabled:en}}); toast(en?'已开启':'已关闭'); }
+  catch(e){ toast('失败:'+e.message); tgLoad(); }
+}
+if(KEY){
+  document.getElementById('tgc-connect').addEventListener('click', tgConnect);
+  document.getElementById('tgc-refresh').addEventListener('click', tgLoad);
+  document.getElementById('tgc-enabled').addEventListener('change', tgToggle);
+  tgLoad();
 }
 
 // ---- 滚动摘要封顶(立即/预览) ----
