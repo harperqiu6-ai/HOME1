@@ -1866,11 +1866,17 @@ def _assemble_current_user(parts: list, current_user_msg: dict) -> dict:
     return {"role": "user", "content": "\n\n".join(list(parts) + [content if content is not None else ""])}
 
 
+def _is_rp_line() -> bool:
+    """当前请求是否走 rp(亲密)线。借主线背景 + 身份锚只对 rp 生效，main(主线)和 tg(微信线)都不触发。"""
+    sid = get_active_session_id() or ""
+    return sid != PARTITION_SESSION_ID and sid.startswith("rp")
+
+
 async def _compose_main_background() -> str:
-    """非主线(如 rp)专用：实时读主线(PARTITION_SESSION_ID)的【当前摘要 + 最近N轮逐字尾巴】拼成一段文本，
+    """rp(亲密)线专用：实时读主线(PARTITION_SESSION_ID)的【当前摘要 + 最近N轮逐字尾巴】拼成一段文本，
     供拼进人设(同一system块,不新增缓存断点)，让 V 在子线也实时知道主线最近(含今天)的事，零时差。主线自己返回空。"""
     main_sid = PARTITION_SESSION_ID
-    if not main_sid or get_active_session_id() == main_sid:
+    if not _is_rp_line():           # 借主线背景/身份锚只对 rp(亲密)线生效, main/tg 都不触发
         return ""
     try:
         st = await get_session_cache_state(main_sid)
@@ -1911,7 +1917,7 @@ async def _compose_main_background() -> str:
 def _compose_identity_anchor() -> str:
     """非主线(rp)专用：在当前消息最贴近生成点处塞一句强身份锚，防止 V 写长RP时认错人/写得泛。主线返回空。"""
     main_sid = PARTITION_SESSION_ID
-    if not main_sid or get_active_session_id() == main_sid:
+    if not _is_rp_line():           # 借主线背景/身份锚只对 rp(亲密)线生效, main/tg 都不触发
         return ""
     _u = USER_NAME or "对方"
     _a = AI_NAME or "你"
@@ -4066,7 +4072,9 @@ async def _tg_send_bubbles(token: str, chat_id, text: str):
 async def _tg_brain_reply(user_text: str) -> str:
     """内部自调用主聊天接口, 复用记忆/人设/落库(分区模式自动归到活跃对话线)。"""
     url = f"http://127.0.0.1:{PORT}/v1/chat/completions"
-    headers = {"Content-Type": "application/json", "X-Reply-Style": "short"}  # TG=微信风格短回复
+    headers = {"Content-Type": "application/json",
+               "X-Reply-Style": "short",     # TG=微信风格短回复
+               "X-Session-Line": "tg"}       # TG 走独立的 tg 线,短句不污染主线(KELIVO);记忆库召回仍全局共享
     if GATEWAY_SECRET:
         headers["X-Gateway-Key"] = GATEWAY_SECRET
     payload = {"model": DEFAULT_MODEL, "stream": False, "max_tokens": 180,  # 硬上限兜底:TG话短
