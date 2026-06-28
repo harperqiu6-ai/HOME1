@@ -1924,9 +1924,12 @@ def _compose_reply_style_anchor() -> str:
     """按请求头 X-Reply-Style 给当前轮塞一句话风提醒(贴身、不进缓存/历史)。short=像发微信。空头返回空(长回复,老行为)。"""
     style = (_request_reply_style.get() or "").strip().lower()
     if style == "short":
-        return ("【这条走即时聊天·像发微信】像真人发微信那样回：短、口语、自然，通常就1~2句话，"
-                "最多别超过3小句。别长篇大论、别分段写小作文、别罗列1234、别用*动作旁白*/括号神态。"
-                "情绪和语气还是你自己，该撒娇撒娇、该接话接话，只是话说短、像秒回。")
+        return ("【这条走即时聊天·像真人发微信·一定要有活人感!!!】"
+                "像真人在那头一句一句打字那样回：每句都短，十几二十个字，甚至四五个字都行；"
+                "一句没说完的就换行拆成下一句接着说，可以连着发四五句。"
+                "口语、随意、自然，像秒回——别长篇大论、别写成一整段、别分点罗列、别用*动作旁白*或（括号神态）。"
+                "情绪语气还是你自己，该撒娇撒娇、该接话接话。"
+                "【格式硬要求】每一小句单独占一行(用换行分隔)，方便像微信那样一条条蹦出来。")
     return ""
 
 
@@ -3988,6 +3991,31 @@ async def _tg_send(token: str, chat_id, text: str):
                       {"chat_id": chat_id, "text": p, "disable_web_page_preview": True})
 
 
+async def _tg_send_bubbles(token: str, chat_id, text: str):
+    """像真人发微信:把回复按行拆成多条消息依次发,带'正在输入'和小停顿。空文本不发,超长行回退分段。"""
+    text = (text or "").strip()
+    if not text:
+        return
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return
+    MAX_BUBBLES = 6                      # 防刷屏:多出的并进最后一条
+    if len(lines) > MAX_BUBBLES:
+        lines = lines[:MAX_BUBBLES - 1] + ["\n".join(lines[MAX_BUBBLES - 1:])]
+    for i, ln in enumerate(lines):
+        if len(ln) > 3500:              # 异常超长行,走原分段逻辑
+            await _tg_send(token, chat_id, ln)
+            continue
+        if i > 0:                       # 第2条起:先"正在输入"+按字数停顿,模拟打字
+            try:
+                await _tg_api(token, "sendChatAction", {"chat_id": chat_id, "action": "typing"})
+            except Exception:
+                pass
+            await asyncio.sleep(min(1.8, 0.4 + len(ln) * 0.06))
+        await _tg_api(token, "sendMessage",
+                      {"chat_id": chat_id, "text": ln, "disable_web_page_preview": True})
+
+
 async def _tg_brain_reply(user_text: str) -> str:
     """内部自调用主聊天接口, 复用记忆/人设/落库(分区模式自动归到活跃对话线)。"""
     url = f"http://127.0.0.1:{PORT}/v1/chat/completions"
@@ -4032,7 +4060,10 @@ async def _tg_handle_update(update: dict):
 
     await _tg_api(token, "sendChatAction", {"chat_id": chat_id, "action": "typing"})
     reply = await _tg_brain_reply(text)
-    await _tg_send(token, chat_id, reply or "(我这边好像出了点小问题，等下再跟我说一次好吗…)")
+    if reply:
+        await _tg_send_bubbles(token, chat_id, reply)   # 像真人:一条条蹦
+    else:
+        await _tg_send(token, chat_id, "(我这边好像出了点小问题，等下再跟我说一次好吗…)")
 
 
 @app.post("/telegram/webhook/{secret}")
