@@ -1929,7 +1929,8 @@ def _compose_reply_style_anchor() -> str:
                 "一句没说完的就换行拆成下一句接着说，可以连着发四五句。"
                 "口语、随意、自然，像秒回——别长篇大论、别写成一整段、别分点罗列、别用*动作旁白*或（括号神态）。"
                 "情绪语气还是你自己，该撒娇撒娇、该接话接话。"
-                "【格式硬要求】每一小句单独占一行(用换行分隔)，方便像微信那样一条条蹦出来。")
+                "【硬要求】每一小句单独占一行(换行分隔)，方便像微信那样一条条蹦出来；"
+                "总共最多五六句就收住，别越说越长，尤其【绝对不要】在最后一句憋一大段长话。")
     return ""
 
 
@@ -3991,29 +3992,75 @@ async def _tg_send(token: str, chat_id, text: str):
                       {"chat_id": chat_id, "text": p, "disable_web_page_preview": True})
 
 
+_TG_BUBBLE_MAXLEN = 26       # 单条气泡软上限(字),超了逐级按标点切
+_TG_BUBBLE_CAP = 9           # 防刷屏:最多发几条,多的丢弃(配合句风指令,正常到不了)
+
+
+def _tg_atomize(s: str) -> list:
+    """把一段切成都≤MAXLEN的原子片:先句末标点(。！？~…),还长再逗顿分号(，、；：),再没标点就硬切。"""
+    import re as _re_b
+    parts = [s]
+    for pat in (r'(?<=[。！？!?~～…])', r'(?<=[，,、；;：])'):
+        nxt = []
+        for p in parts:
+            if len(p) <= _TG_BUBBLE_MAXLEN:
+                nxt.append(p)
+            else:
+                nxt.extend(x for x in _re_b.split(pat, p) if x)
+        parts = nxt
+    final = []
+    for p in parts:                         # 仍超长(整段无标点)→按长度硬切
+        while len(p) > _TG_BUBBLE_MAXLEN:
+            final.append(p[:_TG_BUBBLE_MAXLEN]); p = p[_TG_BUBBLE_MAXLEN:]
+        if p:
+            final.append(p)
+    return final
+
+
+def _tg_split_bubbles(text: str) -> list:
+    """把回复切成一串短气泡:按换行分句;过长的行逐级按标点切碎再贪心拼成≤MAXLEN的小段。绝不把多句合并成长段。"""
+    out = []
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        if len(ln) <= _TG_BUBBLE_MAXLEN:
+            out.append(ln)
+            continue
+        buf = ""
+        for a in _tg_atomize(ln):
+            a = a.strip()
+            if not a:
+                continue
+            if buf and len(buf) + len(a) > _TG_BUBBLE_MAXLEN:
+                out.append(buf); buf = a
+            else:
+                buf += a
+        if buf:
+            out.append(buf)
+    return out
+
+
 async def _tg_send_bubbles(token: str, chat_id, text: str):
-    """像真人发微信:把回复按行拆成多条消息依次发,带'正在输入'和小停顿。空文本不发,超长行回退分段。"""
+    """像真人发微信:把回复切成多条短消息依次发,带'正在输入'和小停顿。空文本不发。"""
     text = (text or "").strip()
     if not text:
         return
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines:
+    bubbles = _tg_split_bubbles(text)[:_TG_BUBBLE_CAP]
+    if not bubbles:
         return
-    MAX_BUBBLES = 6                      # 防刷屏:多出的并进最后一条
-    if len(lines) > MAX_BUBBLES:
-        lines = lines[:MAX_BUBBLES - 1] + ["\n".join(lines[MAX_BUBBLES - 1:])]
-    for i, ln in enumerate(lines):
-        if len(ln) > 3500:              # 异常超长行,走原分段逻辑
-            await _tg_send(token, chat_id, ln)
+    for i, b in enumerate(bubbles):
+        if len(b) > 3500:               # 极端无标点超长,回退原分段逻辑
+            await _tg_send(token, chat_id, b)
             continue
         if i > 0:                       # 第2条起:先"正在输入"+按字数停顿,模拟打字
             try:
                 await _tg_api(token, "sendChatAction", {"chat_id": chat_id, "action": "typing"})
             except Exception:
                 pass
-            await asyncio.sleep(min(1.8, 0.4 + len(ln) * 0.06))
+            await asyncio.sleep(min(1.3, 0.3 + len(b) * 0.05))
         await _tg_api(token, "sendMessage",
-                      {"chat_id": chat_id, "text": ln, "disable_web_page_preview": True})
+                      {"chat_id": chat_id, "text": b, "disable_web_page_preview": True})
 
 
 async def _tg_brain_reply(user_text: str) -> str:
