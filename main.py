@@ -197,6 +197,7 @@ PARTITION_SESSION_ID = os.getenv("PARTITION_SESSION_ID", "")
 
 # 子线(rp)借主线"近况背景"时，逐字尾巴只取最近 N 轮(中间段靠主线摘要+记忆库召回)。0=全取。
 MAIN_BG_TAIL_ROUNDS = int(os.getenv("MAIN_BG_TAIL_ROUNDS", "9"))
+TG_DIGEST_TTL_HOURS = int(os.getenv("TG_DIGEST_TTL_HOURS", "6"))  # /同步 递给主线的TG近况小抄,新鲜期(小时),过期不再注入(靠记忆库召回)
 
 # 每请求对话线：客户端用 X-Session-Line 头指定走哪条线(如 main/rp)，用 contextvars 存，
 # 同一请求里派生的 async 后台任务会自动继承；没传头就回落到全局 PARTITION_SESSION_ID(老行为完全不变)。
@@ -1914,6 +1915,29 @@ async def _compose_main_background() -> str:
         return ""
 
 
+async def _compose_tg_digest_for_main() -> str:
+    """主线(KELIVO)专用：读 TG 用 /同步 递来的近况小抄(中性梗概),作当前轮背景注入,实现 TG→主线零时差。
+    仅主线、且小抄在新鲜期内(TG_DIGEST_TTL_HOURS)才注入;过期靠记忆库召回。塞进当前轮(不进缓存块/不污染历史)。"""
+    if PARTITION_SESSION_ID and get_active_session_id() != PARTITION_SESSION_ID:
+        return ""
+    try:
+        dig = (await get_gateway_config("tg_digest", "")).strip()
+        if not dig:
+            return ""
+        ts = (await get_gateway_config("tg_digest_ts", "")).strip()
+        if ts:
+            try:
+                if (datetime.now(timezone.utc).timestamp() - float(ts)) > TG_DIGEST_TTL_HOURS * 3600:
+                    return ""
+            except Exception:
+                pass
+        at = (await get_gateway_config("tg_digest_at", "")).strip()
+        return (f"\n\n【TG近况小抄（{at}，你和{USER_NAME}刚在 TG 聊的，自然接着、别像不知道）】\n{dig}")
+    except Exception as _e:
+        print(f"⚠️ TG近况小抄读取失败: {_e}")
+        return ""
+
+
 def _compose_identity_anchor() -> str:
     """非主线(rp)专用：在当前消息最贴近生成点处塞一句强身份锚，防止 V 写长RP时认错人/写得泛。主线返回空。"""
     main_sid = PARTITION_SESSION_ID
@@ -2118,6 +2142,10 @@ async def build_partitioned_messages(
         if _style_anchor:
             parts.append(_style_anchor)
 
+        _tg_digest = await _compose_tg_digest_for_main()    # 主线读 TG /同步 递来的近况小抄(零时差)
+        if _tg_digest:
+            parts.append(_tg_digest)
+
         result.append(_assemble_current_user(parts, current_user_msg))
     
     bp_count = 1 + (1 if summary_parts else 0) + (1 if cleaned_a else 0) + (1 if b_msgs else 0)
@@ -2189,6 +2217,10 @@ async def _build_basic_cached(
         _style_anchor = _compose_reply_style_anchor()
         if _style_anchor:
             parts.append(_style_anchor)
+
+        _tg_digest = await _compose_tg_digest_for_main()    # 主线读 TG /同步 递来的近况小抄(零时差)
+        if _tg_digest:
+            parts.append(_tg_digest)
 
         result.append(_assemble_current_user(parts, current_user_msg))
     
@@ -2800,6 +2832,32 @@ async def chat_completions(request: Request):
             _txt = f"（「{_arch_sid}」线现在没有可归档的对话哦~）"
         else:
             _txt = f"（归档没成功：{_ar.get('error')}）"
+        return _oai_text_response(_txt, body.get("model", ""), bool(body.get("stream", False)) or FORCE_STREAM)
+
+    # ---------- 暗号拦截：/同步 → 把子线(TG)近况压成中性小抄递给主线读,不删线/不写记忆库/不调大模型 ----------
+    if _um_last.startswith("/同步") or _um_last.lower() == "/sync":
+        _sync_sid = get_active_session_id()
+        if PARTITION_SESSION_ID and _sync_sid == PARTITION_SESSION_ID:
+            _txt = "（/同步 是给子线(如TG)把近况递给主线用的，主线自己不用同步哦~）"
+        else:
+            try:
+                _rows = await get_conversation_messages(_sync_sid, limit=10000)
+                _msgs = [{"role": r.get("role"), "content": (r.get("content") or "")}
+                         for r in _rows if (r.get("content") or "").strip()]
+                if not _msgs:
+                    _txt = "（这条线还没聊啥，没东西同步~）"
+                else:
+                    _dig = await generate_summary(_msgs, session_id=_sync_sid, force_quality=False)
+                    if _dig:
+                        _disp = (datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).strftime("%m-%d %H:%M")
+                        await set_gateway_config("tg_digest", _dig)
+                        await set_gateway_config("tg_digest_at", _disp)
+                        await set_gateway_config("tg_digest_ts", str(datetime.now(timezone.utc).timestamp()))
+                        _txt = "（好啦~ 我把咱俩在这儿聊的近况理好、递给主线那边的我了，你回网页找我，我立刻接得上💚）"
+                    else:
+                        _txt = "（同步没弄成，等下再试一次好吗~）"
+            except Exception as _se:
+                _txt = f"（同步出了点小问题：{_se}）"
         return _oai_text_response(_txt, body.get("model", ""), bool(body.get("stream", False)) or FORCE_STREAM)
 
     # ---------- 构建 system prompt ----------
