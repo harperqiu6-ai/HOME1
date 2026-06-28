@@ -4069,16 +4069,50 @@ async def _tg_send_bubbles(token: str, chat_id, text: str):
                       {"chat_id": chat_id, "text": b, "disable_web_page_preview": True})
 
 
-async def _tg_brain_reply(user_text: str) -> str:
-    """内部自调用主聊天接口, 复用记忆/人设/落库(分区模式自动归到活跃对话线)。"""
+async def _tg_download_photo(token: str, msg: dict) -> str:
+    """取 TG 消息里最大尺寸照片,下载转 base64 data uri 喂给看图模型。无照片/失败返回 ''。"""
+    photos = msg.get("photo") or []
+    if not photos:
+        return ""
+    file_id = (photos[-1] or {}).get("file_id")     # 数组末尾=最大分辨率
+    if not file_id:
+        return ""
+    try:
+        import base64 as _b64
+        info = await _tg_api(token, "getFile", {"file_id": file_id})
+        fp = ((info.get("result") or {}).get("file_path") or "") if info.get("ok") else ""
+        if not fp:
+            return ""
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.get(f"{TG_API_BASE}/file/bot{token}/{fp}")
+            if r.status_code != 200:
+                return ""
+            data = r.content
+        ext = fp.rsplit(".", 1)[-1].lower() if "." in fp else "jpg"
+        mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                "webp": "image/webp", "gif": "image/gif"}.get(ext, "image/jpeg")
+        return f"data:{mime};base64," + _b64.b64encode(data).decode("ascii")
+    except Exception as e:
+        print(f"⚠️ TG 照片下载失败: {e}")
+        return ""
+
+
+async def _tg_brain_reply(user_text: str, image_uris: list = None) -> str:
+    """内部自调用主聊天接口, 复用记忆/人设/落库(分区模式自动归到活跃对话线)。带图则发多模态 content。"""
     url = f"http://127.0.0.1:{PORT}/v1/chat/completions"
     headers = {"Content-Type": "application/json",
                "X-Reply-Style": "short",     # TG=微信风格短回复
                "X-Session-Line": "tg"}       # TG 走独立的 tg 线,短句不污染主线(KELIVO);记忆库召回仍全局共享
     if GATEWAY_SECRET:
         headers["X-Gateway-Key"] = GATEWAY_SECRET
+    if image_uris:                                   # 带图:OpenAI 多模态格式,文字+图一起
+        content = [{"type": "text", "text": user_text or "(图片)"}]
+        for u in image_uris:
+            content.append({"type": "image_url", "image_url": {"url": u}})
+    else:
+        content = user_text
     payload = {"model": DEFAULT_MODEL, "stream": False, "max_tokens": 180,  # 硬上限兜底:TG话短
-               "messages": [{"role": "user", "content": user_text}]}
+               "messages": [{"role": "user", "content": content}]}
     try:
         async with httpx.AsyncClient(timeout=180) as client:
             r = await client.post(url, headers=headers, json=payload)
@@ -4096,7 +4130,9 @@ async def _tg_handle_update(update: dict):
     msg = update.get("message") or update.get("edited_message") or {}
     chat_id = (msg.get("chat") or {}).get("id")
     text = (msg.get("text") or "").strip()
-    if not token or chat_id is None or not text:
+    caption = (msg.get("caption") or "").strip()    # 照片自带的文字说明
+    has_photo = bool(msg.get("photo"))
+    if not token or chat_id is None or (not text and not has_photo):
         return
 
     owner = str(cfg["tg_chat_id"]).strip()
@@ -4114,7 +4150,16 @@ async def _tg_handle_update(update: dict):
         return
 
     await _tg_api(token, "sendChatAction", {"chat_id": chat_id, "action": "typing"})
-    reply = await _tg_brain_reply(text)
+    image_uris = []
+    if has_photo:                       # 下载照片(只对主人,在上面已校验)
+        du = await _tg_download_photo(token, msg)
+        if du:
+            image_uris.append(du)
+        elif not (text or caption):     # 纯图但没拿到图
+            await _tg_send(token, chat_id, "(这张图我好像没收到，能再发一次吗…)")
+            return
+
+    reply = await _tg_brain_reply((caption or text), image_uris or None)
     if reply:
         await _tg_send_bubbles(token, chat_id, reply)   # 像真人:一条条蹦
     else:
