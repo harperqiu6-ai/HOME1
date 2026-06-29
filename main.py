@@ -1486,7 +1486,9 @@ async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: l
             dream_targets = list(only_dates)
             diary_targets = list(only_dates)
         else:
-            dream_targets = sorted(d for d in conv_dates if d < today_s and d not in have)
+            # 做梦只盯【昨天】，绝不回溯补全整个历史(否则一次跨天会把过去每天都投骰子，看起来像"全补全了")
+            dream_targets = [yest_s] if (yest_s in conv_dates and yest_s not in have) else []
+            # 真实小结(回忆墙)是真实记录、不能漏，仍补全所有历史缺口
             diary_targets = sorted(d for d in conv_dates if d < today_s and d not in mw)
 
         # ---- 做梦(独立·只写 dreams 表；不是每天都做，投骰子+情绪兜底) ----
