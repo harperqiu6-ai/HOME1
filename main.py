@@ -1526,10 +1526,16 @@ async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: l
                 continue
             if not dry_run:
                 try:
-                    _mw = {"summary": di.get("summary", ""), "title": di.get("card_title", ""),
-                           "body": di.get("diary", ""), "source": "daily_diary",
+                    _diary_text = di.get("diary", "")[:2000]
+                    _summary_text = di.get("summary", "")
+                    _title_text = di.get("card_title", "")
+                    _mw = {"summary": _summary_text, "title": _title_text,
+                           "body": _diary_text, "source": "daily_diary",
                            "author": "xiaoke", "author_cn": (AI_NAME or "V")}
-                    await save_migrated_memory(di.get("diary", "")[:2000], 6, di.get("card_title", ""),
+                    # 跟手动/迁移写回忆墙同款 content 格式:【回忆·日期·作者】标题 +〔检索摘要〕浓缩 + 正文
+                    # → ① UI 显示恢复日期/检索摘要 ② 关键词搜索能命中浓缩 summary 词,召回更准
+                    _mw_content = _compose_mw_content(_title_text, _diary_text, "xiaoke", None, d, _summary_text)
+                    await save_migrated_memory(_mw_content, 6, _title_text,
                                                d, datetime.now(timezone.utc).isoformat(), _mw)
                 except Exception as _me:
                     print(f"⚠️ 真实小结→回忆墙写入失败 {d}: {_me}")
@@ -1550,6 +1556,28 @@ async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: l
                         pass
             out.append({"date": d, "kind": "diary", "status": "ok", "diary_len": len(di.get("diary", "")),
                         "diary": (di.get("diary", "") if dry_run else None)})
+
+        # ---- 补归档扫描(幂等):修结构性 bug——原归档代码只在"本次新生成回忆墙那一刻"跑(1545附近),
+        # 任何 transient 失败(服务休眠/网络抖动/任务被取消)→ 那天的碎片永远漏归档。
+        # 这里每次跑 maybe_run_dreams 都扫一遍:有回忆墙覆盖且当天还活跃 layer1 碎片的旧日,全归档。
+        # 今天不动(碎片还在写)。已归档的不会被重复拉起(get_fragment_ids_for_date 只看 is_active=TRUE)。
+        if not dry_run:
+            try:
+                _mw_all = await get_memorywall_dates()
+                _swept = 0
+                for _md in sorted(_mw_all):
+                    _md_s = str(_md)
+                    if _md_s >= today_s:
+                        continue
+                    _stale = await get_fragment_ids_for_date(_md_s)
+                    if _stale:
+                        await archive_decayed_memories(_stale)
+                        _swept += len(_stale)
+                        print(f"🗂️ 补归档{_md_s}漏的{len(_stale)}条当天碎片(可逆)")
+                if _swept:
+                    print(f"🗂️ 补归档扫描总计 {_swept} 条")
+            except Exception as _se:
+                print(f"⚠️ 补归档扫描失败: {_se}")
 
         print(f"💤 做梦+真实小结补做{'(dry)' if dry_run else ''}: "
               f"ok={len([o for o in out if o.get('status')=='ok'])} 梦目标={dream_targets} 小结目标={diary_targets}")
