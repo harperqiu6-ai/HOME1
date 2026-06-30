@@ -241,6 +241,41 @@ EXTRA_TITLE = os.getenv("EXTRA_TITLE", "AI Memory Gateway")
 
 
 # ============================================================
+# 「递纸条」召回扩展（scratchpad）
+# 长输入/RP/总结等场景：让小模型先列"主题词清单"，按清单多 query 召回，再交主模型生成。
+# 解决纯 top-N 召回对长输出/泛 query "事实抓不全→编造"的问题。默认走 DeepSeek 官方 (便宜+中文强)。
+# 失败/超时一律降级到原 search_memories，绝不拖垮主响应。
+# ============================================================
+SCRATCHPAD_ENABLED = os.getenv("SCRATCHPAD_ENABLED", "true").lower() == "true"
+# 独立 endpoint+key (DeepSeek 官方比 OpenRouter 便宜 5%；想换走面板改 base_url+key+model)
+SCRATCHPAD_BASE_URL = os.getenv("SCRATCHPAD_BASE_URL", "https://api.deepseek.com/v1/chat/completions")
+SCRATCHPAD_API_KEY = os.getenv("SCRATCHPAD_API_KEY", "")
+SCRATCHPAD_MODEL = os.getenv("SCRATCHPAD_MODEL", "deepseek-chat")
+SCRATCHPAD_TIMEOUT = float(os.getenv("SCRATCHPAD_TIMEOUT", "5.0"))   # 秒；超时→空列表→走原召回
+SCRATCHPAD_TOPICS_MAX = int(os.getenv("SCRATCHPAD_TOPICS_MAX", "8"))  # 纸条上最多列几个主题
+SCRATCHPAD_PER_TOPIC_LIMIT = int(os.getenv("SCRATCHPAD_PER_TOPIC_LIMIT", "5"))  # 每主题召回 top-N
+# 触发门槛（字数）
+SCRATCHPAD_MAIN_MIN_CHARS = int(os.getenv("SCRATCHPAD_MAIN_MIN_CHARS", "50"))  # 主线 ≥50字 + 关键词命中
+SCRATCHPAD_LONG_MIN_CHARS = int(os.getenv("SCRATCHPAD_LONG_MIN_CHARS", "80"))  # 主线 ≥80字 无脑触发
+SCRATCHPAD_RP_MIN_CHARS = int(os.getenv("SCRATCHPAD_RP_MIN_CHARS", "15"))  # RP 线 ≥此值触发
+SCRATCHPAD_TG_ENABLED = os.getenv("SCRATCHPAD_TG_ENABLED", "false").lower() == "true"  # TG 短聊默认关
+# 触发关键词（命中 + 字数过中门槛 = 触发）
+_DEFAULT_SCRATCHPAD_KEYWORDS = (
+    "写,讲讲,聊聊,回忆,回顾,总结,复盘,"
+    "咱俩,咱们,我们,你我,过去,以前,曾经,那时候,前几天,前两天,"
+    "这段时间,这个月,这一年,最近,"
+    "变化,变了,不一样,怎么样,什么样,"
+    "描述,形容,想象,设想"
+)
+SCRATCHPAD_KEYWORDS = [k.strip() for k in os.getenv("SCRATCHPAD_KEYWORDS", _DEFAULT_SCRATCHPAD_KEYWORDS).split(",") if k.strip()]
+# 强制触发暗号（用户在消息开头打这个 → 不管字数/关键词，强制走纸条）
+SCRATCHPAD_TRIGGER_CMD = os.getenv("SCRATCHPAD_TRIGGER_CMD", "/想想")
+
+# 每请求强制触发标记（/想想 暗号识别后置 true；contextvar 让后台任务继承）
+_request_force_scratchpad = contextvars.ContextVar("request_force_scratchpad", default=False)
+
+
+# ============================================================
 # 人设加载
 # ============================================================
 
@@ -684,6 +719,181 @@ def _mem_snippet(text: str, keywords=None) -> str:
     return res
 
 
+# ============================================================
+# 「递纸条」召回扩展 — 实现
+# ============================================================
+
+def _should_use_scratchpad(user_message: str, session_id: str = "", force: bool = False) -> bool:
+    """触发判断。规则：
+      - force=True (来自 /想想 暗号 或 后台调用)        → 触发
+      - 总开关关闭 / 没配 API key / 消息为空            → 不触发
+      - TG 线（默认）                                    → 不触发
+      - RP 线 + 字数 ≥ SCRATCHPAD_RP_MIN_CHARS         → 触发
+      - 主线 + 字数 ≥ SCRATCHPAD_LONG_MIN_CHARS         → 触发
+      - 主线 + 字数 ≥ SCRATCHPAD_MAIN_MIN_CHARS + 命中关键词 → 触发
+      - 其余                                              → 不触发
+    """
+    if force:
+        return True
+    if not SCRATCHPAD_ENABLED or not SCRATCHPAD_API_KEY:
+        return False
+    msg = (user_message or "").strip()
+    if not msg:
+        return False
+    n = len(msg)
+    sid = session_id or get_active_session_id()
+    # 线判断（与 _is_rp_line/TG 同款逻辑：主线=PARTITION_SESSION_ID；rp/tg 看前缀）
+    is_main = bool(PARTITION_SESSION_ID) and sid == PARTITION_SESSION_ID
+    is_rp = (sid != PARTITION_SESSION_ID) and sid.startswith("rp")
+    is_tg = (sid != PARTITION_SESSION_ID) and sid.startswith("tg")
+    if is_tg and not SCRATCHPAD_TG_ENABLED:
+        return False
+    if is_rp:
+        return n >= SCRATCHPAD_RP_MIN_CHARS
+    # 主线（或未知线，按主线宽松对待）
+    if n >= SCRATCHPAD_LONG_MIN_CHARS:
+        return True
+    if n >= SCRATCHPAD_MAIN_MIN_CHARS:
+        return any(kw in msg for kw in SCRATCHPAD_KEYWORDS)
+    return False
+
+
+async def _scratchpad_background() -> str:
+    """拼装递纸条用的"关系档案背景"：userProfile + l5Foundation（截断到 2000 字内）。
+    让 DeepSeek 真的"认识"这俩人，能列具体事件而非抽象泛词。失败返回空串。"""
+    parts = []
+    try:
+        up = (await get_user_profile()).strip()
+        if up:
+            parts.append(f"【对方档案】\n{up[:1200]}")
+    except Exception:
+        pass
+    try:
+        l5 = (await get_l5_foundation()).strip()
+        if l5:
+            parts.append(f"【关系里程碑】\n{l5[:800]}")
+    except Exception:
+        pass
+    return "\n\n".join(parts)
+
+
+async def _scratchpad_topics(user_message: str, recent_context: str = "") -> list:
+    """调 deepseek 把"用户当前消息"扩展成多个具体的检索查询。
+    超时/失败/格式错 → 返回 []，调用方降级到原 search_memories。"""
+    if not SCRATCHPAD_API_KEY:
+        return []
+    msg = (user_message or "").strip()
+    if not msg:
+        return []
+
+    _ai_label = AI_NAME or "V"
+    background = await _scratchpad_background()
+    bg_block = f"\n\n下面是这位用户与 {_ai_label} 的关系档案（仅作背景参考）：\n---\n{background}\n---\n" if background else ""
+
+    sys_prompt = (
+        f"你是一个检索助理。用户即将与他长期相伴的 AI 助手 {_ai_label} 对话。"
+        f"{bg_block}\n"
+        f"你的任务：基于用户这条消息（和上面的背景档案），把它**扩展成多个具体的检索查询**，"
+        f"每个查询会被用来在用户与 {_ai_label} 的对话记忆库里搜索相关内容。\n"
+        f"\n"
+        f"输出规则：\n"
+        f"- 每行一个查询，不要编号、不要标点\n"
+        f"- 优先用档案里提到的**具体名字/事件/日期/地点/物品**作为查询（例：「情人节项链」「上海旅行」「妈妈的病」）\n"
+        f"- 档案里没有相关具体名词时，用稍微泛但仍可检索的查询（例：「最近一个月的争吵」「亲密的肢体接触」「关于工作的烦恼」「深夜聊天」）\n"
+        f"- 避免完全抽象的元词（如「关系」「情感」「记忆」「成长」「变化」），这些在检索里几乎没用\n"
+        f"- 当用户说「咱俩/我们/这段时间」时，扩展成多个具体场景或具体时间段，不要原话照搬\n"
+        f"- 最多 {SCRATCHPAD_TOPICS_MAX} 个；宁缺勿滥；消息太短/太具体/无需扩展时输出空"
+    )
+    user_prompt = f"用户消息：\n{msg}"
+    if recent_context:
+        user_prompt += f"\n\n最近对话（参考语境）：\n{recent_context}"
+    user_prompt += "\n\n请列出检索查询："
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {SCRATCHPAD_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        # DeepSeek 官方不需要 HTTP-Referer；若用户把 base_url 改成 OpenRouter，加上以兼容
+        if "openrouter" in SCRATCHPAD_BASE_URL:
+            headers["HTTP-Referer"] = EXTRA_REFERER
+            headers["X-Title"] = EXTRA_TITLE
+        async with httpx.AsyncClient(timeout=SCRATCHPAD_TIMEOUT) as client:
+            r = await client.post(SCRATCHPAD_BASE_URL, headers=headers, json={
+                "model": SCRATCHPAD_MODEL,
+                "max_tokens": 200,
+                "temperature": 0.3,
+                "messages": [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            })
+        if r.status_code != 200:
+            print(f"📝 纸条调用失败 HTTP {r.status_code}: {r.text[:200]}")
+            return []
+        data = r.json()
+        text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+        if not text:
+            return []
+        # 按行拆分 + 清洗
+        topics = []
+        for line in text.splitlines():
+            t = line.strip().lstrip("-*•·1234567890.、) ").strip()
+            if 2 <= len(t) <= 20 and not any(c in t for c in "。，；：！？"):
+                topics.append(t)
+        topics = topics[:SCRATCHPAD_TOPICS_MAX]
+        if topics:
+            print(f"📝 纸条主题({len(topics)}): {topics}")
+        else:
+            print(f"📝 纸条返回但无可用主题: {text[:80]!r}")
+        return topics
+    except asyncio.TimeoutError:
+        print(f"📝 纸条超时({SCRATCHPAD_TIMEOUT}s) → 降级原召回")
+        return []
+    except Exception as e:
+        print(f"📝 纸条异常 → 降级原召回: {e}")
+        return []
+
+
+async def _expand_recall_with_scratchpad(user_message: str, total_limit: int, recent_context: str = "") -> list:
+    """递纸条→多 query 召回→去重合并。失败返回 [] 让调用方降级到原 search_memories。"""
+    topics = await _scratchpad_topics(user_message, recent_context=recent_context)
+    if not topics:
+        return []
+    # 每个主题各召回 top-N，按 id 去重；最后裁到 total_limit
+    seen = {}
+    for t in topics:
+        try:
+            mems = await search_memories(t, limit=SCRATCHPAD_PER_TOPIC_LIMIT)
+        except Exception as e:
+            print(f"📝 主题「{t}」召回失败: {e}")
+            continue
+        for m in mems:
+            mid = m.get("id")
+            if mid is None:
+                continue
+            # 同 id 已存在 → 保留 score 高的
+            if mid in seen:
+                if float(m.get("score") or 0) > float(seen[mid].get("score") or 0):
+                    seen[mid] = m
+            else:
+                seen[mid] = m
+    # 再用原 query 兜底一次（避免漏掉直接匹配的）
+    try:
+        base_mems = await search_memories(user_message, limit=total_limit)
+        for m in base_mems:
+            mid = m.get("id")
+            if mid is not None and mid not in seen:
+                seen[mid] = m
+    except Exception as e:
+        print(f"📝 兜底召回失败: {e}")
+    # 按 score 排序，截到 total_limit
+    merged = sorted(seen.values(), key=lambda x: -float(x.get("score") or 0))
+    result = merged[:total_limit]
+    print(f"📝 纸条扩展召回: {len(topics)}主题 → {len(seen)}条去重 → 注入{len(result)}条")
+    return result
+
+
 async def build_system_prompt_with_memories(user_message: str, drift: bool = True) -> str:
     """
     构建带记忆的 system prompt（drift=False 时只读，不触发心情漂移；诊断/层视图用）
@@ -698,7 +908,12 @@ async def build_system_prompt_with_memories(user_message: str, drift: bool = Tru
         return persona
 
     try:
-        memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT)
+        # 先尝试递纸条扩展召回（长输入/RP/总结场景）；不触发或失败→走原 search_memories
+        memories = []
+        if _should_use_scratchpad(user_message, force=_request_force_scratchpad.get()):
+            memories = await _expand_recall_with_scratchpad(user_message, MAX_MEMORIES_INJECT)
+        if not memories:
+            memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT)
 
         if not memories:
             return persona
@@ -2406,7 +2621,12 @@ async def build_memory_text(user_message: str, drift: bool = True) -> str:
     if MAX_MEMORIES_INJECT <= 0:
         return ""
     try:
-        memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT)
+        # 先尝试递纸条扩展召回（长输入/RP/总结场景）；不触发或失败→走原 search_memories
+        memories = []
+        if _should_use_scratchpad(user_message, force=_request_force_scratchpad.get()):
+            memories = await _expand_recall_with_scratchpad(user_message, MAX_MEMORIES_INJECT)
+        if not memories:
+            memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT)
         if not memories:
             return ""
 
@@ -2896,6 +3116,50 @@ async def chat_completions(request: Request):
             except Exception as _se:
                 _txt = f"（同步出了点小问题：{_se}）"
         return _oai_text_response(_txt, body.get("model", ""), bool(body.get("stream", False)) or FORCE_STREAM)
+
+    # ---------- 暗号拦截：/想想 → 强制走"递纸条"扩展召回（不拦截回复，剥离前缀后继续正常生成）----------
+    _scratchpad_cmd_hit = (
+        _um_last.startswith(SCRATCHPAD_TRIGGER_CMD)
+        or _um_last.lower().startswith("/scratchpad")
+    )
+    if _scratchpad_cmd_hit:
+        if _um_last.startswith(SCRATCHPAD_TRIGGER_CMD):
+            _stripped_last = _um_last[len(SCRATCHPAD_TRIGGER_CMD):].strip()
+        else:
+            _stripped_last = _um_last[len("/scratchpad"):].strip()
+        if not _stripped_last:
+            _txt = (f"（{SCRATCHPAD_TRIGGER_CMD} 是让我多翻几遍记忆库再回复你的暗号——"
+                    f"后面跟上你想问/想写的内容，我会更仔细地找资料再答~）")
+            return _oai_text_response(_txt, body.get("model", ""), bool(body.get("stream", False)) or FORCE_STREAM)
+        # 剥离前缀：更新本地 user_message + 同步改 messages 末条 user content（让 LLM 看不到暗号）
+        _orig_lines = (user_message or "").splitlines()
+        if _orig_lines:
+            _orig_lines[-1] = _stripped_last
+            user_message = "\n".join(_orig_lines).strip()
+        else:
+            user_message = _stripped_last
+        for _m in reversed(messages):
+            if _m.get("role") != "user":
+                continue
+            _c = _m.get("content")
+            if isinstance(_c, str):
+                _sl = _c.splitlines()
+                if _sl and (_sl[-1].strip().startswith(SCRATCHPAD_TRIGGER_CMD)
+                            or _sl[-1].strip().lower().startswith("/scratchpad")):
+                    _sl[-1] = _stripped_last
+                    _m["content"] = "\n".join(_sl)
+            elif isinstance(_c, list):
+                for _item in _c:
+                    if isinstance(_item, dict) and _item.get("type") == "text":
+                        _tl = (_item.get("text") or "").splitlines()
+                        if _tl and (_tl[-1].strip().startswith(SCRATCHPAD_TRIGGER_CMD)
+                                    or _tl[-1].strip().lower().startswith("/scratchpad")):
+                            _tl[-1] = _stripped_last
+                            _item["text"] = "\n".join(_tl)
+                            break
+            break
+        _request_force_scratchpad.set(True)
+        print(f"📝 暗号触发: {SCRATCHPAD_TRIGGER_CMD} → 强制纸条召回，剥离后={_stripped_last[:60]!r}")
 
     # ---------- 构建 system prompt ----------
     # 先保存原始对话消息（不含 system prompt），用于记忆提取
@@ -7020,8 +7284,27 @@ async def api_console():
             counts["decay_last_batch"] = len(json.loads(_b)) if _b else 0
         except Exception as e:
             counts["error"] = str(e)
+    # 「递纸条」诊断（只读：v1 只暴露当前值，编辑走 Render env vars + 重启；hot-reload 留 v2）
+    scratchpad = {
+        "enabled":           SCRATCHPAD_ENABLED,
+        "has_api_key":       bool(SCRATCHPAD_API_KEY),
+        "base_url":          SCRATCHPAD_BASE_URL,
+        "model":             SCRATCHPAD_MODEL,
+        "timeout_s":         SCRATCHPAD_TIMEOUT,
+        "topics_max":        SCRATCHPAD_TOPICS_MAX,
+        "per_topic_limit":   SCRATCHPAD_PER_TOPIC_LIMIT,
+        "trigger": {
+            "main_min_chars": SCRATCHPAD_MAIN_MIN_CHARS,
+            "long_min_chars": SCRATCHPAD_LONG_MIN_CHARS,
+            "rp_min_chars":   SCRATCHPAD_RP_MIN_CHARS,
+            "tg_enabled":     SCRATCHPAD_TG_ENABLED,
+            "cmd":            SCRATCHPAD_TRIGGER_CMD,
+            "keyword_count":  len(SCRATCHPAD_KEYWORDS),
+        },
+    }
     return {"status": "ok", "memory_enabled": MEMORY_ENABLED,
             "toggles": toggles, "numbers": numbers, "counts": counts,
+            "scratchpad": scratchpad,
             "intimacy_keys": INTIMACY_UNLOCK_KEYS}
 
 
