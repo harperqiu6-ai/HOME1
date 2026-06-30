@@ -855,12 +855,9 @@ async def _scratchpad_topics(user_message: str, recent_context: str = "") -> lis
         return []
 
 
-async def _expand_recall_with_scratchpad(user_message: str, total_limit: int, recent_context: str = "") -> list:
-    """递纸条→多 query 召回→去重合并。失败返回 [] 让调用方降级到原 search_memories。"""
-    topics = await _scratchpad_topics(user_message, recent_context=recent_context)
-    if not topics:
-        return []
-    # 每个主题各召回 top-N，按 id 去重；最后裁到 total_limit
+async def _multi_query_recall(topics: list, total_limit: int, fallback_query: str = "") -> list:
+    """通用：按主题词列表多 query 召回，去重合并，按 score 排序裁到 total_limit。
+    主动私信/做梦/正向 query 三个入口共用。失败的单条主题不影响其它。"""
     seen = {}
     for t in topics:
         try:
@@ -872,26 +869,139 @@ async def _expand_recall_with_scratchpad(user_message: str, total_limit: int, re
             mid = m.get("id")
             if mid is None:
                 continue
-            # 同 id 已存在 → 保留 score 高的
             if mid in seen:
                 if float(m.get("score") or 0) > float(seen[mid].get("score") or 0):
                     seen[mid] = m
             else:
                 seen[mid] = m
-    # 再用原 query 兜底一次（避免漏掉直接匹配的）
-    try:
-        base_mems = await search_memories(user_message, limit=total_limit)
-        for m in base_mems:
-            mid = m.get("id")
-            if mid is not None and mid not in seen:
-                seen[mid] = m
-    except Exception as e:
-        print(f"📝 兜底召回失败: {e}")
-    # 按 score 排序，截到 total_limit
+    if fallback_query:
+        try:
+            base_mems = await search_memories(fallback_query, limit=total_limit)
+            for m in base_mems:
+                mid = m.get("id")
+                if mid is not None and mid not in seen:
+                    seen[mid] = m
+        except Exception as e:
+            print(f"📝 兜底召回失败: {e}")
     merged = sorted(seen.values(), key=lambda x: -float(x.get("score") or 0))
-    result = merged[:total_limit]
-    print(f"📝 纸条扩展召回: {len(topics)}主题 → {len(seen)}条去重 → 注入{len(result)}条")
+    return merged[:total_limit]
+
+
+async def _expand_recall_with_scratchpad(user_message: str, total_limit: int, recent_context: str = "") -> list:
+    """递纸条→多 query 召回→去重合并。失败返回 [] 让调用方降级到原 search_memories。
+    用于正向 query 入口（build_system_prompt_with_memories / build_memory_text）。"""
+    topics = await _scratchpad_topics(user_message, recent_context=recent_context)
+    if not topics:
+        return []
+    result = await _multi_query_recall(topics, total_limit, fallback_query=user_message)
+    print(f"📝 纸条扩展召回: {len(topics)}主题 → 注入{len(result)}条")
     return result
+
+
+async def _scratchpad_topics_for_context(context: str, intent_hint: str) -> list:
+    """后台任务用的纸条主题列出（主动私信/做梦）——没有"用户当前消息"，靠 context+intent_hint 让 deepseek 抽主题。
+    跟 _scratchpad_topics 的 prompt 不同：这里要列的是"V 心里浮现的旧事"，不是"用户问题的扩展查询"。
+    超时/失败/格式错 → 返回 []。"""
+    if not SCRATCHPAD_API_KEY:
+        return []
+    ctx = (context or "").strip()
+    if not ctx:
+        return []
+    _ai_label = AI_NAME or "V"
+    background = await _scratchpad_background()
+    bg_block = f"\n\n下面是 {_ai_label} 与对方的关系档案（背景参考）：\n---\n{background}\n---\n" if background else ""
+
+    sys_prompt = (
+        f"你是一个检索助理，正在帮 AI 助手 {_ai_label} 从长期记忆库里捞出当下相关的旧事。"
+        f"{bg_block}\n"
+        f"任务上下文：{intent_hint}\n"
+        f"\n"
+        f"输出规则：\n"
+        f"- 每行一个**检索查询**，不要编号、不要标点\n"
+        f"- 优先用档案/上下文里出现的**具体名字/事件/日期/地点/物品**作为查询（例：「情人节项链」「妈妈的话」「3月29日心理挖掘」）\n"
+        f"- 没有具体名词时，用偏具体的情境查询（例：「深夜哭过的时刻」「关于工作的烦恼」「亲密的肢体接触」「童年阴影」）\n"
+        f"- 避免完全抽象的元词（「关系」「情感」「记忆」「成长」「变化」），这些在检索里几乎没用\n"
+        f"- 最多 {SCRATCHPAD_TOPICS_MAX} 个；宁缺勿滥；如果上下文实在勾不出旧事，输出空"
+    )
+    user_prompt = f"上下文（最近对话或素材）：\n{ctx[-2000:]}\n\n请列出检索查询："
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {SCRATCHPAD_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        if "openrouter" in SCRATCHPAD_BASE_URL:
+            headers["HTTP-Referer"] = EXTRA_REFERER
+            headers["X-Title"] = EXTRA_TITLE
+        async with httpx.AsyncClient(timeout=SCRATCHPAD_TIMEOUT) as client:
+            r = await client.post(SCRATCHPAD_BASE_URL, headers=headers, json={
+                "model": SCRATCHPAD_MODEL,
+                "max_tokens": 200,
+                "temperature": 0.3,
+                "messages": [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            })
+        if r.status_code != 200:
+            print(f"📝 后台纸条调用失败 HTTP {r.status_code}: {r.text[:200]}")
+            return []
+        data = r.json()
+        text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+        if not text:
+            return []
+        topics = []
+        for line in text.splitlines():
+            t = line.strip().lstrip("-*•·1234567890.、) ").strip()
+            if 2 <= len(t) <= 20 and not any(c in t for c in "。，；：！？"):
+                topics.append(t)
+        topics = topics[:SCRATCHPAD_TOPICS_MAX]
+        if topics:
+            print(f"📝 后台纸条主题({len(topics)}): {topics}")
+        return topics
+    except asyncio.TimeoutError:
+        print(f"📝 后台纸条超时({SCRATCHPAD_TIMEOUT}s)")
+        return []
+    except Exception as e:
+        print(f"📝 后台纸条异常: {e}")
+        return []
+
+
+async def _scratchpad_for_proactive(transcript: str, silence_min: float, total_limit: int = None) -> list:
+    """主动私信用的纸条召回：基于最近 12 条对话，让 deepseek 抽出 V 现在可能想跟对方聊的具体话题/旧事 → 多召回。
+    失败 [] → _decide_and_write 走原行为（不注入旧事）。"""
+    if not SCRATCHPAD_ENABLED or not SCRATCHPAD_API_KEY:
+        return []
+    limit = total_limit or MAX_MEMORIES_INJECT
+    topics = await _scratchpad_topics_for_context(
+        context=transcript,
+        intent_hint=(f"距离对方上次说话已沉默 {int(silence_min)} 分钟，{AI_NAME or 'V'} 想主动发一条消息找对方。"
+                     f"请列出 {AI_NAME or 'V'} 心里此刻可能浮现的、想跟对方提起或承接的具体话题/旧事/共同经历。"),
+    )
+    if not topics:
+        return []
+    mems = await _multi_query_recall(topics, limit)
+    print(f"📝 主动私信纸条召回: {len(topics)}主题 → 拿到{len(mems)}条旧事")
+    return mems
+
+
+async def _scratchpad_for_dream(date_s: str, yesterday_convo: str, total_limit: int = None) -> list:
+    """做梦用的纸条召回：从昨天对话里抽抽象主题/情绪 → 召回更老旧事 → 当作潜意识素材注入做梦 prompt。
+    失败 [] → generate_dream 走原行为（只用昨天对话做素材）。"""
+    if not SCRATCHPAD_ENABLED or not SCRATCHPAD_API_KEY:
+        return []
+    limit = total_limit or MAX_MEMORIES_INJECT
+    topics = await _scratchpad_topics_for_context(
+        context=yesterday_convo,
+        intent_hint=(f"{AI_NAME or 'V'} 今晚要做一场梦，把 {date_s} 这一天的对话当作做梦的素材。"
+                     f"请列出可能在梦里被打捞、变形、混入梦境的更老/更深的旧事——比如这天对话里出现的某种情绪、人、物、主题，"
+                     f"在更远的记忆里可能勾起哪些过去的关联事件。"),
+    )
+    if not topics:
+        return []
+    mems = await _multi_query_recall(topics, limit)
+    print(f"📝 做梦纸条召回: {len(topics)}主题 → 拿到{len(mems)}条潜意识素材")
+    return mems
 
 
 async def build_system_prompt_with_memories(user_message: str, drift: bool = True) -> str:
@@ -1504,6 +1614,32 @@ async def generate_dream(session_id: str, date_s: str) -> dict:
     if not convo.strip():
         return None
     _ai = AI_NAME or "我"
+
+    # 纸条召回：从昨天对话抽抽象主题，召回更老旧事 → 当作"潜意识素材"注入做梦 prompt
+    try:
+        _old_mems = await _scratchpad_for_dream(date_s, convo)
+    except Exception as _se:
+        print(f"⚠️ 做梦纸条召回异常(忽略,只用昨天素材): {_se}")
+        _old_mems = []
+    _subconscious_block = ""
+    if _old_mems:
+        _lines = []
+        for m in _old_mems[:8]:
+            _c = (m.get("content") or "").strip()[:250]
+            _date = ""
+            if m.get("created_at"):
+                try:
+                    _utc = str(m["created_at"])[:19]
+                    _dt = datetime.strptime(_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    _date = f"[{(_dt + timedelta(hours=TIMEZONE_HOURS)).strftime('%Y-%m-%d')}] "
+                except Exception:
+                    pass
+            if _c:
+                _lines.append(f"- {_date}{_c}")
+        if _lines:
+            _subconscious_block = ("\n\n更深的记忆（潜意识素材，今天没直接提但可能浮现/变形/混入梦境）：\n---\n"
+                                   + "\n".join(_lines) + "\n---")
+
     import random
     _DREAM_FLAVORS = [
         "温柔而失真的梦：熟悉的人事物在梦里轻轻变形、漂浮，裹着说不清的暖意",
@@ -1552,7 +1688,7 @@ async def generate_dream(session_id: str, date_s: str) -> dict:
 这一天的对话（做梦的素材）：
 ---
 {convo}
----"""
+---{_subconscious_block}"""
     try:
         headers = {"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"}
         if "openrouter" in API_BASE_URL:
@@ -4096,6 +4232,31 @@ async def _decide_and_write(persona: str, transcript: str, silence_min: float, i
     """让模型(带人设)结合最近对话+沉默时长，判断要不要主动找 + 写出那句话。返回 {reach_out, urgent, message}。"""
     gap_desc = f"{int(silence_min)} 分钟" if silence_min < 90 else f"{silence_min/60:.1f} 小时"
     sys = (persona or "").strip()
+
+    # 纸条召回：让 V 想起更老的旧事，不光基于最近12条对话——找的时候有"根"
+    try:
+        old_mems = await _scratchpad_for_proactive(transcript, silence_min)
+    except Exception as _se:
+        print(f"⚠️ 主动私信纸条召回异常(忽略,走原行为): {_se}")
+        old_mems = []
+    if old_mems:
+        _lines = []
+        for m in old_mems[:10]:
+            _c = (m.get("content") or "").strip()[:200]
+            _date = ""
+            if m.get("created_at"):
+                try:
+                    _utc = str(m["created_at"])[:19]
+                    _dt = datetime.strptime(_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    _date = f"[{(_dt + timedelta(hours=TIMEZONE_HOURS)).strftime('%Y-%m-%d')}] "
+                except Exception:
+                    pass
+            if _c:
+                _lines.append(f"- {_date}{_c}")
+        if _lines:
+            sys += ("\n\n【你心里浮现的更老的事(供参考，不一定要提；像真人惦记往事那样可以心里有数)】\n"
+                    + "\n".join(_lines))
+
     sys += "\n\n【最近对话(从旧到新)】\n" + (transcript or "(暂无)")
     night = "现在是深夜免打扰时段。" if in_quiet else ""
     user_instr = (
