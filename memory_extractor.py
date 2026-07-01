@@ -8,9 +8,61 @@ v2.3 改进：提取时注入已有记忆，让模型对比后只提取全新信
 """
 
 import os
+import re
 import json
 import httpx
 from typing import List, Dict
+
+
+def _robust_extract_json_array(text: str):
+    """多层修复解析 haiku 常见输出。返回 list 成功、None 失败。
+    haiku 常见错法: markdown 围栏/中文引号/单引号/尾逗号/Python常量/前后带解释文/单对象非数组。
+    挨个修:1)剥围栏 loads 2)常见修复后 loads 3)正则抽[...] loads 4)修复+正则 5)单{}包成[]。"""
+    if not text or not text.strip():
+        return None
+    t = text.strip()
+    if t.startswith("```json"):
+        t = t[7:]
+    elif t.startswith("```"):
+        t = t[3:]
+    if t.endswith("```"):
+        t = t[:-3]
+    t = t.strip()
+
+    def _try(s):
+        try:
+            v = json.loads(s)
+            return v if isinstance(v, list) else None
+        except Exception:
+            return None
+
+    def _fix(s):
+        s = s.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+        s = s.replace("'", '"')
+        s = re.sub(r'\bTrue\b', 'true', s)
+        s = re.sub(r'\bFalse\b', 'false', s)
+        s = re.sub(r'\bNone\b', 'null', s)
+        s = re.sub(r',(\s*[\]\}])', r'\1', s)
+        return s
+
+    for cand in (t, _fix(t)):
+        r = _try(cand)
+        if r is not None:
+            return r
+    m = re.search(r'\[[\s\S]*\]', t)
+    if m:
+        for cand in (m.group(), _fix(m.group())):
+            r = _try(cand)
+            if r is not None:
+                return r
+    m = re.search(r'\{[\s\S]*\}', t)
+    if m:
+        for cand in ("[" + m.group() + "]", "[" + _fix(m.group()) + "]"):
+            r = _try(cand)
+            if r is not None:
+                return r
+    return None
+
 
 API_KEY = os.getenv("API_KEY", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
@@ -87,6 +139,13 @@ EXTRACTION_PROMPT = """你是记忆提取专家。从对话中提取值得长期
   {{"kind": "persona", "content": "行为/相处偏好", "importance": 分数}}
 ]
 importance 为 1-10（10最重要）；valence∈[-1,1]、arousal∈[0,1]；is_milestone/is_explicit 默认 false。没有可提取的就返回 []。
+
+# ⚠️ 铁律 · 输出格式（违反则你的工作作废）
+你的整个回复必须以 `[` 字符开头、以 `]` 字符结尾。
+不要写任何解释性文字（不要"以下是提取的记忆:"、不要"我从对话中发现"）。
+不要用 markdown 代码块围栏（不要 ```json 或 ```）。
+用双引号 `"`，不要用单引号 `'` 或中文引号 `"" ''`。
+就算没有可提取的记忆，也只输出两个字符：`[]`
 """
 
 
@@ -138,107 +197,90 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
     # 把已有记忆填入prompt
     prompt = EXTRACTION_PROMPT.format(existing_memories=memories_text)
 
-    # 调用 LLM 提取记忆
+    # 调用 LLM 提取记忆(带一次重试:haiku 常返回不合规 JSON,重试时 system 尾部再加最强约束)
+    memories = None
+    last_raw = ""
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
-                API_BASE_URL,
-                headers={
-                    "Authorization": f"Bearer {get_memory_api_key()}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://midsummer-gateway.local",
-                    "X-Title": "Midsummer Memory Extraction",
-                },
-                json={
-                    "model": MEMORY_MODEL,
-                    "max_tokens": 1000,
-                    "messages": [
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": f"请从以下对话中提取新的记忆：\n\n{conversation_text}"},
-                    ],
-                },
+        for attempt in (1, 2):
+            _extra = "" if attempt == 1 else (
+                "\n\n【最后强调 · 第二次尝试】上一次你的输出解析失败了(不是纯 JSON 数组)。"
+                "这次你的整个回复必须只有 JSON 数组本身:以 `[` 开头,以 `]` 结尾,"
+                "别的一个字符都不要,包括解释、代码块围栏、markdown。"
+                "如果没有可提取的记忆,输出 `[]` 两个字符即可。"
             )
+            async with httpx.AsyncClient(timeout=60) as client:
+                response = await client.post(
+                    API_BASE_URL,
+                    headers={
+                        "Authorization": f"Bearer {get_memory_api_key()}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "https://midsummer-gateway.local",
+                        "X-Title": "Midsummer Memory Extraction",
+                    },
+                    json={
+                        "model": MEMORY_MODEL,
+                        "max_tokens": 2000,  # 1000→2000 防长 JSON 被截断(丢右方括号)
+                        "messages": [
+                            {"role": "system", "content": prompt + _extra},
+                            {"role": "user", "content": f"请从以下对话中提取新的记忆：\n\n{conversation_text}"},
+                        ],
+                    },
+                )
+                if response.status_code != 200:
+                    print(f"⚠️  记忆提取请求失败(第{attempt}次): HTTP {response.status_code}")
+                    continue
+                text = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+                last_raw = text
+                print(f"📝 记忆模型原始返回(第{attempt}次):\n{text[:500]}", flush=True)
+                memories = _robust_extract_json_array(text)
+                if memories is not None:
+                    if attempt == 2:
+                        print(f"📝 第二次尝试解析成功({len(memories)}条)")
+                    break
+                print(f"⚠️  第{attempt}次 JSON 解析失败({'重试一次' if attempt == 1 else '放弃'})")
 
-            if response.status_code != 200:
-                print(f"⚠️  记忆提取请求失败: {response.status_code}")
-                return []
+        if memories is None:
+            print(f"⚠️  记忆提取两次都解析失败,放弃。原始返回尾片段: {last_raw[-200:]!r}")
+            return []
+        if not isinstance(memories, list):
+            return []
 
-            data = response.json()
-            text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        # 验证格式（保留 kind 分类 + replaces_id 冲突标记）
+        valid_memories = []
+        for mem in memories:
+            if isinstance(mem, dict) and "content" in mem:
+                kind = mem.get("kind", "fact")
+                if kind not in ("fact", "persona"):
+                    kind = "fact"
+                item = {
+                    "content": str(mem["content"]),
+                    "importance": int(mem.get("importance", 5)),
+                    "kind": kind,
+                }
+                # 情绪① Russell 坐标：clamp + 默认（arousal 默认 0.2 兼作地板）
+                try:
+                    item["valence"] = max(-1.0, min(1.0, float(mem.get("valence", 0.0))))
+                except (TypeError, ValueError):
+                    item["valence"] = 0.0
+                try:
+                    item["arousal"] = max(0.0, min(1.0, float(mem.get("arousal", 0.2))))
+                except (TypeError, ValueError):
+                    item["arousal"] = 0.2
+                rid = mem.get("replaces_id")
+                if isinstance(rid, bool):
+                    rid = None
+                elif isinstance(rid, int):
+                    item["replaces_id"] = rid
+                elif isinstance(rid, str) and rid.strip().isdigit():
+                    item["replaces_id"] = int(rid.strip())
+                # ② L5：里程碑标记（仅 kind=fact 才认）
+                item["is_milestone"] = bool(mem.get("is_milestone")) and kind == "fact"
+                item["is_explicit"] = bool(mem.get("is_explicit")) and kind == "fact"
+                valid_memories.append(item)
 
-            # 打印模型原始返回（截断防刷屏）
-            print(f"📝 记忆模型原始返回:\n{text[:500]}", flush=True)
+        print(f"📝 从对话中提取了 {len(valid_memories)} 条（已对比 {len(existing_memories or [])} 条已有记忆）")
+        return valid_memories
 
-            # 清理可能的 markdown 格式
-            text = text.strip()
-            if text.startswith("```json"):
-                text = text[7:]
-            if text.startswith("```"):
-                text = text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-
-            # 强力JSON提取：如果上面清理后仍然解析失败，用正则兜底
-            try:
-                memories = json.loads(text)
-            except json.JSONDecodeError:
-                # 尝试从文本中提取第一个 [...] 结构
-                import re
-                match = re.search(r'\[.*\]', text, re.DOTALL)
-                if match:
-                    try:
-                        memories = json.loads(match.group())
-                        print(f"📝 JSON正则兜底提取成功")
-                    except json.JSONDecodeError as e:
-                        print(f"⚠️  记忆提取结果解析失败: {e}")
-                        return []
-                else:
-                    print(f"⚠️  记忆提取结果中未找到JSON数组")
-                    return []
-
-            if not isinstance(memories, list):
-                return []
-
-            # 验证格式（保留 kind 分类 + replaces_id 冲突标记）
-            valid_memories = []
-            for mem in memories:
-                if isinstance(mem, dict) and "content" in mem:
-                    kind = mem.get("kind", "fact")
-                    if kind not in ("fact", "persona"):
-                        kind = "fact"
-                    item = {
-                        "content": str(mem["content"]),
-                        "importance": int(mem.get("importance", 5)),
-                        "kind": kind,
-                    }
-                    # 情绪① Russell 坐标：clamp + 默认（arousal 默认 0.2 兼作地板）
-                    try:
-                        item["valence"] = max(-1.0, min(1.0, float(mem.get("valence", 0.0))))
-                    except (TypeError, ValueError):
-                        item["valence"] = 0.0
-                    try:
-                        item["arousal"] = max(0.0, min(1.0, float(mem.get("arousal", 0.2))))
-                    except (TypeError, ValueError):
-                        item["arousal"] = 0.2
-                    rid = mem.get("replaces_id")
-                    if isinstance(rid, bool):
-                        rid = None
-                    elif isinstance(rid, int):
-                        item["replaces_id"] = rid
-                    elif isinstance(rid, str) and rid.strip().isdigit():
-                        item["replaces_id"] = int(rid.strip())
-                    # ② L5：里程碑标记（仅 kind=fact 才认）
-                    item["is_milestone"] = bool(mem.get("is_milestone")) and kind == "fact"
-                    item["is_explicit"] = bool(mem.get("is_explicit")) and kind == "fact"
-                    valid_memories.append(item)
-
-            print(f"📝 从对话中提取了 {len(valid_memories)} 条（已对比 {len(existing_memories or [])} 条已有记忆）")
-            return valid_memories
-
-    except json.JSONDecodeError as e:
-        print(f"⚠️  记忆提取结果解析失败: {e}")
-        return []
     except Exception as e:
         print(f"⚠️  记忆提取出错: {e}")
         return []
