@@ -731,6 +731,14 @@
                             <div class="combo-dropdown" id="dropdown-CACHE_SUMMARY_MODEL"></div>
                         </div>
                     </div>
+                    <div class="settings-field">
+                        <label>缓存 TTL 模式</label>
+                        <select id="set-CACHE_TTL_MODE" class="input">
+                            <option value="1h">慢聊 1h（默认，原作者设定）</option>
+                            <option value="5m">快聊 5m（密集连聊时更省）</option>
+                        </select>
+                        <small class="form-hint">1h = 长会话 / 中速节奏（10-60 分钟一句）最省；5m = 密集来回（几分钟内多轮）写入溢价更低。选错不会崩，随时切。</small>
+                    </div>
                 </div>
 
                 <!-- 向量搜索 -->

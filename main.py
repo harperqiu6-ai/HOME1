@@ -14,6 +14,7 @@ AI Memory Gateway — 带记忆系统的 LLM 转发网关
 
 import os
 import json
+import time
 import uuid
 import asyncio
 import secrets
@@ -141,6 +142,13 @@ def _ai_self() -> str:
 CACHE_PARTITION_ENABLED = os.getenv("CACHE_PARTITION_ENABLED", "false").lower() == "true"
 CACHE_PARTITION_X = int(os.getenv("CACHE_PARTITION_X", "15"))
 CACHE_SUMMARY_MODEL = os.getenv("CACHE_SUMMARY_MODEL", "anthropic/claude-haiku-4.5")
+# 缓存 TTL 模式：控制 cache_control 的 ttl 字段
+#   "1h"   = 原作者默认，长会话/中速节奏最省（打底）
+#   "5m"   = 密集聊模式，写入溢价低
+#   "none" = 不缓存（PR-2 才启用，10 分钟惰性回退到 "1h"）
+# 任何非法值都会被 _cache_ctl() 兜底为 "1h"，绝不改变原作者行为
+CACHE_TTL_MODE = os.getenv("CACHE_TTL_MODE", "1h")
+_CACHE_TTL_MODE_SET_AT = 0.0  # PR-2 用：进入 "none" 模式的时间戳（epoch 秒）
 # ⑤ 保质感摘要：A区摘要从第三人称干摘要→保质感(铁则一)。默认关(碰分区缓存主链路,验过再开)；开时新摘要过 _scrub 防露骨入常驻缓存
 SUMMARY_QUALITY_ENABLED = os.getenv("SUMMARY_QUALITY_ENABLED", "false").lower() == "true"
 # ③-2 做梦用的模型：默认同摘要模型(haiku,数字证明能保质感)；要更浓质感可 env 调成主力模型
@@ -431,6 +439,9 @@ async def lifespan(app: FastAPI):
                         "CACHE_PARTITION_ENABLED": lambda v: _parse_bool(v),
                         "CACHE_PARTITION_X": int, "CACHE_PARTITION_TRIGGER": str,
                         "CACHE_PARTITION_WINDOW": int, "CACHE_SUMMARY_MODEL": str,
+                        # 缓存 TTL 模式（"1h"/"5m"；"none" 视为非法 → 回落 "1h"，
+                        # 这样"不缓存"模式即使因崩溃残留在库里，重启后也自动回 1h 打底）
+                        "CACHE_TTL_MODE": lambda v: (str(v).strip().lower() if str(v).strip().lower() in ("1h", "5m") else "1h"),
                         "FORCE_STREAM": lambda v: _parse_bool(v),
                         "REASONING_EFFORT": str,
                         # 记忆控制台 B 类(原 env-only,现复用面板配置存库+恢复)
@@ -2116,26 +2127,57 @@ def _should_rotate(b_rounds_count: int, X: int, a_msgs: list) -> bool:
 CACHE_MAX_ROTATIONS = int(os.getenv("CACHE_MAX_ROTATIONS", "2"))
 
 
+def _cache_ctl():
+    """
+    返回当前 cache_control 字典；不缓存模式返回 None。
+    ─────────────────────────────────────────────
+    模式来自全局 CACHE_TTL_MODE：
+      "1h"   → {"type":"ephemeral","ttl":"1h"}   （原作者默认，打底）
+      "5m"   → {"type":"ephemeral","ttl":"5m"}   （密集聊模式）
+      "none" → None                              （不加 cache_control；PR-2 才启用）
+
+    ★ 兜底原则 ★
+    任何异常路径都返回原作者默认的 1h 字典，不改变任何原有行为。
+    这确保：即使 DB 挂了、值被污染、变量丢失，也不会破坏现有缓存机制。
+    """
+    try:
+        mode = CACHE_TTL_MODE if isinstance(CACHE_TTL_MODE, str) else "1h"
+        mode = mode.strip().lower()
+        if mode == "5m":
+            return {"type": "ephemeral", "ttl": "5m"}
+        if mode == "none":
+            return None  # PR-2 生效；PR-1 阶段面板不给此选项
+        # 其他一切情况（"1h" / 拼写错误 / 空值 / 异常）→ 原作者默认
+        return {"type": "ephemeral", "ttl": "1h"}
+    except Exception:
+        return {"type": "ephemeral", "ttl": "1h"}
+
+
 def _apply_breakpoint(msg: dict) -> bool:
     """
     给消息打上 cache_control breakpoint。
     支持 content 为 str 或 list（多模态block数组）两种格式。
     返回 True 表示成功打上，False 表示无法打（比如content为空）。
     """
+    cc = _cache_ctl()  # None 表示不缓存模式
     content = msg.get('content')
-    
+
     # content 是纯字符串
     if isinstance(content, str) and content.strip():
-        msg['content'] = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+        if cc is None:
+            # 不缓存模式：不动 content，也报告"处理完毕"避免调用方继续往前找
+            return True
+        msg['content'] = [{"type": "text", "text": content, "cache_control": cc}]
         return True
-    
+
     # content 是 block 数组（多模态消息）
     if isinstance(content, list):
         # 从后往前找最后一个 text block
         for i in range(len(content) - 1, -1, -1):
             block = content[i]
             if isinstance(block, dict) and block.get("type") == "text" and block.get("text", "").strip():
-                block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+                if cc is not None:
+                    block["cache_control"] = cc
                 return True
     
     return False
@@ -2451,11 +2493,15 @@ async def build_partitioned_messages(
         base_prompt = (base_prompt or "") + _mbg
     result = []
     if base_prompt:
+        _sys_block = {"type": "text", "text": base_prompt}
+        _cc = _cache_ctl()
+        if _cc is not None:
+            _sys_block["cache_control"] = _cc
         result.append({
             "role": "system",
-            "content": [{"type": "text", "text": base_prompt, "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+            "content": [_sys_block]
         })
-    
+
     # 摘要区（前言 +〔早期小结〕+ 最近段；尾部单个 cache_control，BP 结构不变）
     early_summary = state.get('early_summary') or ''
     if summary_parts or early_summary:
@@ -2464,7 +2510,9 @@ async def build_partitioned_messages(
             blocks.append({"type": "text", "text": "〔更早的小结〕\n" + early_summary})
         for part in summary_parts:
             blocks.append({"type": "text", "text": part})
-        blocks[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}  # BP 永远打在摘要区最后一块
+        _cc = _cache_ctl()
+        if _cc is not None:
+            blocks[-1]["cache_control"] = _cc  # BP 永远打在摘要区最后一块
         result.append({"role": "user", "content": blocks})
         result.append({"role": "assistant", "content": "好的，我已了解之前的对话内容。"})
     
@@ -2557,9 +2605,13 @@ async def _build_basic_cached(
         base_prompt = (base_prompt or "") + _mbg
     result = []
     if base_prompt:
+        _sys_block = {"type": "text", "text": base_prompt}
+        _cc = _cache_ctl()
+        if _cc is not None:
+            _sys_block["cache_control"] = _cc
         result.append({
             "role": "system",
-            "content": [{"type": "text", "text": base_prompt, "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+            "content": [_sys_block]
         })
     
     h_cleaned = [{k: v for k, v in msg.items() if k not in ('created_at',)} for msg in history]
@@ -7206,6 +7258,8 @@ async def get_settings():
             "CACHE_PARTITION_TRIGGER": db.get("CACHE_PARTITION_TRIGGER") or CACHE_PARTITION_TRIGGER,
             "CACHE_PARTITION_WINDOW":  int(db.get("CACHE_PARTITION_WINDOW") or CACHE_PARTITION_WINDOW),
             "CACHE_SUMMARY_MODEL":     db.get("CACHE_SUMMARY_MODEL") or str(CACHE_SUMMARY_MODEL),
+            # 缓存 TTL 模式（"1h" 打底 / "5m" 密集聊；PR-2 会加 "none"）
+            "CACHE_TTL_MODE":          db.get("CACHE_TTL_MODE") or CACHE_TTL_MODE,
 
             # 向量搜索（开源版用 EMBEDDING_API_KEY + EMBEDDING_BASE_URL）
             "MEMORY_VECTOR_ENABLED":   _parse_bool(db.get("MEMORY_VECTOR_ENABLED"), _db_module.MEMORY_VECTOR_ENABLED),
@@ -7261,6 +7315,8 @@ async def save_settings(request: Request):
             "CACHE_PARTITION_TRIGGER": str,
             "CACHE_PARTITION_WINDOW": int,
             "CACHE_SUMMARY_MODEL":   str,
+            # 缓存 TTL 模式："1h" / "5m"（PR-1）；PR-2 加 "none"。非法值兜底 "1h"，绝不破坏原作者机制
+            "CACHE_TTL_MODE":        lambda v: (str(v).strip().lower() if str(v).strip().lower() in ("1h", "5m") else "1h"),
             "FORCE_STREAM":          lambda v: _parse_bool(v),
             "REASONING_EFFORT":      str,
             # 记忆控制台 B 类(原 env-only → 存库+热更+恢复)
