@@ -6907,6 +6907,59 @@ async def api_photos_cleanup(request: Request):
             "note": "磁盘空间在后台回收中(约1分钟)"}
 
 
+@app.post("/api/debug/scratchpad")
+async def api_debug_scratchpad(request: Request):
+    """只读诊断「递纸条」(deepseek)链路:给一条 user 消息,直接跑 _scratchpad_topics,
+    返回 key 配没配、生成的主题列表、以及每个主题召回几条。deepseek 挂了在这里一眼看穿。"""
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    q = (b.get("message") or "").strip()
+    if not q:
+        return {"error": "需要 message"}
+    out = {"key_set": bool(SCRATCHPAD_API_KEY), "base_url": SCRATCHPAD_BASE_URL,
+           "model": SCRATCHPAD_MODEL, "timeout_s": SCRATCHPAD_TIMEOUT, "enabled": SCRATCHPAD_ENABLED}
+    if not SCRATCHPAD_API_KEY:
+        out["verdict"] = "SCRATCHPAD_API_KEY 没配置,递纸条从没生效过(会静默降级原召回)"
+        return out
+    import time as _t
+    _t0 = _t.time()
+    topics = await _scratchpad_topics(q)
+    out["elapsed_s"] = round(_t.time() - _t0, 2)
+    out["topics"] = topics
+    if topics:
+        hits = {}
+        for t in topics[:4]:
+            try:
+                ms = await search_memories(t, limit=3)
+                hits[t] = [f"#{m.get('id')} {str(m.get('content'))[:40]}" for m in ms]
+            except Exception as e:
+                hits[t] = [f"召回出错: {e}"]
+        out["recall_by_topic"] = hits
+        out["verdict"] = "递纸条工作正常"
+    else:
+        out["verdict"] = ("没产出主题——要么 deepseek 调用失败/超时(看 elapsed 是否≈timeout),"
+                          "要么它判断这条消息不需要扩展。换条更长的消息再试可区分。")
+    return out
+
+
+@app.get("/api/debug/find-convo")
+async def api_debug_find_convo(q: str, limit: int = 20):
+    """只读:全文搜历史对话(所有线,含已归档线)。查'某件事当初到底聊没聊过、在哪条线、什么时候'。"""
+    if not (q or "").strip():
+        return {"error": "需要 ?q=关键词"}
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, session_id, role, left(content, 120) AS snippet, created_at "
+            "FROM conversations WHERE content LIKE '%' || $1 || '%' "
+            "ORDER BY id DESC LIMIT $2", q.strip(), max(1, min(int(limit), 100)))
+    return {"query": q, "count": len(rows),
+            "rows": [{"id": r["id"], "session": r["session_id"], "role": r["role"],
+                      "at": str(r["created_at"]), "snippet": r["snippet"]} for r in rows]}
+
+
 @app.post("/api/debug/memory-gate")
 async def api_debug_memory_gate(request: Request):
     """只读演示 ②/① 露骨语境闸：给一条 user 消息，返回检索原始命中(arousal/score) +
