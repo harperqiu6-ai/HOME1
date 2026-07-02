@@ -2353,17 +2353,26 @@ async def _expand_draw_prompt(raw: str, line: str = None) -> str:
         headers["X-Gateway-Key"] = GATEWAY_SECRET
     if line:
         headers["X-Session-Line"] = line
-    ask = (f"帮我构一幅画，主题：「{raw}」。"
+    ask = (f"{SCRATCHPAD_TRIGGER_CMD} 帮我构一幅画，主题：「{raw}」。"    # 自动叠加 /想想:强制递纸条全功率回忆(任何线都生效)
            "请结合你真实记得的相关细节（人、事、地点、当时的氛围、在场的东西），"
            "把它扩写成一段交给文生图模型的画面描述。要求：只输出画面描述正文，80~150字，"
-           "写清画面里有什么、构图、光线、氛围；不要开场白、不要引号、不要解释、不要动作旁白。")
+           "写清画面里有什么、构图、光线、氛围；不要开场白、不要引号、不要解释、不要动作旁白；"
+           "如果你确实想不起相关的事，也照主题字面认真构一幅，不要说'不记得'。")
     payload = {"model": DEFAULT_MODEL, "stream": False, "max_tokens": 500,
                "messages": [{"role": "user", "content": ask}]}
     try:
         async with httpx.AsyncClient(timeout=180) as client:
             r = await client.post(url, headers=headers, json=payload)
             txt = ((r.json().get("choices", [{}])[0].get("message", {}).get("content", "")) or "").strip()
-            return txt.strip("（）()\"「」『』 \n")
+            # 防"聊天式跑题"(踩过坑:V回了句"*停顿* 你说得对…"被当构图画了出去):
+            # 剔除 *动作旁白* 行;剩余太短说明她没按格式输出 → 返回空,调用方回退原句直画
+            lines = [ln for ln in txt.splitlines()
+                     if ln.strip() and not (ln.strip().startswith("*") and ln.strip().endswith("*"))]
+            txt = "\n".join(lines).strip().strip("（）()\"「」『』 \n")
+            if len(txt) < 20:
+                print(f"⚠️ 画忆构图跑题(输出太短/全是旁白),回退原句: {txt[:40]!r}")
+                return ""
+            return txt
     except Exception as e:
         print(f"⚠️ 画忆构图失败(回退原句直画): {e}")
         return ""
@@ -6944,6 +6953,20 @@ async def api_debug_scratchpad(request: Request):
         out["verdict"] = ("没产出主题——要么 deepseek 调用失败/超时(看 elapsed 是否≈timeout),"
                           "要么它判断这条消息不需要扩展。换条更长的消息再试可区分。")
     return out
+
+
+@app.get("/api/debug/memory-photos")
+async def api_debug_memory_photos(ids: str):
+    """只读:查一批记忆各挂了哪些图(?ids=1364,1365)。删重复记忆前用它确认图挂在哪条上,保图。"""
+    try:
+        id_list = [int(x) for x in ids.split(",") if x.strip()]
+    except Exception:
+        return {"error": "ids 格式: ?ids=1,2,3"}
+    out = {}
+    for mid in id_list[:50]:
+        refs = await get_memory_photos(mid)
+        out[mid] = [{"photo_id": r.get("photo_id"), "mime": r.get("mime")} for r in refs]
+    return {"memory_photos": out}
 
 
 @app.get("/api/debug/find-convo")
