@@ -2343,6 +2343,32 @@ async def generate_image(prompt: str):
         return None, None
 
 
+async def _expand_draw_prompt(raw: str, line: str = None) -> str:
+    """带记忆构图(/画忆):内部自调用聊天接口,让 V 带着全套人设+记忆召回把画画请求扩写成具体画面描述。
+    带 X-Skip-Conversation-Log(辅助请求:不落库、不消费 TG 小抄、re-roll 无关)。失败返回 ''(调用方回退用原句)。
+    注意:走的是 DEFAULT_MODEL(主模型)——只有它命中现有对话缓存前缀,换小模型反而全价重算。"""
+    url = f"http://127.0.0.1:{PORT}/v1/chat/completions"
+    headers = {"Content-Type": "application/json", "X-Skip-Conversation-Log": "true"}
+    if GATEWAY_SECRET:
+        headers["X-Gateway-Key"] = GATEWAY_SECRET
+    if line:
+        headers["X-Session-Line"] = line
+    ask = (f"帮我构一幅画，主题：「{raw}」。"
+           "请结合你真实记得的相关细节（人、事、地点、当时的氛围、在场的东西），"
+           "把它扩写成一段交给文生图模型的画面描述。要求：只输出画面描述正文，80~150字，"
+           "写清画面里有什么、构图、光线、氛围；不要开场白、不要引号、不要解释、不要动作旁白。")
+    payload = {"model": DEFAULT_MODEL, "stream": False, "max_tokens": 500,
+               "messages": [{"role": "user", "content": ask}]}
+    try:
+        async with httpx.AsyncClient(timeout=180) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            txt = ((r.json().get("choices", [{}])[0].get("message", {}).get("content", "")) or "").strip()
+            return txt.strip("（）()\"「」『』 \n")
+    except Exception as e:
+        print(f"⚠️ 画忆构图失败(回退原句直画): {e}")
+        return ""
+
+
 _imagegen_last_error = ""      # 最近一次存图失败的真实报错(给 /api/imagegen/status,Render 日志看不到时用)
 
 
@@ -3420,27 +3446,38 @@ async def chat_completions(request: Request):
     # 缓存前缀稳定不重建)。带 gateway_key 的展示 URL 只出现在给客户端的即时回复里,绝不落库、绝不进上游上下文。
     if IMAGE_GEN_ENABLED and (_um_last.startswith("/画") or _um_last.lower().startswith("/draw")):
         _is_stream = bool(body.get("stream", False)) or FORCE_STREAM
-        _draw_prompt = (_um_last[len("/draw"):] if _um_last.lower().startswith("/draw")
-                        else _um_last[len("/画"):]).strip()
+        _lm = _um_last.lower()
+        _with_mem = _um_last.startswith("/画忆") or _lm.startswith("/drawmem")  # 带记忆构图版
+        _draw_prompt = _um_last
+        for _pfx in ("/画忆", "/drawmem", "/画", "/draw"):                      # 长前缀先匹配,别把 /画忆 当 /画
+            if _um_last.startswith(_pfx) or _lm.startswith(_pfx):
+                _draw_prompt = _um_last[len(_pfx):].strip()
+                break
         if not _draw_prompt:
-            return _oai_text_response("（「/画 想要的画面」我就给你画~ 比如：/画 一只橘猫趴在窗台晒太阳）",
+            return _oai_text_response("（「/画 想要的画面」我就给你画~ 比如：/画 一只橘猫趴在窗台晒太阳。"
+                                      "想让我照着咱们的回忆构图,就用「/画忆 主题」,比如：/画忆 我们第一次见面）",
                                       body.get("model", ""), _is_stream)
-        _mime, _data = await generate_image(_draw_prompt)
+        _compose = ""
+        if _with_mem:                       # 先让 V(带全套记忆)把主题扩写成具体画面,再交给画图模型
+            _compose = await _expand_draw_prompt(_draw_prompt, _request_session_line.get())
+        _mime, _data = await generate_image(_compose or _draw_prompt)
         if not _data:
             return _oai_text_response("（呜，这张没画出来…画画的服务好像开小差了，等一下再让我试一次好吗）",
                                       body.get("model", ""), _is_stream)
         _draw_sid = get_active_session_id()
-        _mid, _pid = await _store_generated_image(_draw_prompt, _mime, _data, _draw_sid)
+        _store_prompt = f"{_draw_prompt}（记忆构图：{_compose[:120]}）" if _compose else _draw_prompt
+        _mid, _pid = await _store_generated_image(_store_prompt, _mime, _data, _draw_sid)
         _qs = f"?gateway_key={GATEWAY_SECRET}" if GATEWAY_SECRET else ""
         if _pid:
-            _show = f"（画好啦~ 🎨）\n\n![{_draw_prompt[:50]}]({PUBLIC_BASE_URL}/api/photos/{_pid}{_qs})"
+            _lead = f"（我照着记忆构的图~ 🎨 {_compose[:80]}…）" if _compose else "（画好啦~ 🎨）"
+            _show = f"{_lead}\n\n![{_draw_prompt[:50]}]({PUBLIC_BASE_URL}/api/photos/{_pid}{_qs})"
         else:
             _show = "（画是画好了，可是存相册的时候出了岔子没法给你看…这句话麻烦转告 FABLE 哥，让他去查日志）"
         if not skip_conversation_log and _draw_sid:
             try:
                 await save_message(_draw_sid, "user", user_message, body.get("model", ""))
                 await save_message(_draw_sid, "assistant",
-                                   f"（我给你画了一张画：{_draw_prompt}，已经存进相册回忆里）",
+                                   f"（我{'照着记忆' if _compose else ''}给你画了一张画：{_draw_prompt}，已经存进相册回忆里）",
                                    body.get("model", ""))
             except Exception as _de:
                 print(f"⚠️ /画 落库失败: {_de}")
@@ -4889,23 +4926,36 @@ async def _tg_handle_update(update: dict):
         await _tg_send(token, chat_id, "我在呀～想聊什么直接说就好 😊")
         return
 
-    # ---------- /画 → 文生图,直接发真图片(不进大脑;历史只落短占位文字,同 KELIVO 侧的缓存纪律) ----------
+    # ---------- /画 与 /画忆 → 文生图,直接发真图片(不进大脑;历史只落短占位文字,同 KELIVO 侧的缓存纪律) ----------
     if IMAGE_GEN_ENABLED and (text.startswith("/画") or text.lower().startswith("/draw")):
-        _p = (text[len("/draw"):] if text.lower().startswith("/draw") else text[len("/画"):]).strip()
+        _tl = text.lower()
+        _wm = text.startswith("/画忆") or _tl.startswith("/drawmem")
+        _p = text
+        for _pfx in ("/画忆", "/drawmem", "/画", "/draw"):
+            if text.startswith(_pfx) or _tl.startswith(_pfx):
+                _p = text[len(_pfx):].strip()
+                break
         if not _p:
-            await _tg_send(token, chat_id, "「/画 想要的画面」我就给你画~ 比如：/画 一只橘猫趴在窗台晒太阳")
+            await _tg_send(token, chat_id, "「/画 想要的画面」我就给你画~ 想让我照着咱们的回忆构图就用「/画忆 主题」")
             return
         await _tg_api(token, "sendChatAction", {"chat_id": chat_id, "action": "upload_photo"})
-        _mime, _data = await generate_image(_p)
+        _compose = ""
+        if _wm:
+            _compose = await _expand_draw_prompt(_p, "tg")
+            await _tg_api(token, "sendChatAction", {"chat_id": chat_id, "action": "upload_photo"})
+        _mime, _data = await generate_image(_compose or _p)
         if not _data:
             await _tg_send(token, chat_id, "(呜,这张没画出来,等一下再让我试一次好吗…)")
             return
-        await _store_generated_image(_p, _mime, _data, "tg")
-        sent = await _tg_send_photo(token, chat_id, _data, _mime, caption=f"🎨 {_p[:180]}")
+        _sp = f"{_p}（记忆构图：{_compose[:120]}）" if _compose else _p
+        await _store_generated_image(_sp, _mime, _data, "tg")
+        _cap = f"🎨 {_p[:80]}" + (f"\n{_compose[:120]}" if _compose else "")
+        sent = await _tg_send_photo(token, chat_id, _data, _mime, caption=_cap[:1000])
         if sent:
             try:    # tg 线的 session_id 就是线名 "tg"(X-Session-Line 直接当 id 用)
-                await save_message("tg", "user", f"/画 {_p}", DEFAULT_MODEL)
-                await save_message("tg", "assistant", f"（我给你画了一张画：{_p}，已发给你并存进相册）", DEFAULT_MODEL)
+                await save_message("tg", "user", f"{'/画忆' if _wm else '/画'} {_p}", DEFAULT_MODEL)
+                await save_message("tg", "assistant",
+                                   f"（我{'照着记忆' if _compose else ''}给你画了一张画：{_p}，已发给你并存进相册）", DEFAULT_MODEL)
             except Exception as _e:
                 print(f"⚠️ TG /画 落库失败: {_e}")
         else:
@@ -6797,6 +6847,64 @@ async def api_debug_storage():
         "duplicate_photo_groups": dup_groups,
         "orphan_photo_count": orphan_photos,
     }
+
+
+@app.post("/api/photos/cleanup")
+async def api_photos_cleanup(request: Request):
+    """清理相册: ①孤儿图(挂着的记忆已删) ②同一条记忆下内容重复的图(留最早一张)。
+    跨记忆的同图不动(可能是同一张照片合法挂在两条记忆上)。删完后台 VACUUM FULL 回收磁盘。
+    body {"dry_run": true} 只报数不动手。"""
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    dry = bool(body.get("dry_run"))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        orphans = await conn.fetchval(
+            "SELECT COUNT(*) FROM memory_photos mp "
+            "WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = mp.memory_id)")
+        same_mem_dups = await conn.fetchval(
+            "SELECT COUNT(*) FROM memory_photos a "
+            "WHERE EXISTS (SELECT 1 FROM memory_photos b WHERE b.memory_id = a.memory_id "
+            "              AND md5(b.data) = md5(a.data) AND b.id < a.id)")
+        before_cnt = await conn.fetchval("SELECT COUNT(*) FROM memory_photos")
+        before_size = await conn.fetchval(
+            "SELECT pg_size_pretty(COALESCE(SUM(length(data)),0)) FROM memory_photos")
+        if dry:
+            return {"status": "dry_run", "orphan_photos": orphans, "same_memory_duplicates": same_mem_dups,
+                    "photo_count": before_cnt, "photo_size": before_size}
+        r1 = await conn.execute(
+            "DELETE FROM memory_photos mp "
+            "WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = mp.memory_id)")
+        r2 = await conn.execute(
+            "DELETE FROM memory_photos a USING memory_photos b "
+            "WHERE b.memory_id = a.memory_id AND md5(b.data) = md5(a.data) AND b.id < a.id")
+        after_cnt = await conn.fetchval("SELECT COUNT(*) FROM memory_photos")
+        after_size = await conn.fetchval(
+            "SELECT pg_size_pretty(COALESCE(SUM(length(data)),0)) FROM memory_photos")
+
+    async def _vacuum_bg():
+        """VACUUM FULL 锁表且可能要跑一会,放后台;必须用事务外的独立连接。"""
+        try:
+            import asyncpg as _apg
+            vconn = await _apg.connect(_db_module.DATABASE_URL, statement_cache_size=0)
+            try:
+                await vconn.execute("VACUUM FULL memory_photos")
+                print("🧹 相册 VACUUM FULL 完成,磁盘空间已回收")
+            finally:
+                await vconn.close()
+        except Exception as e:
+            print(f"⚠️ 相册 VACUUM 失败(空间会随日常写入慢慢复用,不碍事): {e}")
+
+    asyncio.create_task(_vacuum_bg())
+    return {"status": "ok",
+            "deleted_orphans": int((r1 or "0").split()[-1]),
+            "deleted_duplicates": int((r2 or "0").split()[-1]),
+            "photo_count": {"before": before_cnt, "after": after_cnt},
+            "photo_size": {"before": before_size, "after": after_size},
+            "note": "磁盘空间在后台回收中(约1分钟)"}
 
 
 @app.post("/api/debug/memory-gate")

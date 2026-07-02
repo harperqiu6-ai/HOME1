@@ -264,6 +264,7 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border:none;border-ra
         <div class="maint-row"><div><div class="mlabel">撤销单条拆分 <span class="hint">只退某一条</span></div><div class="mhint" id="split-one-msg">在记忆页(勾"显示归档")找到那条原记忆的 #ID 填这里，复活它、收起它拆出来的小条</div></div><div class="mctl"><input id="split-one-id" type="number" placeholder="原记忆ID" style="width:110px"><button class="btn sm" id="split-one-go">撤销这条</button></div></div>
         <div class="maint-row"><div><div class="mlabel">记忆巩固 consolidate<span class="badge off-eng">旧引擎 · 禁用</span></div><div class="mhint">早期合并引擎,已被分层/做梦取代,留档不跑</div></div><div class="mctl"><button class="btn sm" disabled>已禁用</button></div></div>
         <div class="maint-row"><div><div class="mlabel">数据库用量自查</div><div class="mhint" id="storage-msg">查各表大小 + memory_photos 有没有重复/孤儿图片堆积(只读,不改数据)</div></div><div class="mctl"><button class="btn sm" id="storage-check">检查</button></div></div>
+        <div class="maint-row"><div><div class="mlabel">清理相册</div><div class="mhint" id="pc-msg">删孤儿图(记忆已删的)和同条记忆下的重复图,然后回收磁盘空间。先预览再清理。</div></div><div class="mctl"><button class="btn sm" id="pc-preview">预览</button><button class="btn sm warn" id="pc-run">清理</button></div></div>
       </div>
     </div>
 
@@ -441,6 +442,25 @@ function bind(){
   document.getElementById('fold-drift').addEventListener('click',function(){ this.classList.toggle('open'); document.getElementById('foldb-drift').classList.toggle('open'); });
   document.getElementById('fold-maint').addEventListener('click',function(){ this.classList.toggle('open'); document.getElementById('foldb-maint').classList.toggle('open'); });
   document.getElementById('storage-check').addEventListener('click', storageCheck);
+  document.getElementById('pc-preview').addEventListener('click', ()=>photoCleanup(true));
+  document.getElementById('pc-run').addEventListener('click', ()=>photoCleanup(false));
+}
+
+async function photoCleanup(dry){
+  const el = document.getElementById('pc-msg');
+  if(!dry && !confirm('确定清理相册？孤儿图和同条记忆下的重复图会被删除（正常挂着的图不动）。')) return;
+  el.textContent = dry ? '统计中…' : '清理中…';
+  try{
+    const j = await api('/api/photos/cleanup', {method:'POST', body:{dry_run: !!dry}});
+    if(dry){
+      el.textContent = `现有 ${j.photo_count} 张图共 ${j.photo_size} ｜ 可清理: 孤儿 ${j.orphan_photos} 张 · 同记忆重复 ${j.same_memory_duplicates} 张` +
+        ((j.orphan_photos||0)+(j.same_memory_duplicates||0)===0 ? ' ｜ ✅ 很干净,不用清' : '');
+    }else{
+      el.textContent = `✅ 已删 孤儿 ${j.deleted_orphans} 张 · 重复 ${j.deleted_duplicates} 张 ｜ ` +
+        `${j.photo_count.before}张(${j.photo_size.before}) → ${j.photo_count.after}张(${j.photo_size.after}) ｜ 磁盘空间后台回收中`;
+      toast('清理完成');
+    }
+  }catch(e){ el.textContent = '失败:'+e.message; }
 }
 
 async function storageCheck(){
