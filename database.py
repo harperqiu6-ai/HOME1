@@ -326,9 +326,15 @@ async def init_tables():
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_memory_photos_memory ON memory_photos (memory_id);
         """)
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_memory_photos_md5 ON memory_photos (md5(data));
-        """)
+        # md5 表达式索引:查重(WHERE md5(data)=md5($1))走索引秒查,不再每次全库硬算指纹
+        # (图片多了之后硬算会超时,曾把生成图/看图记忆的存图整个拖垮)。建索引要扫全表,
+        # 万一在弱机上超时也绝不能拖死启动——失败只打日志(查重侧已有"失败当新图"兜底)。
+        try:
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_memory_photos_md5 ON memory_photos (md5(data));
+            """)
+        except Exception as e:
+            print(f"⚠️ md5 索引创建失败(不影响启动,查重走兜底): {e}")
 
         # 人设建议（A4）：提取识别出的"行为/相处偏好"不进记忆池，收集到这里供主理人贴 persona
         await conn.execute("""
@@ -870,13 +876,18 @@ async def undo_split_one(original_id: int) -> int:
 
 
 async def photo_hash_exists(data: bytes) -> bool:
-    """检查这张图片(按内容)是否已经存在 memory_photos 里，用于看图记忆去重(避免同一张图反复触发记忆+描述调用)。"""
+    """检查这张图片(按内容)是否已经存在 memory_photos 里，用于看图记忆去重(避免同一张图反复触发记忆+描述调用)。
+    查重失败(超时等)按"不存在"处理——宁可重复存,不能因为查重挂了把整条看图记忆丢掉。"""
     if not data:
         return False
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchval("SELECT 1 FROM memory_photos WHERE md5(data) = md5($1) LIMIT 1", data)
-        return bool(row)
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchval("SELECT 1 FROM memory_photos WHERE md5(data) = md5($1) LIMIT 1", data)
+            return bool(row)
+    except Exception as e:
+        print(f"⚠️ 图片查重失败(按新图处理): {e}")
+        return False
 
 
 async def find_photo_id_by_hash(data: bytes):
@@ -904,11 +915,15 @@ async def save_image_memory(content: str, source_session: str = "", photos=None,
         for (mime, data) in (photos or []):
             if not data:
                 continue
+            dup = False
+            try:                            # 查重失败不拦路:当没重,照插(曾因全库算md5超时把存图整个拖垮)
+                dup = bool(await conn.fetchval(
+                    "SELECT 1 FROM memory_photos WHERE md5(data) = md5($1) LIMIT 1", data))
+            except Exception as e:
+                print(f"⚠️ 看图记忆 #{mid} 查重失败(按新图处理): {e}")
+            if dup:
+                continue  # 同一张图已经存过，跳过重复存储
             try:
-                dup = await conn.fetchval(
-                    "SELECT 1 FROM memory_photos WHERE md5(data) = md5($1) LIMIT 1", data)
-                if dup:
-                    continue  # 同一张图已经存过，跳过重复存储
                 await conn.execute(
                     "INSERT INTO memory_photos (memory_id, original_name, mime, data) VALUES ($1, $2, $3, $4)",
                     mid, "chat_image", (mime or 'image/png'), data)
