@@ -5535,9 +5535,9 @@ CONSOLIDATION_PROMPT = """
 你是记忆整理助手。请将以下对话碎片整理成完整的事件记录。
 
 要求：
-1. 按主题/事件分组，相关的碎片合并到一起
-2. 每个事件一条记录，不要太细碎也不要太笼统
-3. 每条记录包含：标题（10字内）+ 完整描述
+1. 按主题/事件分组，相关的碎片合并到一起。**必须大胆合并**：同一场互动、同一次聊天、同一个话题在几小时内的所有碎片，属于同一个事件，必须合成一条——哪怕单条碎片已经写得很完整。碎片开头的时间就是用来判断'是不是连着发生的'的依据。
+2. 整理的目的是把同期发生的事焊在一起，方便日后一起被想起。所以事件数量必须明显少于碎片数量（一般一天最多 2~4 个事件）。'由1条碎片单独成一个事件'只允许出现在该碎片与当天其他所有内容都毫无关系时。
+3. 每条记录包含：标题（10字内）+ 完整描述。描述按发生顺序把该事件所有碎片的内容都写进去，可以长，不许丢事实。
 4. 合并重复内容，保留重要细节
 5. 保留原文中的主观感受、情绪表达和个人化用语，不要改写为客观陈述或第三方总结
 6. content字段中不要使用双引号，用单引号或书名号代替
@@ -5584,8 +5584,15 @@ async def consolidate_memories_for_date_range(start_date, end_date):
         return {"status": "no_fragments", "start_date": str(start_date), "end_date": str(end_date)}
     
     # 构建碎片文本
+    def _frag_ts(ts):
+        if hasattr(ts, "strftime"):
+            if getattr(ts, "tzinfo", None) is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return ts.astimezone(timezone(timedelta(hours=TIMEZONE_HOURS))).strftime("%m-%d %H:%M")
+        return str(ts)[:16]
+
     fragments_text = "\n".join([
-        f"[ID={f['id']}] ({f['created_at'].strftime('%m-%d') if hasattr(f['created_at'], 'strftime') else str(f['created_at'])[:10]}) {f['content']}"
+        f"[ID={f['id']}] ({_frag_ts(f['created_at'])}) {f['content']}"
         for f in fragments
     ])
     
@@ -5609,7 +5616,7 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                     json={
                         "model": consolidation_model,
                         "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": 2000
+                        "max_tokens": 6000
                     }
                 )
 
