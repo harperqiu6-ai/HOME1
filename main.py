@@ -2353,24 +2353,40 @@ async def _expand_draw_prompt(raw: str, line: str = None) -> str:
         headers["X-Gateway-Key"] = GATEWAY_SECRET
     if line:
         headers["X-Session-Line"] = line
-    ask = (f"{SCRATCHPAD_TRIGGER_CMD} 帮我构一幅画，主题：「{raw}」。"    # 自动叠加 /想想:强制递纸条全功率回忆(任何线都生效)
-           "请结合你真实记得的相关细节（人、事、地点、当时的氛围、在场的东西），"
-           "把它扩写成一段交给文生图模型的画面描述。要求：只输出画面描述正文，80~150字，"
+    # 手递记忆:先拿"原始主题"(不掺指令包装,查询不被稀释)单独跑递纸条+召回,把命中原文直接塞进构图请求。
+    # 教训:靠管线自己召回时,检索查询=整段包装指令,"猫塑"这种关键词被稀释,真记忆浮不上来。
+    mem_block = ""
+    try:
+        mems = []
+        if SCRATCHPAD_ENABLED and SCRATCHPAD_API_KEY:
+            mems = await _expand_recall_with_scratchpad(raw, 8)
+        if not mems:
+            mems = await search_memories(raw, limit=8)
+        if mems:
+            _ml = "\n".join(f"- {(m.get('content') or '')[:220]}" for m in mems[:8])
+            mem_block = f"〔为这幅画翻出的相关记忆，可能有用也可能无关，自行取用〕\n{_ml}\n\n"
+            print(f"🎨 画忆手递记忆 {len(mems[:8])} 条")
+    except Exception as e:
+        print(f"⚠️ 画忆记忆手递失败(继续裸构): {e}")
+    ask = (f"{mem_block}帮我构一幅画，主题：「{raw}」。"
+           "请结合上面记忆里真实的细节（人、事、地点、当时的氛围、在场的东西），"
+           "把主题扩写成一段交给文生图模型的画面描述。要求：只输出画面描述正文，80~150字，"
            "写清画面里有什么、构图、光线、氛围；不要开场白、不要引号、不要解释、不要动作旁白；"
-           "如果你确实想不起相关的事，也照主题字面认真构一幅，不要说'不记得'。")
+           "即使记忆对不上号，也照主题字面认真构一幅，绝不要输出'不记得/想不起'之类的话。")
     payload = {"model": DEFAULT_MODEL, "stream": False, "max_tokens": 500,
                "messages": [{"role": "user", "content": ask}]}
     try:
         async with httpx.AsyncClient(timeout=180) as client:
             r = await client.post(url, headers=headers, json=payload)
             txt = ((r.json().get("choices", [{}])[0].get("message", {}).get("content", "")) or "").strip()
-            # 防"聊天式跑题"(踩过坑:V回了句"*停顿* 你说得对…"被当构图画了出去):
-            # 剔除 *动作旁白* 行;剩余太短说明她没按格式输出 → 返回空,调用方回退原句直画
+            # 防"聊天式跑题"(踩过坑:V回"*停顿* 你说得对…"/"我真的不记得…"被当构图画了出去):
+            # 剔除 *动作旁白* 行;剩余太短、或明显在聊天而不是描述画面 → 返回空,调用方回退原句直画
             lines = [ln for ln in txt.splitlines()
                      if ln.strip() and not (ln.strip().startswith("*") and ln.strip().endswith("*"))]
             txt = "\n".join(lines).strip().strip("（）()\"「」『』 \n")
-            if len(txt) < 20:
-                print(f"⚠️ 画忆构图跑题(输出太短/全是旁白),回退原句: {txt[:40]!r}")
+            _offtopic = ("不记得", "想不起", "记忆库", "没捞到", "记忆里没有", "你问了", "我不知道")
+            if len(txt) < 20 or any(w in txt for w in _offtopic):
+                print(f"⚠️ 画忆构图跑题(太短/在聊天),回退原句: {txt[:60]!r}")
                 return ""
             return txt
     except Exception as e:
