@@ -2343,10 +2343,14 @@ async def generate_image(prompt: str):
         return None, None
 
 
+_imagegen_last_error = ""      # 最近一次存图失败的真实报错(给 /api/imagegen/status,Render 日志看不到时用)
+
+
 async def _store_generated_image(prompt: str, mime: str, data: bytes, session_id: str):
     """生成图落库:二进制进 memory_photos(长期,/api/photos/id 可取)+一条'画了什么'文字记忆(可检索→她之后记得)。
-    返回 (memory_id, photo_id)。save_image_memory 按 md5 去重可能跳过插入——那就按内容翻出已有那张的 id 照常展示;
-    只有真的没存上(插入失败且库里也找不到)才返回 photo_id=None。"""
+    返回 (memory_id, photo_id)。三段式兜底:①save_image_memory 正常挂图 ②没挂上先按 md5 找已有同图(去重情形)
+    ③还没有就绕过去重逻辑用 save_photo 裸插一张。全失败才 photo_id=None,并把报错记进 _imagegen_last_error。"""
+    global _imagegen_last_error
     content = f"{AI_NAME or 'AI'}给{USER_NAME}画了一张画，内容是：{prompt}"
     mid = await save_image_memory(content, source_session=session_id, photos=[(mime, data)],
                                   importance=5, arousal=0.4)
@@ -2356,14 +2360,27 @@ async def _store_generated_image(prompt: str, mime: str, data: bytes, session_id
         if refs:
             pid = refs[0].get("photo_id")
             print(f"🎨 生成图已存: memory #{mid}, photo #{pid}, {len(data)} bytes")
-        else:                               # 没挂上新图:多半是撞了 md5 去重,翻出已有那张照常给她看
+    except Exception as e:
+        _imagegen_last_error = f"查关联图失败 {type(e).__name__}: {e}"
+        print(f"⚠️ 生成图取 photo_id 失败: {e}")
+    if not pid:                             # ② 撞 md5 去重?翻出已有那张照常给她看
+        try:
             pid = await find_photo_id_by_hash(data)
             if pid:
                 print(f"🎨 生成图撞去重: memory #{mid} 复用已有 photo #{pid}")
-            else:
-                print(f"⚠️ 生成图没存上也没找到同图: memory #{mid}, {len(data)} bytes, mime={mime}")
-    except Exception as e:
-        print(f"⚠️ 生成图取 photo_id 失败: {e}")
+        except Exception as e:
+            _imagegen_last_error = f"md5查重失败 {type(e).__name__}: {e}"
+            print(f"⚠️ 生成图 md5 查重失败: {e}")
+    if not pid:                             # ③ 最后一搏:绕开去重那套,裸插(这里的报错不吞,如实记录)
+        try:
+            pid = await save_photo(mid, "drawing", mime, data)
+            print(f"🎨 生成图裸插成功: memory #{mid}, photo #{pid}")
+            _imagegen_last_error = ""
+        except Exception as e:
+            _imagegen_last_error = f"裸插失败 {type(e).__name__}: {e}"
+            print(f"⚠️ 生成图裸插也失败: memory #{mid}, {len(data)} bytes, mime={mime}, err={e}")
+    if pid:
+        _imagegen_last_error = ""
     return mid, pid
 
 
@@ -6188,6 +6205,7 @@ async def api_imagegen_status():
         "own_base": bool(IMAGE_GEN_BASE_URL),        # 是否单独设了画图地址
         "own_key": own_key,                          # 是否单独设了画图 key
         "key_set": own_key or bool(getattr(_db_module, "EMBEDDING_API_KEY", "")),
+        "last_error": _imagegen_last_error,          # 最近一次存图失败的真实报错(成功后自动清空)
     }
 
 
