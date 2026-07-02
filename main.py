@@ -2407,6 +2407,12 @@ async def _store_generated_image(prompt: str, mime: str, data: bytes, session_id
     # (踩过坑:三条"画了三花猫"的测试记忆 imp=5 霸榜"猫"相关召回,把发腮协议/猫品种讨论挤出前十)
     mid = await save_image_memory(content, source_session=session_id, photos=[(mime, data)],
                                   importance=3, arousal=0.3)
+    # 台账立刻转归档态,彻底退出召回(更狠的坑:台账原文带着用户的画图关键词,每画一次就多一条
+    # "满分假记忆"霸占该关键词的召回前排——猫塑事件连环污染两轮都是它)。相册图/历史占位不受影响。
+    try:
+        await set_memory_active(mid, False)
+    except Exception as e:
+        print(f"⚠️ 画图台账转归档失败(会参与召回,记得手动归档 #{mid}): {e}")
     pid = None
     try:
         refs = await get_memory_photos(mid)
