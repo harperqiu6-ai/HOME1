@@ -2378,8 +2378,10 @@ async def _store_generated_image(prompt: str, mime: str, data: bytes, session_id
     ③还没有就绕过去重逻辑用 save_photo 裸插一张。全失败才 photo_id=None,并把报错记进 _imagegen_last_error。"""
     global _imagegen_last_error
     content = f"{AI_NAME or 'AI'}给{USER_NAME}画了一张画，内容是：{prompt}"
+    # importance 压低到 3:画图记录只是"画过什么"的台账,不能在语义召回里挤掉真实往事
+    # (踩过坑:三条"画了三花猫"的测试记忆 imp=5 霸榜"猫"相关召回,把发腮协议/猫品种讨论挤出前十)
     mid = await save_image_memory(content, source_session=session_id, photos=[(mime, data)],
-                                  importance=5, arousal=0.4)
+                                  importance=3, arousal=0.3)
     pid = None
     try:
         refs = await get_memory_photos(mid)
