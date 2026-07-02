@@ -2287,27 +2287,48 @@ async def _save_image_memory_bg(session_id: str, images: list):
 
 
 async def generate_image(prompt: str):
-    """文生图:调 images/generations(硅基流动兼容格式)生成一张图并立刻下载,返回 (mime, bytes)。失败返回 (None, None)。
-    生成方给的图片 URL 约1小时就过期,所以必须当场下载二进制存库,长期取图一律走 /api/photos/{id}。"""
+    """文生图:POST {base}/images/generations,兼容两类服务商、随便切——
+    ① 硅基流动:参数用 image_size/batch_size,返回 images[0].url
+    ② OpenAI 兼容中转站(gpt-image-2 / dall-e / seedream 等):参数用 size/n,返回 data[0].url 或 data[0].b64_json
+    请求先按 base url 猜风格,被 400/422 打回就换另一种再试一次(400=请求被拒,不烧钱)。
+    拿到图立刻下载/解码返回 (mime, bytes),失败 (None, None)。
+    (生成方给的图片 URL 往往1小时就过期,所以必须当场拿到二进制存库,长期取图一律走 /api/photos/{id}。)"""
     key = IMAGE_GEN_API_KEY or getattr(_db_module, "EMBEDDING_API_KEY", "") or ""
     base = (IMAGE_GEN_BASE_URL or getattr(_db_module, "EMBEDDING_BASE_URL", "") or "").rstrip("/")
     if not (key and base):
         print("⚠️ 文生图未配置(缺 IMAGE_GEN_API_KEY/EMBEDDING_API_KEY 或 base url)")
         return None, None
+    _style_sf = {"model": IMAGE_GEN_MODEL, "prompt": prompt, "image_size": IMAGE_GEN_SIZE, "batch_size": 1}
+    _style_oa = {"model": IMAGE_GEN_MODEL, "prompt": prompt, "size": IMAGE_GEN_SIZE, "n": 1}
+    payloads = [_style_sf, _style_oa] if "siliconflow" in base.lower() else [_style_oa, _style_sf]
     try:
-        async with httpx.AsyncClient(timeout=180) as client:
-            r = await client.post(
-                f"{base}/images/generations",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={"model": IMAGE_GEN_MODEL, "prompt": prompt,
-                      "image_size": IMAGE_GEN_SIZE, "batch_size": 1})
-            if r.status_code != 200:
-                print(f"⚠️ 文生图 HTTP {r.status_code}: {r.text[:200]}")
+        async with httpx.AsyncClient(timeout=300) as client:
+            j = None
+            for i, pl in enumerate(payloads):
+                r = await client.post(
+                    f"{base}/images/generations",
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json=pl)
+                if r.status_code == 200:
+                    j = r.json() or {}
+                    break
+                print(f"⚠️ 文生图 HTTP {r.status_code}(参数风格{i + 1}/{len(payloads)}): {r.text[:200]}")
+                if r.status_code not in (400, 422):     # 鉴权/额度/模型名错等,换参数风格也没救
+                    return None, None
+            if j is None:
                 return None, None
-            imgs = (r.json() or {}).get("images") or []
-            url = ((imgs[0] or {}).get("url") or "") if imgs else ""
+            items = j.get("images") or j.get("data") or []
+            item = (items[0] or {}) if items else {}
+            b64 = item.get("b64_json") or ""
+            url = item.get("url") or ""
+            if b64:                                     # gpt-image 系直接返 base64
+                import base64 as _b64
+                return "image/png", _b64.b64decode(b64)
+            if url.startswith("data:"):
+                mime, data = _decode_data_uri(url)
+                return (mime or "image/png", data) if data else (None, None)
             if not url:
-                print("⚠️ 文生图返回里没有图片 URL")
+                print("⚠️ 文生图返回里没有图片(url/b64_json 都为空)")
                 return None, None
             d = await client.get(url)
             if d.status_code != 200 or not d.content:
