@@ -1,0 +1,25 @@
+name: 凌晨自动整理
+
+on:
+  schedule:
+    - cron: '15 21 * * *'   # UTC 21:15 = 北京时间次日 05:15
+  workflow_dispatch: {}      # Actions 页面可手动点 Run workflow 测试
+
+jobs:
+  consolidate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 触发整理（curl 重试会先唤醒 Render 免费实例）
+        run: |
+          curl -sS -f --retry 6 --retry-delay 20 --retry-all-errors --max-time 120 \
+            -X POST "https://home1-htca.onrender.com/api/memories/consolidate/auto" \
+            -H "X-Gateway-Key: ${{ secrets.GATEWAY_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{}'
+
+      - name: 等 2 分半后查看整理结果
+        run: |
+          sleep 150
+          curl -sS --max-time 60 \
+            "https://home1-htca.onrender.com/api/memories/consolidate/status" \
+            -H "X-Gateway-Key: ${{ secrets.GATEWAY_KEY }}"

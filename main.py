@@ -32,6 +32,7 @@ from database import save_migrated_memory, find_memory_by_mw_id, save_photo, lin
 from database import list_memorywall, get_memorywall_one, update_memorywall, get_memory_photos, set_memory_active
 from database import get_memories_explicit_flags, set_memory_explicit, get_explicit_backfill_candidates, get_high_arousal_memories
 from database import get_long_memories, split_memory_into, undo_split, undo_split_one
+from database import get_fragments_by_time_window
 from database import get_decay_candidates, count_active_memories, deactivate_memories, archive_decayed_memories, reactivate_decayed_memories
 from database import count_explicit_memories, clear_persona_suggestions, clear_l5_candidates, get_current_mood
 from database import save_dream, get_dream, list_dreams, get_dream_dates, get_memorywall_dates, delete_dream_memories, get_memorywall_summary_by_date, get_avg_arousal_for_date, get_fragment_ids_for_date, get_all_conversations_for_date, archive_line_conversations
@@ -5574,15 +5575,21 @@ async def consolidate_memories_for_date(event_date):
 
 async def consolidate_memories_for_date_range(start_date, end_date):
     """整理指定时间段的碎片记忆"""
-    from datetime import date
-    import re
-    
-    # 获取该时间段的碎片
     fragments = await get_fragments_by_date_range(start_date, end_date)
-    
+
     if not fragments:
         return {"status": "no_fragments", "start_date": str(start_date), "end_date": str(end_date)}
-    
+
+    result = await _consolidate_fragment_batch(fragments, start_date)
+    result["start_date"] = str(start_date)
+    result["end_date"] = str(end_date)
+    return result
+
+
+async def _consolidate_fragment_batch(fragments, event_date):
+    """整理一批碎片的核心：AI 按事件分组合并 → 写 layer2 事件记忆 → 停用碎片"""
+    import re
+
     # 构建碎片文本
     def _frag_ts(ts):
         if hasattr(ts, "strftime"):
@@ -5696,7 +5703,7 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                         title=event.get("title", ""),
                         content=event.get("content", ""),
                         importance=event.get("importance", 5),
-                        event_date=start_date,
+                        event_date=event_date,
                         merged_from=merged_ids
                     )
                     created_count += 1
@@ -5707,8 +5714,6 @@ async def consolidate_memories_for_date_range(start_date, end_date):
             
             return {
                 "status": "ok",
-                "start_date": str(start_date),
-                "end_date": str(end_date),
                 "fragments_processed": len(fragments),
                 "events_created": created_count
             }
@@ -5774,6 +5779,96 @@ async def api_manual_consolidate(request: Request):
 async def api_consolidate_status():
     """查询整理任务状态"""
     return _consolidate_status
+
+
+# ===== 凌晨自动整理（按「逻辑日」，GitHub Actions 定时触发）=====
+# 逻辑日 = 当天 boundary 点 ~ 次日 boundary 点（北京时间，默认凌晨4点）。
+# 跨零点的连续对话（23:00 聊到 01:30）落在同一个逻辑日里，不会被日历日切成两半。
+AUTO_CONSOLIDATE_LOOKBACK_DAYS = int(os.getenv("AUTO_CONSOLIDATE_LOOKBACK_DAYS", "3"))
+AUTO_CONSOLIDATE_BOUNDARY_HOUR = int(os.getenv("AUTO_CONSOLIDATE_BOUNDARY_HOUR", "4"))
+
+
+async def auto_consolidate_recent(lookback_days=None, dry_run=False):
+    """整理最近 lookback_days 个已结束的逻辑日的碎片。
+
+    - 只看最近几天：漏跑的中间天会自动补上，但更早的积压
+      （比如迁移进来的成批老碎片）不碰，留给手动整理控制节奏。
+    - 已整理过的天没有活跃碎片，自动跳过，重复触发无副作用。
+    """
+    if lookback_days is None:
+        lookback_days = AUTO_CONSOLIDATE_LOOKBACK_DAYS
+    lookback_days = max(1, min(int(lookback_days), 14))
+    boundary = AUTO_CONSOLIDATE_BOUNDARY_HOUR
+    local_tz = timezone(timedelta(hours=TIMEZONE_HOURS))
+    now_local = datetime.now(timezone.utc).astimezone(local_tz)
+    # 最近一个已结束的逻辑日：过了今天 boundary 点，昨天的逻辑日才算结束
+    anchor = now_local.date() if now_local.hour >= boundary else now_local.date() - timedelta(days=1)
+    days = [anchor - timedelta(days=i) for i in range(lookback_days, 0, -1)]  # 从旧到新
+
+    report = []
+    for d in days:
+        start_local = datetime(d.year, d.month, d.day, boundary, tzinfo=local_tz)
+        end_local = start_local + timedelta(days=1)
+        fragments = await get_fragments_by_time_window(
+            start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc))
+        if not fragments:
+            continue
+        if dry_run:
+            report.append({"day": str(d), "fragments": len(fragments), "dry_run": True})
+            continue
+        result = await _consolidate_fragment_batch(fragments, d)
+        result["day"] = str(d)
+        report.append(result)
+        print(f"[auto/consolidate] 逻辑日 {d}: {result}")
+
+    summary = {
+        "status": "ok",
+        "checked_days": [str(d) for d in days],
+        "processed": report,
+        "ran_at": now_local.strftime("%Y-%m-%d %H:%M"),
+        "dry_run": dry_run,
+    }
+    if not dry_run:
+        try:
+            await set_gateway_config("auto_consolidate_last", json.dumps(summary, ensure_ascii=False))
+        except Exception:
+            pass
+    return summary
+
+
+@app.post("/api/memories/consolidate/auto")
+async def api_auto_consolidate(request: Request):
+    """凌晨自动整理入口。body 可选: {"dry_run": true, "lookback_days": 3}
+    dry_run 同步返回将要处理的天和碎片数；正式跑异步执行，结果查 /api/memories/consolidate/status
+    """
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    lookback = data.get("lookback_days")
+
+    if data.get("dry_run"):
+        return await auto_consolidate_recent(lookback, dry_run=True)
+
+    if _consolidate_status.get("running"):
+        return {"status": "already_running", "started_at": _consolidate_status.get("started_at")}
+
+    async def _run():
+        _consolidate_status.update({"running": True, "started_at": "auto", "result": None, "error": None})
+        try:
+            result = await auto_consolidate_recent(lookback)
+            _consolidate_status["result"] = result
+            print(f"[auto/consolidate] 完成: {result}")
+        except Exception as e:
+            _consolidate_status["error"] = str(e)
+            print(f"[auto/consolidate] 失败: {e}")
+        finally:
+            _consolidate_status["running"] = False
+
+    asyncio.create_task(_run())
+    return {"status": "started", "mode": "auto"}
 
 
 @app.post("/api/migrate/memory-wall")

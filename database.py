@@ -2780,7 +2780,21 @@ async def get_fragments_by_date_range(start_date, end_date):
         return [dict(r) for r in rows]
 
 
-async def create_event_memory(title: str, content: str, importance: int, 
+async def get_fragments_by_time_window(start_utc, end_utc):
+    """获取指定UTC时间窗内的原始碎片（凌晨自动整理按「逻辑日」取数用）"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, content, importance, created_at
+            FROM memories
+            WHERE layer = 1 AND is_active = TRUE
+            AND created_at >= $1 AND created_at < $2
+            ORDER BY created_at
+        """, start_utc, end_utc)
+        return [dict(r) for r in rows]
+
+
+async def create_event_memory(title: str, content: str, importance: int,
                                event_date, merged_from: list):
     """创建事件记忆（从碎片合并而来）"""
     pool = await get_pool()
