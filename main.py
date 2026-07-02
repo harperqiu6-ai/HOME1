@@ -28,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_recent_messages, extract_search_keywords, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge, apply_mood_drift, get_emotion_backfill_targets, update_emotion_only, update_memory_emotion
-from database import save_migrated_memory, find_memory_by_mw_id, save_photo, link_photo_to_memory, get_photo, memory_photo_count, delete_memory_photos, get_mw_meta, update_mw_meta
+from database import save_migrated_memory, find_memory_by_mw_id, save_photo, link_photo_to_memory, get_photo, memory_photo_count, delete_memory_photos, get_mw_meta, update_mw_meta, find_photo_id_by_hash
 from database import list_memorywall, get_memorywall_one, update_memorywall, get_memory_photos, set_memory_active
 from database import get_memories_explicit_flags, set_memory_explicit, get_explicit_backfill_candidates, get_high_arousal_memories
 from database import get_long_memories, split_memory_into, undo_split, undo_split_one
@@ -2345,7 +2345,8 @@ async def generate_image(prompt: str):
 
 async def _store_generated_image(prompt: str, mime: str, data: bytes, session_id: str):
     """生成图落库:二进制进 memory_photos(长期,/api/photos/id 可取)+一条'画了什么'文字记忆(可检索→她之后记得)。
-    返回 (memory_id, photo_id);photo_id 可能为 None(同图已存过被去重)。"""
+    返回 (memory_id, photo_id)。save_image_memory 按 md5 去重可能跳过插入——那就按内容翻出已有那张的 id 照常展示;
+    只有真的没存上(插入失败且库里也找不到)才返回 photo_id=None。"""
     content = f"{AI_NAME or 'AI'}给{USER_NAME}画了一张画，内容是：{prompt}"
     mid = await save_image_memory(content, source_session=session_id, photos=[(mime, data)],
                                   importance=5, arousal=0.4)
@@ -2354,6 +2355,13 @@ async def _store_generated_image(prompt: str, mime: str, data: bytes, session_id
         refs = await get_memory_photos(mid)
         if refs:
             pid = refs[0].get("photo_id")
+            print(f"🎨 生成图已存: memory #{mid}, photo #{pid}, {len(data)} bytes")
+        else:                               # 没挂上新图:多半是撞了 md5 去重,翻出已有那张照常给她看
+            pid = await find_photo_id_by_hash(data)
+            if pid:
+                print(f"🎨 生成图撞去重: memory #{mid} 复用已有 photo #{pid}")
+            else:
+                print(f"⚠️ 生成图没存上也没找到同图: memory #{mid}, {len(data)} bytes, mime={mime}")
     except Exception as e:
         print(f"⚠️ 生成图取 photo_id 失败: {e}")
     return mid, pid
@@ -3410,7 +3418,7 @@ async def chat_completions(request: Request):
         if _pid:
             _show = f"（画好啦~ 🎨）\n\n![{_draw_prompt[:50]}]({PUBLIC_BASE_URL}/api/photos/{_pid}{_qs})"
         else:
-            _show = "（这张跟之前画过的一模一样，相册里已经有啦~）"
+            _show = "（画是画好了，可是存相册的时候出了岔子没法给你看…这句话麻烦转告 FABLE 哥，让他去查日志）"
         if not skip_conversation_log and _draw_sid:
             try:
                 await save_message(_draw_sid, "user", user_message, body.get("model", ""))

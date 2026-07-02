@@ -879,6 +879,15 @@ async def photo_hash_exists(data: bytes) -> bool:
         return bool(row)
 
 
+async def find_photo_id_by_hash(data: bytes):
+    """按图片内容(md5)找已存的 photo id;没有返回 None。生成图撞上去重时,用它翻出已有那张来展示。"""
+    if not data:
+        return None
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval("SELECT id FROM memory_photos WHERE md5(data) = md5($1) LIMIT 1", data)
+
+
 async def save_image_memory(content: str, source_session: str = "", photos=None,
                             importance: int = 5, valence: float = 0.0, arousal: float = 0.4) -> int:
     """看图记忆:存一条文字描述记忆 + 关联图片(memory_photos,长期可取 /api/photos/id)。返回 memory_id。
