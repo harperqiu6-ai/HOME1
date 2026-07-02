@@ -203,6 +203,16 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border:none;border-ra
       <div class="row"><div class="hint" id="tgc-msg">　</div><div class="ctl"><button class="btn sm" id="tgc-connect">连接 / 注册 webhook</button><button class="btn sm" id="tgc-refresh">刷新状态</button></div></div>
     </div>
 
+    <!-- DRAW 画图(/画) -->
+    <div class="panel wide">
+      <div class="panel-h"><span class="en">DRAW</span><span class="cn">画图(/画) · 换服务商</span><i class="ti ti-palette"></i></div>
+      <div class="row"><div><div class="label">画图总开关</div><div class="hint" id="ig-stat">聊天里发「/画 想要的画面」就出图；下面换画图用的服务商，保存立即生效、不用重启</div></div><div class="ctl"><label class="tg"><input type="checkbox" id="ig-enabled"><span class="track"></span><span class="knob"></span></label></div></div>
+      <div class="row"><div><div class="label">接口地址</div><div class="hint">中转站给的地址，末尾带 /v1；清空保存=回到共用向量检索那套(硅基流动)</div></div><div class="ctl"><input id="ig-base" type="text" placeholder="https://中转站/v1" style="width:300px"></div></div>
+      <div class="row"><div class="label">API Key</div><div class="ctl"><input id="ig-key" type="password" placeholder="sk-…（留空=不改）" style="width:300px"></div></div>
+      <div class="row"><div><div class="label">模型名</div><div class="hint">以服务商模型列表里写的为准，如 gpt-image-2、Kwai-Kolors/Kolors</div></div><div class="ctl"><input id="ig-model" type="text" style="width:300px"></div></div>
+      <div class="row"><div class="hint" id="ig-msg">　</div><div class="ctl"><button class="btn sm" id="ig-save">保存(立即生效)</button><button class="btn sm" id="ig-refresh">刷新状态</button></div></div>
+    </div>
+
     <!-- DECAY -->
     <div class="panel wide">
       <div class="panel-h"><span class="en">DECAY</span><span class="cn">精炼 · 遗忘(归档≠删除·可逆)</span><i class="ti ti-hourglass-low"></i></div>
@@ -544,6 +554,42 @@ if(KEY){
   document.getElementById('tgc-refresh').addEventListener('click', tgLoad);
   document.getElementById('tgc-enabled').addEventListener('change', tgToggle);
   tgLoad();
+}
+
+// ---- 画图(/画) 换服务商 ----
+async function igLoad(){
+  try{
+    const s = await api('/api/imagegen/status');
+    document.getElementById('ig-enabled').checked = !!s.enabled;
+    const b = document.getElementById('ig-base');
+    b.value = s.own_base ? s.base_url : '';
+    if(!s.own_base) b.placeholder = '留空=共用向量检索那套（现在: '+(s.base_url||'未配置')+'）';
+    const k = document.getElementById('ig-key');
+    k.value=''; k.placeholder = s.own_key ? '已单独设置（留空=不改）' : (s.key_set ? '正在共用向量检索的 key（留空=继续共用）' : '⚠️ 未配置任何 key');
+    document.getElementById('ig-model').value = s.model||'';
+    document.getElementById('ig-stat').textContent = (s.enabled?'✅ 开着':'⛔ 关着')+' ｜ 模型: '+(s.model||'?')+' ｜ 地址: '+(s.base_url||'未配置');
+  }catch(e){ document.getElementById('ig-stat').textContent='状态加载失败:'+e.message; }
+}
+async function igToggle(){
+  const en=document.getElementById('ig-enabled').checked;
+  try{ await api('/api/settings',{method:'PUT',body:{IMAGE_GEN_ENABLED:en}}); toast(en?'画图已开启':'画图已关闭'); igLoad(); }
+  catch(e){ toast('失败:'+e.message); igLoad(); }
+}
+async function igSave(){
+  const el=document.getElementById('ig-msg'); el.textContent='保存中…';
+  const body={ IMAGE_GEN_BASE_URL: document.getElementById('ig-base').value.trim() };
+  const key=document.getElementById('ig-key').value.trim(); if(key) body.IMAGE_GEN_API_KEY=key;
+  const model=document.getElementById('ig-model').value.trim(); if(model) body.IMAGE_GEN_MODEL=model;
+  try{
+    await api('/api/settings',{method:'PUT',body:body});
+    el.textContent='✅ 已保存，立即生效。去聊天里发「/画 一只橘猫」试试~'; toast('已保存'); igLoad();
+  }catch(e){ el.textContent='失败:'+e.message; toast('失败'); }
+}
+if(KEY){
+  document.getElementById('ig-save').addEventListener('click', igSave);
+  document.getElementById('ig-refresh').addEventListener('click', igLoad);
+  document.getElementById('ig-enabled').addEventListener('change', igToggle);
+  igLoad();
 }
 
 // ---- 滚动摘要封顶(立即/预览) ----

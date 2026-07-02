@@ -6175,6 +6175,22 @@ async def api_get_photo(photo_id: int):
     return Response(content=bytes(row["data"]), media_type=row.get("mime") or "image/png")
 
 
+@app.get("/api/imagegen/status")
+async def api_imagegen_status():
+    """画图(/画)当前配置——给操作间 DRAW 面板。key 只报"设没设",真值绝不回传。"""
+    eff_base = (IMAGE_GEN_BASE_URL or getattr(_db_module, "EMBEDDING_BASE_URL", "") or "").rstrip("/")
+    own_key = bool(IMAGE_GEN_API_KEY)
+    return {
+        "enabled": IMAGE_GEN_ENABLED,
+        "model": IMAGE_GEN_MODEL,
+        "size": IMAGE_GEN_SIZE,
+        "base_url": eff_base,                        # 实际生效的地址(可能是复用向量检索那套)
+        "own_base": bool(IMAGE_GEN_BASE_URL),        # 是否单独设了画图地址
+        "own_key": own_key,                          # 是否单独设了画图 key
+        "key_set": own_key or bool(getattr(_db_module, "EMBEDDING_API_KEY", "")),
+    }
+
+
 # ============================================================
 # 回忆墙视图 CRUD —— API-first：dashboard 与未来的 MCP 出口共用这组端点
 # “回忆” = memories 里 mw_meta 非空的记忆（迁入的 + dashboard 新建的），同库不同视图，
