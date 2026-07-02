@@ -125,6 +125,14 @@ L5_AUTO_ENABLED = os.getenv("L5_AUTO_ENABLED", "true").lower() == "true"
 # 看图(多模态透传):分区拼 prompt 时保留当前 user 的 image_url 块转发给 opus(默认关到验收;控制台开关)。关=原行为(拍扁纯文本)
 IMAGE_ENABLED = os.getenv("IMAGE_ENABLED", "false").lower() == "true"
 
+# 文生图(/画 暗号):调 images/generations 接口(硅基流动兼容格式)。key/地址默认复用向量检索那套(同为硅基流动)。
+# 生成图只存 memory_photos 表(长期)+一条可检索文字记忆;逐字历史只落一行短占位文字——图片本体绝不进上下文/缓存。
+IMAGE_GEN_ENABLED = os.getenv("IMAGE_GEN_ENABLED", "true").lower() == "true"
+IMAGE_GEN_MODEL = os.getenv("IMAGE_GEN_MODEL", "Kwai-Kolors/Kolors")
+IMAGE_GEN_BASE_URL = os.getenv("IMAGE_GEN_BASE_URL", "")   # 空=复用 EMBEDDING_BASE_URL
+IMAGE_GEN_API_KEY = os.getenv("IMAGE_GEN_API_KEY", "")     # 空=复用 EMBEDDING_API_KEY
+IMAGE_GEN_SIZE = os.getenv("IMAGE_GEN_SIZE", "1024x1024")
+
 # ===== 去个人化(可分发 fork):对话对象名 / AI 名 / 健康护栏 / 首页 都改配置(env+DB,默认通用或空) =====
 # 空白部署 → built-prompt 不含任何人名/暗号/健康红线。阮阮实例在 /api/settings 填回 USER_NAME=阮阮、AI_NAME=阿克、
 # HEALTH_SAFETY_NOTE=… 即与原来完全一致(她的人设/档案/L5/记忆本就都在她 DB)。
@@ -453,6 +461,9 @@ async def lifespan(app: FastAPI):
                         "PERSONA_SUGGESTION_MIN_IMPORTANCE": int,
                         "L5_AUTO_ENABLED": lambda v: _parse_bool(v),
                         "IMAGE_ENABLED": lambda v: _parse_bool(v),
+                        "IMAGE_GEN_ENABLED": lambda v: _parse_bool(v),
+                        "IMAGE_GEN_MODEL": str, "IMAGE_GEN_BASE_URL": str,
+                        "IMAGE_GEN_API_KEY": str, "IMAGE_GEN_SIZE": str,
                         "USER_NAME": str, "AI_NAME": str, "HEALTH_SAFETY_NOTE": str,
                         "HOME_TITLE": str, "HOME_SUBTITLE": str, "SINCE_DATE": str,
                         "INTIMACY_UNLOCK_KEYS": lambda v: [k.strip().lower() for k in str(v).split(",") if k.strip()],
@@ -2275,6 +2286,58 @@ async def _save_image_memory_bg(session_id: str, images: list):
         print(f"⚠️ 看图记忆失败: {e}")
 
 
+async def generate_image(prompt: str):
+    """文生图:调 images/generations(硅基流动兼容格式)生成一张图并立刻下载,返回 (mime, bytes)。失败返回 (None, None)。
+    生成方给的图片 URL 约1小时就过期,所以必须当场下载二进制存库,长期取图一律走 /api/photos/{id}。"""
+    key = IMAGE_GEN_API_KEY or getattr(_db_module, "EMBEDDING_API_KEY", "") or ""
+    base = (IMAGE_GEN_BASE_URL or getattr(_db_module, "EMBEDDING_BASE_URL", "") or "").rstrip("/")
+    if not (key and base):
+        print("⚠️ 文生图未配置(缺 IMAGE_GEN_API_KEY/EMBEDDING_API_KEY 或 base url)")
+        return None, None
+    try:
+        async with httpx.AsyncClient(timeout=180) as client:
+            r = await client.post(
+                f"{base}/images/generations",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={"model": IMAGE_GEN_MODEL, "prompt": prompt,
+                      "image_size": IMAGE_GEN_SIZE, "batch_size": 1})
+            if r.status_code != 200:
+                print(f"⚠️ 文生图 HTTP {r.status_code}: {r.text[:200]}")
+                return None, None
+            imgs = (r.json() or {}).get("images") or []
+            url = ((imgs[0] or {}).get("url") or "") if imgs else ""
+            if not url:
+                print("⚠️ 文生图返回里没有图片 URL")
+                return None, None
+            d = await client.get(url)
+            if d.status_code != 200 or not d.content:
+                print(f"⚠️ 生成图下载失败 HTTP {d.status_code}")
+                return None, None
+            mime = (d.headers.get("content-type") or "image/png").split(";")[0].strip()
+            if not mime.startswith("image/"):
+                mime = "image/png"
+            return mime, d.content
+    except Exception as e:
+        print(f"⚠️ 文生图失败: {e}")
+        return None, None
+
+
+async def _store_generated_image(prompt: str, mime: str, data: bytes, session_id: str):
+    """生成图落库:二进制进 memory_photos(长期,/api/photos/id 可取)+一条'画了什么'文字记忆(可检索→她之后记得)。
+    返回 (memory_id, photo_id);photo_id 可能为 None(同图已存过被去重)。"""
+    content = f"{AI_NAME or 'AI'}给{USER_NAME}画了一张画，内容是：{prompt}"
+    mid = await save_image_memory(content, source_session=session_id, photos=[(mime, data)],
+                                  importance=5, arousal=0.4)
+    pid = None
+    try:
+        refs = await get_memory_photos(mid)
+        if refs:
+            pid = refs[0].get("photo_id")
+    except Exception as e:
+        print(f"⚠️ 生成图取 photo_id 失败: {e}")
+    return mid, pid
+
+
 def _assemble_current_user(parts: list, current_user_msg: dict) -> dict:
     """拼「当前 user」消息:注入块(parts:时间/记忆/feel/proactive…)+ 原文。
     IMAGE_ENABLED 且原 content 是多模态 list 时:注入+原文本合成首个 text 块、保留 image_url 等媒体块(透传给 opus);
@@ -3305,6 +3368,37 @@ async def chat_completions(request: Request):
             except Exception as _se:
                 _txt = f"（同步出了点小问题：{_se}）"
         return _oai_text_response(_txt, body.get("model", ""), bool(body.get("stream", False)) or FORCE_STREAM)
+
+    # ---------- 暗号拦截：/画 → 文生图（硅基流动），不调聊天大模型 ----------
+    # 缓存纪律:图片二进制只进 memory_photos 表;逐字历史只落一行短占位文字(每轮重放也就几十字、内容恒定,
+    # 缓存前缀稳定不重建)。带 gateway_key 的展示 URL 只出现在给客户端的即时回复里,绝不落库、绝不进上游上下文。
+    if IMAGE_GEN_ENABLED and (_um_last.startswith("/画") or _um_last.lower().startswith("/draw")):
+        _is_stream = bool(body.get("stream", False)) or FORCE_STREAM
+        _draw_prompt = (_um_last[len("/draw"):] if _um_last.lower().startswith("/draw")
+                        else _um_last[len("/画"):]).strip()
+        if not _draw_prompt:
+            return _oai_text_response("（「/画 想要的画面」我就给你画~ 比如：/画 一只橘猫趴在窗台晒太阳）",
+                                      body.get("model", ""), _is_stream)
+        _mime, _data = await generate_image(_draw_prompt)
+        if not _data:
+            return _oai_text_response("（呜，这张没画出来…画画的服务好像开小差了，等一下再让我试一次好吗）",
+                                      body.get("model", ""), _is_stream)
+        _draw_sid = get_active_session_id()
+        _mid, _pid = await _store_generated_image(_draw_prompt, _mime, _data, _draw_sid)
+        _qs = f"?gateway_key={GATEWAY_SECRET}" if GATEWAY_SECRET else ""
+        if _pid:
+            _show = f"（画好啦~ 🎨）\n\n![{_draw_prompt[:50]}]({PUBLIC_BASE_URL}/api/photos/{_pid}{_qs})"
+        else:
+            _show = "（这张跟之前画过的一模一样，相册里已经有啦~）"
+        if not skip_conversation_log and _draw_sid:
+            try:
+                await save_message(_draw_sid, "user", user_message, body.get("model", ""))
+                await save_message(_draw_sid, "assistant",
+                                   f"（我给你画了一张画：{_draw_prompt}，已经存进相册回忆里）",
+                                   body.get("model", ""))
+            except Exception as _de:
+                print(f"⚠️ /画 落库失败: {_de}")
+        return _oai_text_response(_show, body.get("model", ""), _is_stream)
 
     # ---------- 暗号拦截：/想想 → 强制走"递纸条"扩展召回（不拦截回复，剥离前缀后继续正常生成）----------
     _scratchpad_cmd_hit = (
@@ -4572,6 +4666,22 @@ async def _tg_api(token: str, method: str, payload: dict) -> dict:
         return {}
 
 
+async def _tg_send_photo(token: str, chat_id, data: bytes, mime: str = "image/png", caption: str = "") -> bool:
+    """发一张图给 TG(sendPhoto, multipart 上传二进制)。成功返回 True。"""
+    if not token or not data:
+        return False
+    ext = {"image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}.get(mime, "png")
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(f"{TG_API_BASE}/bot{token}/sendPhoto",
+                                  data={"chat_id": str(chat_id), "caption": caption},
+                                  files={"photo": (f"drawing.{ext}", data, mime)})
+            return bool((r.json() or {}).get("ok"))
+    except Exception as e:
+        print(f"⚠️ Telegram sendPhoto 失败: {e}")
+        return False
+
+
 async def _tg_send(token: str, chat_id, text: str):
     """发消息给 TG, 自动分段(单条上限4096), 纯文本避免 markdown 解析报错。"""
     text = text or ""
@@ -4731,6 +4841,29 @@ async def _tg_handle_update(update: dict):
         return
     if text == "/start":
         await _tg_send(token, chat_id, "我在呀～想聊什么直接说就好 😊")
+        return
+
+    # ---------- /画 → 文生图,直接发真图片(不进大脑;历史只落短占位文字,同 KELIVO 侧的缓存纪律) ----------
+    if IMAGE_GEN_ENABLED and (text.startswith("/画") or text.lower().startswith("/draw")):
+        _p = (text[len("/draw"):] if text.lower().startswith("/draw") else text[len("/画"):]).strip()
+        if not _p:
+            await _tg_send(token, chat_id, "「/画 想要的画面」我就给你画~ 比如：/画 一只橘猫趴在窗台晒太阳")
+            return
+        await _tg_api(token, "sendChatAction", {"chat_id": chat_id, "action": "upload_photo"})
+        _mime, _data = await generate_image(_p)
+        if not _data:
+            await _tg_send(token, chat_id, "(呜,这张没画出来,等一下再让我试一次好吗…)")
+            return
+        await _store_generated_image(_p, _mime, _data, "tg")
+        sent = await _tg_send_photo(token, chat_id, _data, _mime, caption=f"🎨 {_p[:180]}")
+        if sent:
+            try:    # tg 线的 session_id 就是线名 "tg"(X-Session-Line 直接当 id 用)
+                await save_message("tg", "user", f"/画 {_p}", DEFAULT_MODEL)
+                await save_message("tg", "assistant", f"（我给你画了一张画：{_p}，已发给你并存进相册）", DEFAULT_MODEL)
+            except Exception as _e:
+                print(f"⚠️ TG /画 落库失败: {_e}")
+        else:
+            await _tg_send(token, chat_id, "(画好了但没发出去…图已经存进相册,在操作间能看到)")
         return
 
     await _tg_api(token, "sendChatAction", {"chat_id": chat_id, "action": "typing"})
@@ -7431,6 +7564,11 @@ async def save_settings(request: Request):
             "PERSONA_SUGGESTION_MIN_IMPORTANCE": int,
             "L5_AUTO_ENABLED":       lambda v: _parse_bool(v),
             "IMAGE_ENABLED":         lambda v: _parse_bool(v),
+            "IMAGE_GEN_ENABLED":     lambda v: _parse_bool(v),
+            "IMAGE_GEN_MODEL":       str,
+            "IMAGE_GEN_BASE_URL":    str,
+            "IMAGE_GEN_API_KEY":     str,
+            "IMAGE_GEN_SIZE":        str,
             "USER_NAME":             str,
             "AI_NAME":               str,
             "HEALTH_SAFETY_NOTE":    str,
