@@ -3034,6 +3034,24 @@ async def update_memory_with_layer(memory_id: int, content: str = None,
         )
 
 
+async def refresh_memory_embedding(memory_id: int):
+    """内容被人工编辑后重算向量,让语义检索跟上新内容(不然改了字面、向量还停在旧内容上)。失败只打日志。"""
+    if not MEMORY_VECTOR_ENABLED:
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT content FROM memories WHERE id = $1", memory_id)
+        if not row or not (row["content"] or "").strip():
+            return
+        try:
+            emb = await compute_embedding(row["content"])
+            if emb:
+                await save_memory_embedding(conn, memory_id, emb)
+                print(f"🔄 记忆 #{memory_id} 向量已随内容更新")
+        except Exception as e:
+            print(f"⚠️ 记忆 #{memory_id} 重算向量失败: {e}")
+
+
 async def get_layer_statistics():
     """获取各层记忆的统计数据"""
     pool = await get_pool()

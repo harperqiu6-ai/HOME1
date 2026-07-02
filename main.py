@@ -28,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_recent_messages, extract_search_keywords, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge, apply_mood_drift, get_emotion_backfill_targets, update_emotion_only, update_memory_emotion
-from database import save_migrated_memory, find_memory_by_mw_id, save_photo, link_photo_to_memory, get_photo, memory_photo_count, delete_memory_photos, get_mw_meta, update_mw_meta, find_photo_id_by_hash
+from database import save_migrated_memory, find_memory_by_mw_id, save_photo, link_photo_to_memory, get_photo, memory_photo_count, delete_memory_photos, get_mw_meta, update_mw_meta, find_photo_id_by_hash, refresh_memory_embedding
 from database import list_memorywall, get_memorywall_one, update_memorywall, get_memory_photos, set_memory_active
 from database import get_memories_explicit_flags, set_memory_explicit, get_explicit_backfill_candidates, get_high_arousal_memories
 from database import get_long_memories, split_memory_into, undo_split, undo_split_one
@@ -4093,6 +4093,8 @@ async def api_update_memory(memory_id: int, request: Request):
     # 面板手动改情绪：仅当显式带 valence/arousal 时覆盖写两列 + 重置漂移基线（其余字段走上面常规更新）
     if data.get("valence") is not None and data.get("arousal") is not None:
         await update_memory_emotion(memory_id, data["valence"], data["arousal"])
+    if data.get("content") is not None:      # 内容改了→向量跟着重算,语义检索才认新内容
+        await refresh_memory_embedding(memory_id)
     return {"status": "ok", "id": memory_id}
 
 
@@ -4129,6 +4131,8 @@ async def api_batch_update(request: Request):
             title=item.get("title"),
             layer=item.get("layer"),
         )
+        if item.get("content") is not None:  # 内容改了→向量跟着重算,语义检索才认新内容
+            await refresh_memory_embedding(item["id"])
     return {"status": "ok", "updated": len(updates)}
 
 
