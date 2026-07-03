@@ -4585,6 +4585,13 @@ async def _decide_and_write(persona: str, transcript: str, silence_min: float, i
         return {"reach_out": False}
 
 
+# 「问过就别再问」冷却：LLM 判定过"不发"后，只要用户没有新消息(对话没变化)，
+# 冷却期内不再花钱去问同一个问题。用户一说话 last_user_ts 变了，冷却自动作废。
+# (内存变量,Render 重启即清,最坏多问一次,可接受)
+PROACTIVE_SKIP_COOLDOWN_MIN = float(os.getenv("PROACTIVE_SKIP_COOLDOWN_MIN", "45"))
+_proactive_skip_state = {"decided_at": None, "last_user_ts": None}
+
+
 async def maybe_send_proactive(force: bool = False) -> dict:
     """主动私信主流程：每次后台自查时调用一次。force=True 用于调试(忽略闸门)。"""
     cfg = await get_push_config()
@@ -4625,6 +4632,11 @@ async def maybe_send_proactive(force: bool = False) -> dict:
             return {"sent": False, "reason": "streak_capped", "streak": streak}
         if gap_min < cfg["push_silence_min"]:
             return {"sent": False, "reason": "too_soon", "gap_min": int(gap_min)}
+        # 冷却：上次已问过 LLM 且它说"不发"，对话又没变化 → 冷却期内不再问(省钱)
+        _sk = _proactive_skip_state
+        if _sk["decided_at"] and _sk["last_user_ts"] == last_user_ts \
+           and (now - _sk["decided_at"]).total_seconds() < PROACTIVE_SKIP_COOLDOWN_MIN * 60:
+            return {"sent": False, "reason": "skip_cooldown"}
         # 🎲 投骰子：到时间后也不是每次都来——掷中了才"动念"去问 LLM 要不要发，制造随性/看心情的感觉
         import random as _rnd
         if _rnd.random() > float(cfg.get("push_probability", 0.25)):
@@ -4649,6 +4661,7 @@ async def maybe_send_proactive(force: bool = False) -> dict:
     _disp_silence = max(silence_min, cfg["push_silence_min"]) if force else silence_min
     decision = await _decide_and_write(persona, transcript, _disp_silence, in_quiet)
     if not decision.get("reach_out") and not force:
+        _proactive_skip_state.update({"decided_at": now, "last_user_ts": last_user_ts})
         return {"sent": False, "reason": "ai_decided_skip"}
     urgent = bool(decision.get("urgent"))
     text = (decision.get("message") or "").strip()
@@ -4663,6 +4676,8 @@ async def maybe_send_proactive(force: bool = False) -> dict:
     if not force and in_quiet:
         # 深夜：仅"未解情绪(urgent)"且本段沉默还没破例过，才发1次
         if not (cfg["push_quiet_urgent"] and urgent and streak == 0):
+            # 深夜写了又不够紧急被丢弃，同样进冷却——别整晚每5分钟白写一条
+            _proactive_skip_state.update({"decided_at": now, "last_user_ts": last_user_ts})
             return {"sent": False, "reason": "quiet_hours_not_urgent"}
 
     title = AI_NAME or "AI"
