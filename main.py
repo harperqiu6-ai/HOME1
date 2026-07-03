@@ -4165,6 +4165,26 @@ async def api_line_log(request: Request):
     if len(content) > 8000:
         content = content[:8000]
     await save_message(line, role, content, model=str(data.get("model") or "cyberboss"))
+    # cyberboss 线自动记忆提取：assistant 落地=一轮结束。凑齐紧邻的 user+assistant 对，
+    # 就走与主线完全同款的后台提取管线（skip_conversation_log=True 防止双份入库；
+    # 垃圾过滤/查重/feel/做梦懒触发等副作用与主线一致）。
+    if role == "assistant" and line == CYBERBOSS_LINE_ID and MEMORY_ENABLED:
+        try:
+            rows = await get_conversation_messages(line, limit=10000)
+            rows = rows[-10:]
+            last_user = ""
+            for r in reversed(rows[:-1]):
+                if r.get("role") == "user":
+                    last_user = (r.get("content") or "").strip()
+                    break
+            if last_user:
+                ctx = [{"role": r.get("role"), "content": r.get("content") or ""} for r in rows[:-1]]
+                asyncio.create_task(process_memories_background(
+                    line, last_user, content, "cyberboss",
+                    context_messages=ctx, skip_conversation_log=True,
+                ))
+        except Exception as _e:
+            print(f"⚠️ cyberboss线提取调度失败: {_e}")
     return {"status": "ok"}
 
 
