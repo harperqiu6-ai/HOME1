@@ -4144,6 +4144,50 @@ async def api_search_memories(q: str = "", limit: int = 20):
         return {"error": str(e), "results": []}
 
 
+@app.get("/api/memories/top")
+async def api_top_memories(limit: int = 6, min_importance: int = 7, max_chars: int = 90):
+    """外部代理(cyberboss)开新线程时拉「当前要点」小抄：活跃、高重要度、最近优先的事实条目。
+    刻意排除叙事体（回忆墙长文/梦/露骨），每条截断——保持 FACTS 风格（现在时、条目化），不是日记。"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用", "facts": []}
+    limit = max(1, min(12, int(limit or 6)))
+    min_importance = max(1, min(10, int(min_importance or 7)))
+    max_chars = max(30, min(200, int(max_chars or 90)))
+    try:
+        rows = await get_all_memories_detail(active_only=True)
+        cands = []
+        for m in rows:
+            if m.get("is_mw") or m.get("is_explicit"):
+                continue
+            c = (m.get("content") or "").strip()
+            if not c or len(c) > 400 or c.startswith("【梦") or c.startswith("【这是"):
+                continue
+            imp = int(m.get("importance") or 0)
+            if imp < min_importance:
+                continue
+            cands.append(m)
+        def _ts(m):
+            dt = m.get("created_at")
+            if dt is None:
+                return 0.0
+            try:
+                if getattr(dt, "tzinfo", None) is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except Exception:
+                return 0.0
+        cands.sort(key=lambda m: (int(m.get("importance") or 0), _ts(m)), reverse=True)
+        facts = []
+        for m in cands[:limit]:
+            c = (m.get("content") or "").strip().replace("\n", " ")
+            if len(c) > max_chars:
+                c = c[:max_chars] + "…"
+            facts.append({"content": c, "importance": int(m.get("importance") or 0)})
+        return {"facts": facts, "total": len(facts)}
+    except Exception as e:
+        return {"error": str(e), "facts": []}
+
+
 @app.post("/api/memories/create")
 async def api_create_memory(request: Request):
     """外部代理（cyberboss 等）直接写入一条记忆（layer1 碎片，自动算向量，走夜间整理）"""
