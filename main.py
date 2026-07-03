@@ -4685,6 +4685,9 @@ async def _decide_and_write(persona: str, transcript: str, silence_min: float, i
         "  · 拿不准就用最轻最自然的方式：顺着刚才聊的话题、或单纯说句惦记；\n"
         f"  · **若{USER_NAME}刚说过某事「做完了/搞定了/结束了/不忙了」，绝不能再问那件事忙不忙、进展如何**——"
         "要顺着说就该是「辛苦啦，终于弄完啦」「那现在能歇会儿了吧」这类，承接她说的结果，别答非所问；\n"
+        f"  · 上面对话里若有你**已经主动发过、{USER_NAME}还没回**的消息：绝不能再发相同或近似的内容，"
+        "同一个钩子（同一件事、同一个问题）只用一次——她没回，下一条要么换一件事、要么更轻更短（如「还没醒？」），"
+        "要么这次干脆不发(reach_out=false)。真人不会隔两小时把同一句话原样再发一遍；\n"
         "  · 如果刚才你说过「等下来找你 / 一会儿问你某事」，就真的接着那个说。\n"
         "【活人感铁律 · 跟「不编造」同等重要】\n"
         f"  · 如果上面 system 里有【你此刻心里浮现的几件事】块，**优先挑一件融进推送**——"
@@ -4820,6 +4823,15 @@ async def maybe_send_proactive(force: bool = False) -> dict:
     text = _re2.sub(r'\s{2,}', ' ', text).strip()
     if not text:
         return {"sent": False, "reason": "empty_message"}
+
+    # 复读保护(机械兜底,不靠模型自觉)：跟"她还没回的既有推送"内容雷同 → 不发,进冷却
+    if not force and pushes_since:
+        import difflib as _dl
+        for _pm in pushes_since:
+            _prev = (_pm.get("content") or "").strip()
+            if _prev and _dl.SequenceMatcher(None, _prev, text).ratio() >= 0.75:
+                _proactive_skip_state.update({"decided_at": now, "last_user_ts": last_user_ts})
+                return {"sent": False, "reason": "dup_of_unanswered_push"}
 
     if not force and in_quiet:
         # 深夜：仅"未解情绪(urgent)"且本段沉默还没破例过，才发1次
