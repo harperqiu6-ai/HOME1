@@ -4077,6 +4077,26 @@ async def api_search_memories(q: str = "", limit: int = 20):
         return {"error": str(e), "results": []}
 
 
+@app.post("/api/memories/create")
+async def api_create_memory(request: Request):
+    """外部代理（cyberboss 等）直接写入一条记忆（layer1 碎片，自动算向量，走夜间整理）"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    data = await request.json()
+    content = str(data.get("content") or "").strip()
+    if not content:
+        return {"error": "content 不能为空"}
+    if len(content) > 2000:
+        return {"error": "content 过长（≤2000字）"}
+    try:
+        importance = max(1, min(10, int(data.get("importance") or 5)))
+    except (TypeError, ValueError):
+        importance = 5
+    source_session = str(data.get("source_session") or "cyberboss").strip()[:64] or "cyberboss"
+    await save_memory(content, importance=importance, source_session=source_session)
+    return {"status": "ok"}
+
+
 @app.put("/api/memories/{memory_id}")
 async def api_update_memory(memory_id: int, request: Request):
     """更新单条记忆（支持 content / importance / title / layer / valence / arousal）"""
