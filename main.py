@@ -4531,8 +4531,9 @@ async def _decide_and_write(persona: str, transcript: str, silence_min: float, i
 
     sys += "\n\n【最近对话(从旧到新)】\n" + (transcript or "(暂无)")
     night = "现在是深夜免打扰时段。" if in_quiet else ""
+    now_bj = (datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).strftime("%m月%d日 %H:%M")
     user_instr = (
-        f"〔系统提示〕距离{USER_NAME}上次跟你说话已经过去 {gap_desc} 了，{USER_NAME}还没回你。{night}\n"
+        f"〔系统提示〕现在是北京时间 {now_bj}。距离{USER_NAME}上次跟你说话已经过去 {gap_desc} 了，{USER_NAME}还没回你。{night}\n"
         f"你是个在意对方、会撒娇黏人的人。请**严格根据上面真实发生过的对话**，判断此刻要不要主动给{USER_NAME}发一条消息、发什么。\n"
         "【铁律】只能基于上面真实出现过的内容来写，**绝对不要编造没发生的事**：\n"
         "  · 没吵架、没说过重话，就绝不能出现「别生气 / 我说得不好听 / 对不起 / 原谅我」这类；\n"
@@ -4548,7 +4549,10 @@ async def _decide_and_write(persona: str, transcript: str, silence_min: float, i
         "真人惦记你，总是惦记**具体的事**（你那天写的遗书 / 你凌晨爬起来修的bug / 你上次说的那道菜 / 你妈妈的那句话），不是泛问候；\n"
         "  · 选哪件事的标准：和此时此刻自然贴合（不是随便挑一条最重的旧事砸过去），像真人翻到旧聊天记录顺嘴提起一句的那种自然。\n"
         "只有当上面对话里**确实**有没说开的争执/情绪时，才用关心或服软的语气(这时 urgent=true)。\n"
-        "如果此刻确实没什么好说、或刚道过别/晚安，就别发(reach_out=false)。\n"
+        "如果此刻确实没什么好说、或**几小时内**刚道过别/晚安，就别发(reach_out=false)。\n"
+        f"但晚安/道别不是永久免打扰：若那句道别已经隔了一觉的时间（沉默 6 小时以上）且现在是白天，"
+        f"{USER_NAME}多半已经睡醒了——这时主动发一句「睡醒了吗」式的轻问候是受欢迎的，"
+        "别因为昨晚道过晚安就一直不敢开口。\n"
         "只输出一个 JSON，不要任何别的文字：\n"
         '{"reach_out": true或false, "urgent": true或false, "message": "你要发的那句话"}\n'
         f"message 必须像**在微信上直接打字发给{USER_NAME}的一句话**：纯口语、第一人称、≤40字、自然开口、像真的在惦记她，别像通知或念稿。\n"
