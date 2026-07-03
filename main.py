@@ -4186,7 +4186,17 @@ async def api_line_recent(line: str = "", rounds: int = 9):
                 if c:
                     msgs.append({"role": m.get("role"), "content": c})
         summary_segments = ([f"〔更早〕{early}"] if early else []) + list(summary_parts)
-        return {"line": sid, "summary": "\n".join(summary_segments).strip(), "recent": msgs}
+        latest_at = ""
+        if rows:
+            _ts = rows[-1].get("created_at")
+            if _ts is not None:
+                try:
+                    if getattr(_ts, "tzinfo", None) is None:
+                        _ts = _ts.replace(tzinfo=timezone.utc)
+                    latest_at = _ts.astimezone(timezone.utc).isoformat()
+                except Exception:
+                    pass
+        return {"line": sid, "summary": "\n".join(summary_segments).strip(), "recent": msgs, "latest_at": latest_at}
     except Exception as e:
         return {"error": str(e), "line": sid}
 
