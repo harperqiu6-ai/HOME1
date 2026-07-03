@@ -2536,6 +2536,52 @@ async def _compose_tg_digest_for_main() -> str:
         return ""
 
 
+CYBERBOSS_LINE_ID = os.getenv("CYBERBOSS_LINE_ID", "cyberboss")
+CYBERBOSS_DIGEST_ROUNDS = int(os.getenv("CYBERBOSS_DIGEST_ROUNDS", "8"))
+CYBERBOSS_DIGEST_TTL_HOURS = float(os.getenv("CYBERBOSS_DIGEST_TTL_HOURS", "6"))
+CYBERBOSS_DIGEST_CHAR_CAP = int(os.getenv("CYBERBOSS_DIGEST_CHAR_CAP", "1200"))
+
+
+async def _compose_cyberboss_digest_for_main() -> str:
+    """主线(KELIVO)专用：实时读 cyberboss 线(TG陪伴bot逐字抄送)的最近尾巴，塞当前轮 parts(零时差)。
+    仅主线、非辅助请求、且最后一条在 TTL 内才注入；截字防膨胀。不进缓存块/不污染历史(与 tg_digest 同款安全模式)。"""
+    if PARTITION_SESSION_ID and get_active_session_id() != PARTITION_SESSION_ID:
+        return ""
+    if _request_skip_log.get():
+        return ""
+    try:
+        rows = await get_conversation_messages(CYBERBOSS_LINE_ID, limit=10000)
+        if not rows:
+            return ""
+        rows = rows[-(CYBERBOSS_DIGEST_ROUNDS * 2):]
+        last_ts = rows[-1].get("created_at")
+        if last_ts is not None:
+            try:
+                if getattr(last_ts, "tzinfo", None) is None:
+                    last_ts = last_ts.replace(tzinfo=timezone.utc)
+                if (datetime.now(timezone.utc) - last_ts).total_seconds() > CYBERBOSS_DIGEST_TTL_HOURS * 3600:
+                    return ""      # 太旧不注入,靠记忆库召回
+            except Exception:
+                pass
+        lines = []
+        for r in rows:
+            c = (r.get("content") or "").strip()
+            if not c:
+                continue
+            role = USER_NAME if r.get("role") == "user" else (AI_NAME or "我")
+            lines.append(f"{role}: {c}")
+        body = "\n".join(lines).strip()
+        if not body:
+            return ""
+        if len(body) > CYBERBOSS_DIGEST_CHAR_CAP:
+            body = "…" + body[-CYBERBOSS_DIGEST_CHAR_CAP:]
+        return (f"\n\n【TG陪伴bot近况（{USER_NAME}最近在 Telegram 陪伴bot那边的真实对话——那也是你的一个分身在陪她，"
+                f"自然接着、别像不知道，也别当成别人）】\n{body}")
+    except Exception as _e:
+        print(f"⚠️ cyberboss近况小抄组装失败: {_e}")
+        return ""
+
+
 def _compose_identity_anchor() -> str:
     """非主线(rp)专用：在当前消息最贴近生成点处塞一句强身份锚，防止 V 写长RP时认错人/写得泛。主线返回空。"""
     main_sid = PARTITION_SESSION_ID
@@ -2750,6 +2796,10 @@ async def build_partitioned_messages(
         if _tg_digest:
             parts.append(_tg_digest)
 
+        _cb_digest = await _compose_cyberboss_digest_for_main()    # 主线实时借 cyberboss(TG陪伴bot) 线近况(零时差)
+        if _cb_digest:
+            parts.append(_cb_digest)
+
         result.append(_assemble_current_user(parts, current_user_msg))
     
     bp_count = 1 + (1 if summary_parts else 0) + (1 if cleaned_a else 0) + (1 if b_msgs else 0)
@@ -2829,6 +2879,10 @@ async def _build_basic_cached(
         _tg_digest = await _compose_tg_digest_for_main()    # 主线读 TG /同步 递来的近况小抄(零时差)
         if _tg_digest:
             parts.append(_tg_digest)
+
+        _cb_digest = await _compose_cyberboss_digest_for_main()    # 主线实时借 cyberboss(TG陪伴bot) 线近况(零时差)
+        if _cb_digest:
+            parts.append(_cb_digest)
 
         result.append(_assemble_current_user(parts, current_user_msg))
     
@@ -4095,6 +4149,46 @@ async def api_create_memory(request: Request):
     source_session = str(data.get("source_session") or "cyberboss").strip()[:64] or "cyberboss"
     await save_memory(content, importance=importance, source_session=source_session)
     return {"status": "ok"}
+
+
+@app.post("/api/line/log")
+async def api_line_log(request: Request):
+    """外部代理(cyberboss)把对话逐字实时抄送进指定线（只入库，不调模型；供主线零时差借阅+回忆墙跨线合读）"""
+    data = await request.json()
+    line = str(data.get("line") or CYBERBOSS_LINE_ID).strip()[:32] or CYBERBOSS_LINE_ID
+    role = str(data.get("role") or "").strip()
+    content = str(data.get("content") or "").strip()
+    if role not in ("user", "assistant"):
+        return {"error": "role 必须是 user 或 assistant"}
+    if not content:
+        return {"error": "content 不能为空"}
+    if len(content) > 8000:
+        content = content[:8000]
+    await save_message(line, role, content, model=str(data.get("model") or "cyberboss"))
+    return {"status": "ok"}
+
+
+@app.get("/api/line/recent")
+async def api_line_recent(line: str = "", rounds: int = 9):
+    """外部代理(cyberboss)读某条线的近况：滚动摘要 + 最近N轮逐字（line 缺省=主线）"""
+    sid = (line or "").strip() or PARTITION_SESSION_ID
+    rounds = max(1, min(20, int(rounds or 9)))
+    try:
+        st = await get_session_cache_state(sid)
+        summary_parts = st.get("summary_parts") or []
+        early = (st.get("early_summary") or "").strip()
+        rows = await get_conversation_messages(sid, limit=10000)
+        rnds = group_by_rounds([{"role": r.get("role"), "content": (r.get("content") or "")} for r in rows])
+        msgs = []
+        for rnd in rnds[-rounds:]:
+            for m in rnd:
+                c = (m.get("content") or "").strip()
+                if c:
+                    msgs.append({"role": m.get("role"), "content": c})
+        summary_segments = ([f"〔更早〕{early}"] if early else []) + list(summary_parts)
+        return {"line": sid, "summary": "\n".join(summary_segments).strip(), "recent": msgs}
+    except Exception as e:
+        return {"error": str(e), "line": sid}
 
 
 @app.put("/api/memories/{memory_id}")
