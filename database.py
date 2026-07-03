@@ -1199,7 +1199,7 @@ async def get_fragment_ids_for_date(date_s) -> list:
         rows = await conn.fetch(
             "SELECT id FROM memories "
             "WHERE layer = 1 AND is_active = TRUE AND mw_meta IS NULL "
-            "AND (event_date = $1::date OR (event_date IS NULL AND created_at >= $2 AND created_at < $3)) "
+            "AND (event_date = $1::text::date OR (event_date IS NULL AND created_at >= $2 AND created_at < $3)) "
             "AND content NOT LIKE '%晚上做的一场梦，不是真实发生的事%'",
             date_str, start_utc, end_utc)
         return [r["id"] for r in rows]
@@ -1211,9 +1211,9 @@ async def get_memorywall_summary_by_date(date_s: str) -> str:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT mw_meta->>'summary' AS summary FROM memories "
-            "WHERE mw_meta IS NOT NULL AND is_active = TRUE AND event_date = $1::date "
+            "WHERE mw_meta IS NOT NULL AND is_active = TRUE AND event_date = $1::text::date "
             "ORDER BY created_at DESC LIMIT 1",
-            date_s)
+            str(date_s))
         return (row["summary"] or "").strip() if row else ""
 
 

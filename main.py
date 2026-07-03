@@ -1563,13 +1563,20 @@ async def refresh_l2(session_id: str) -> str:
     """生成并存今日浓缩；跨天则把昨日 today 转成一句桥（临时，L3 上线后撤）。"""
     today_s = str((datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date())
     if _l2_state.get("date") and _l2_state["date"] != today_s:
-        _yday = _l2_state["date"]  # 刚结束的那天
-        _mw_summary = await get_memorywall_summary_by_date(_yday)
+        # 昨日桥用「真实的昨天」：状态日期可能因刷新中断冻在多天前，别把一周前当"昨日"
+        _yday = str((datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date() - timedelta(days=1))
+        _mw_summary = ""
+        try:
+            _mw_summary = await get_memorywall_summary_by_date(_yday)
+        except Exception as _be:
+            print(f"⚠️ 昨日桥读取失败(不阻塞今日浓缩刷新): {_be}")
         if _mw_summary:
             _l2_state["bridge"] = _mw_summary  # 昨日桥接管：用昨日回忆墙的真实小结(不用梦)
-        elif (_l2_state.get("today") or "").strip():
+        elif (_l2_state.get("today") or "").strip() and _l2_state["date"] == _yday:
             prev = _l2_state["today"].strip()
             _l2_state["bridge"] = (prev.split("。")[0][:120] or prev[:120])  # 还没梦→回退旧截断
+        else:
+            _l2_state["bridge"] = ""  # 旧浓缩不是昨天的→宁可没有桥,别拿更早的天冒充昨日
         _l2_state["today"] = ""
     digest = await generate_today_digest(session_id)
     if digest:
@@ -1591,6 +1598,9 @@ def _compose_l2_block() -> str:
     if b:
         blocks.append(f"〔昨日〕{b}")
     t = (_l2_state.get("today") or "").strip()
+    # 日期守卫：状态不是今天的(重启恢复的旧浓缩/刷新失败冻住)→旧"今日"绝不冒充今天注入
+    if t and _l2_state.get("date") != str((datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date()):
+        t = ""
     if t:
         blocks.append(t)
     if not blocks:
@@ -3222,12 +3232,15 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
         
         _round_counter += 1
 
-        # ② L2今日：每 N 轮刷新今日浓缩（独立于提取间隔，后台不阻塞回复）
-        if L2_TODAY_ENABLED and L2_REFRESH_N > 0 and (_round_counter % L2_REFRESH_N == 0):
-            try:
-                asyncio.create_task(refresh_l2(session_id))
-            except Exception as _le:
-                print(f"⚠️ L2刷新调度失败: {_le}")
+        # ② L2今日：每 N 轮刷新今日浓缩（独立于提取间隔，后台不阻塞回复）。
+        # 状态日期不是今天(跨天第一句/部署重启把轮次计数清零)也立刻刷,别让旧"今日"一直挂着。
+        if L2_TODAY_ENABLED and L2_REFRESH_N > 0:
+            _l2_today_s = str((datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date())
+            if (_round_counter % L2_REFRESH_N == 0) or (_l2_state.get("date") != _l2_today_s):
+                try:
+                    asyncio.create_task(refresh_l2(session_id))
+                except Exception as _le:
+                    print(f"⚠️ L2刷新调度失败: {_le}")
 
         # ③-2 做梦懒触发：本地日变了(跨天)的第一句话→后台补做未覆盖的过去日(含昨天)。
         # 请求触发、无需 cron/常驻；维护成本只在跨天那一次。
