@@ -558,6 +558,17 @@ def extract_search_keywords(query: str) -> List[str]:
     if len(cjk_singles) <= 20:
         keywords.update(cjk_singles)
 
+    # 短语兜底：自造词/暗号（如"砍蛋"类新词）不在 jieba 词典时会被拆成单字，
+    # 关键词路只剩零散单字、向量路对自造词又语义乱猜 → 精确命中全靠运气。
+    # 短查询（2-8字、无空白、含CJK）把整句原样也作为一个短语关键词（ILIKE 子串精确匹配），
+    # 配合"看不懂的词原样单独搜"的工具守则，保证任何专属词按原字必中且权重最高（df 稀有）。
+    _phrase = cleaned.strip()
+    if (2 <= len(_phrase) <= 8
+            and not re.search(r"\s", _phrase)
+            and any(CJK_CHAR_PATTERN.match(c) for c in _phrase)
+            and _phrase not in _STOP_WORDS):
+        keywords.add(_phrase)
+
     return list(keywords)
 
 
