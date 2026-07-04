@@ -4611,6 +4611,8 @@ PUSH_DEFAULTS = {
     "push_quiet_urgent": True,    # 免打扰时段:吵架等未解情绪可破例发1条
     "push_probability":  0.25,    # 投骰子:到时间后每次检查有此概率才"动念"去找你(越小越随性)
     "push_icon":         "https://pic1.imgdb.cn/item/6a3ce18bbb21102f81d40039.jpg",  # 推送图标(公网直链,需 iOS15+;留空=默认图标)
+    "push_tg_token":     "",      # 双投递:vesper TG bot 的 token(留空=只发Bark)
+    "push_tg_chat":      "",      # 双投递:主人的 TG chat_id
 }
 
 
@@ -4814,7 +4816,14 @@ async def maybe_send_proactive(force: bool = False) -> dict:
         msgs = await get_recent_messages(sid, 40)
     except Exception as e:
         return {"sent": False, "reason": f"history_error:{e}"}
-    if not msgs:
+    # 盯两条线：cyberboss(TG)线也算"听到她声音"——她正在TG那边聊着,就不算失联,别隔空夺命催
+    cb_msgs = []
+    if CYBERBOSS_LINE_ID and CYBERBOSS_LINE_ID != sid:
+        try:
+            cb_msgs = await get_recent_messages(CYBERBOSS_LINE_ID, 40)
+        except Exception:
+            cb_msgs = []
+    if not msgs and not cb_msgs:
         return {"sent": False, "reason": "no_history"}
 
     now = datetime.now(timezone.utc)
@@ -4823,9 +4832,17 @@ async def maybe_send_proactive(force: bool = False) -> dict:
         if m["role"] == "user":
             last_user = m
             break
-    if not last_user:
+    cb_last_user = None
+    for m in reversed(cb_msgs):
+        if m["role"] == "user":
+            cb_last_user = m
+            break
+    if not last_user and not cb_last_user:
         return {"sent": False, "reason": "no_user_msg"}
-    last_user_ts = _ts_aware(last_user["created_at"])
+    # 沉默时长 = 距两条线里最近一次她说话
+    _cand = sorted(((_ts_aware(u["created_at"]), u) for u in (last_user, cb_last_user) if u),
+                   key=lambda x: x[0])
+    last_user_ts, last_user = _cand[-1]
 
     pushes_since = [m for m in msgs if m["role"] == "assistant"
                     and _is_push_msg(m["metadata"]) and _ts_aware(m["created_at"]) > last_user_ts]
@@ -4855,10 +4872,15 @@ async def maybe_send_proactive(force: bool = False) -> dict:
     if not force and in_quiet and not cfg["push_quiet_urgent"]:
         return {"sent": False, "reason": "quiet_hours"}
 
+    # 两线合并按时间排序取尾14条(TG线的话带标注)；她最近那句给全文(≤400字)，其余截120字省token
+    _tagged = [(m, "") for m in msgs[-14:]] + [(m, "(在TG)") for m in cb_msgs[-14:]]
+    _tagged = [t for t in _tagged
+               if t[0]["role"] in ("user", "assistant") and (t[0]["content"] or "").strip()]
+    _tagged.sort(key=lambda t: _ts_aware(t[0]["created_at"]))
+    _tagged = _tagged[-14:]
     transcript = "\n".join(
-        # 你最近那句话给模型看全文(≤400字)，其余仍截120字省 token
-        f"{'我' if m['role'] == 'assistant' else USER_NAME}: {(m['content'] or '').strip()[:400 if m is last_user else 120]}"
-        for m in msgs[-12:] if m["role"] in ("user", "assistant") and (m["content"] or "").strip()
+        f"{('我' if m['role'] == 'assistant' else USER_NAME)}{tag}: {(m['content'] or '').strip()[:400 if m is last_user else 120]}"
+        for m, tag in _tagged
     )
     persona = ""
     try:
@@ -4898,23 +4920,37 @@ async def maybe_send_proactive(force: bool = False) -> dict:
             return {"sent": False, "reason": "quiet_hours_not_urgent"}
 
     title = AI_NAME or "AI"
-    ok = await _bark_push(cfg["bark_url"], title, text, urgent=urgent, icon=cfg.get("push_icon", ""))
-    if not ok:
-        return {"sent": False, "reason": "bark_failed", "message": text}
-    # 同时把这条主动私信发到 Telegram(若已绑定)
+    ok_bark = await _bark_push(cfg["bark_url"], title, text, urgent=urgent, icon=cfg.get("push_icon", ""))
+    # 双投递：vesper TG bot 也发一份(梯子不稳时 Bark 兜底；TG 可直接回复接着聊)
+    ok_tg = False
+    if cfg.get("push_tg_token") and cfg.get("push_tg_chat"):
+        try:
+            _r = await _tg_api(cfg["push_tg_token"], "sendMessage",
+                               {"chat_id": cfg["push_tg_chat"], "text": text,
+                                "disable_web_page_preview": True})
+            ok_tg = bool(_r.get("ok"))
+        except Exception as _te:
+            print(f"⚠️ 主动私信TG(vesper)投递失败: {_te}")
+    # 旧 TG bot 通道保留(当前已停用,不影响)
     try:
         _tgc = await get_tg_config()
         if _tgc["tg_enabled"] and _tgc["tg_bot_token"] and _tgc["tg_chat_id"]:
             await _tg_send(_tgc["tg_bot_token"], _tgc["tg_chat_id"], text)
     except Exception as _te:
         print(f"⚠️ TG 主动推送失败: {_te}")
+    if not ok_bark and not ok_tg:
+        return {"sent": False, "reason": "delivery_failed", "message": text}
     try:
         meta = _json_push.dumps({"proactive_push": True, "urgent": urgent})
         await save_message(sid, "assistant", text, PROACTIVE_MODEL, metadata=meta)
+        # TG 送达成功就抄一份进 cyberboss 线：TG分身开新线程时"重开前尾巴"能看到这条,接得住她的回复
+        if ok_tg and CYBERBOSS_LINE_ID and CYBERBOSS_LINE_ID != sid:
+            await save_message(CYBERBOSS_LINE_ID, "assistant", text, PROACTIVE_MODEL, metadata=meta)
     except Exception as e:
         print(f"⚠️ 主动私信存库失败: {e}")
-    print(f"💌 主动私信已推送(urgent={urgent}): {text[:40]}")
-    return {"sent": True, "message": text, "urgent": urgent, "streak": streak + 1}
+    print(f"💌 主动私信已推送(bark={ok_bark} tg={ok_tg} urgent={urgent}): {text[:40]}")
+    return {"sent": True, "message": text, "urgent": urgent, "streak": streak + 1,
+            "bark": ok_bark, "tg": ok_tg}
 
 
 @app.get("/api/push/config")
