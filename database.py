@@ -1193,8 +1193,10 @@ async def get_avg_arousal_for_date(date_s) -> float:
 
 
 async def get_fragment_ids_for_date(date_s) -> list:
-    """某个本地日期当天、还活跃的 layer1 碎片 id 列表(排除做梦写的可检索条目)，
+    """某个本地日期当天、还活跃的 layer1 碎片 id 列表(排除做梦写的可检索条目和RP归档总结)，
     供回忆墙生成后归档当天碎片用(回忆墙已经覆盖,碎片留着只是冗余,占检索名额)。
+    RP归档总结豁免：archive_line() 写的那条是整条RP线的唯一可检索精华(回忆墙日记是文学化叙事,
+    替代不了它)，被扫掉=其它线(TG/主线)永远搜不到这场RP → 曾造成"归档后TG说没搜到"事故(2026-07-04)。
     匹配口径：event_date有值就按它(历史导入数据的真实事件日，created_at是导入时间不可信)；
     event_date为空(老的实时碎片，写入时没补这个字段)才退回按created_at落在本地这一天判断。"""
     date_str = date_s if isinstance(date_s, str) else str(date_s)
@@ -1211,7 +1213,8 @@ async def get_fragment_ids_for_date(date_s) -> list:
             "SELECT id FROM memories "
             "WHERE layer = 1 AND is_active = TRUE AND mw_meta IS NULL "
             "AND (event_date = $1::text::date OR (event_date IS NULL AND created_at >= $2 AND created_at < $3)) "
-            "AND content NOT LIKE '%晚上做的一场梦，不是真实发生的事%'",
+            "AND content NOT LIKE '%晚上做的一场梦，不是真实发生的事%' "
+            "AND content NOT LIKE '%一段亲密/RP 互动的回顾%'",
             date_str, start_utc, end_utc)
         return [r["id"] for r in rows]
 
