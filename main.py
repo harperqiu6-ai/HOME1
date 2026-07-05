@@ -276,6 +276,8 @@ SCRATCHPAD_MAIN_MIN_CHARS = int(os.getenv("SCRATCHPAD_MAIN_MIN_CHARS", "50"))  #
 SCRATCHPAD_LONG_MIN_CHARS = int(os.getenv("SCRATCHPAD_LONG_MIN_CHARS", "80"))  # 主线 ≥80字 无脑触发
 SCRATCHPAD_RP_MIN_CHARS = int(os.getenv("SCRATCHPAD_RP_MIN_CHARS", "15"))  # RP 线 ≥此值触发
 SCRATCHPAD_TG_ENABLED = os.getenv("SCRATCHPAD_TG_ENABLED", "false").lower() == "true"  # TG 短聊默认关
+# 外部代理召回入口(/api/recall/agent, cyberboss 每轮用)：消息≥这么多字才走递纸条扩展，更短直接普通混合搜索
+SCRATCHPAD_AGENT_MIN_CHARS = int(os.getenv("SCRATCHPAD_AGENT_MIN_CHARS", "8"))
 # 触发关键词（命中 + 字数过中门槛 = 触发）
 _DEFAULT_SCRATCHPAD_KEYWORDS = (
     "写,讲讲,聊聊,回忆,回顾,总结,复盘,"
@@ -4186,6 +4188,61 @@ async def api_top_memories(limit: int = 6, min_importance: int = 7, max_chars: i
         return {"facts": facts, "total": len(facts)}
     except Exception as e:
         return {"error": str(e), "facts": []}
+
+
+@app.post("/api/recall/agent")
+async def api_recall_agent(request: Request):
+    """外部代理(cyberboss)每轮开口前的自动召回入口：消息够长走「递纸条」扩展召回(deepseek 扩多查询)，
+    太短/纸条失败降级普通混合搜索。服务端硬截断（条数+单条字数），适配器拿到就能直接拼进轮次文本。"""
+    if not MEMORY_ENABLED:
+        return {"memories": [], "mode": "disabled"}
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    q = str(data.get("message") or "").strip()
+    try:
+        limit = max(1, min(8, int(data.get("limit") or 5)))
+    except (TypeError, ValueError):
+        limit = 5
+    try:
+        max_chars = max(60, min(300, int(data.get("max_chars") or 220)))
+    except (TypeError, ValueError):
+        max_chars = 220
+    if len(q) < 2:
+        return {"memories": [], "mode": "skip"}
+    mems = []
+    mode = "plain"
+    try:
+        if SCRATCHPAD_ENABLED and SCRATCHPAD_API_KEY and len(q) >= SCRATCHPAD_AGENT_MIN_CHARS:
+            mems = await _expand_recall_with_scratchpad(q, limit)
+            if mems:
+                mode = "scratchpad"
+        if not mems:
+            mems = await search_memories(q, limit=limit)
+    except Exception as e:
+        print(f"📝 agent召回失败: {e}")
+        return {"memories": [], "mode": "error"}
+    tz_offset = timezone(timedelta(hours=TIMEZONE_HOURS))
+    out = []
+    for m in mems[:limit]:
+        c = (m.get("content") or "").strip()
+        if not c:
+            continue
+        if len(c) > max_chars:
+            c = c[:max_chars].rstrip() + "…"
+        date_s = ""
+        dt = m.get("created_at")
+        if dt is not None:
+            try:
+                if getattr(dt, "tzinfo", None) is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                date_s = dt.astimezone(tz_offset).strftime("%Y-%m-%d")
+            except Exception:
+                date_s = ""
+        out.append({"id": m.get("id"), "date": date_s, "content": c})
+    print(f"📝 agent召回({mode}): {q[:40]!r} → {len(out)}条")
+    return {"memories": out, "mode": mode}
 
 
 @app.post("/api/memories/create")
