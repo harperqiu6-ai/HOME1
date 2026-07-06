@@ -1628,7 +1628,8 @@ async def generate_dream(session_id: str, date_s: str) -> dict:
     if not session_id or not date_s:
         return None
     try:
-        rows = await get_conversation_messages(session_id, limit=10000)
+        # 跨线取材(同日记的合读)：只在 TG(cyberboss) 线聊的日子主线是空的，梦会没素材
+        rows = await get_all_conversations_for_date(date_s)
     except Exception:
         return None
     convo = ""
@@ -1853,19 +1854,13 @@ async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: l
     try:
         if not dry_run:
             _dream_running = True
-        rows = await get_conversation_messages(session_id, limit=10000)
         today_d = (datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date()
         today_s = str(today_d)
         yest_s = str(today_d - timedelta(days=1))
-        conv_dates = set()
-        for m in rows:
-            ts = m.get("created_at")
-            try:
-                if getattr(ts, "tzinfo", None) is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                conv_dates.add(str((ts + timedelta(hours=TIMEZONE_HOURS)).date()))
-            except Exception:
-                pass
+        # 选目标日跨线扫：只在 TG(cyberboss) 线聊的日子主线是空的，按单线扫会整天漏掉
+        # 日记/梦(2026-07-05 首个纯TG日因此没生成回忆墙)。日记正文本就跨线合读，选日对齐。
+        from database import get_all_conversation_dates
+        conv_dates = await get_all_conversation_dates()
         have = await get_dream_dates()
         mw = await get_memorywall_dates()
         if only_dates:

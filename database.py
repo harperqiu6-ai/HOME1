@@ -2231,6 +2231,20 @@ async def archive_line_conversations(session_id: str) -> dict:
     return {"moved": _rowcount(res), "archive_session_id": archive_id}
 
 
+async def get_all_conversation_dates(days_back: int = 60) -> set:
+    """最近 days_back 天里、**所有对话线**有消息的本地日期集合(字符串 YYYY-MM-DD)。
+    供做梦/回忆墙懒触发选目标日用：只在 TG(cyberboss) 线聊的日子主线是空的，
+    按单线扫会整天漏掉(2026-07-05 首个纯TG日因此没生成回忆墙)。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT DISTINCT ((created_at AT TIME ZONE 'UTC') + INTERVAL '{int(TIMEZONE_HOURS)} hours')::date AS d
+            FROM conversations
+            WHERE created_at > NOW() - INTERVAL '{int(days_back)} days'
+        """)
+        return {str(r["d"]) for r in rows}
+
+
 async def get_all_conversations_for_date(date_s) -> list:
     """某个本地日期当天、**所有对话线**的消息(按时间正序，带 session_id)。
     供回忆墙日记"跨线合读"用：让当天 RP 线等其它线的内容也折进同一篇当日回忆墙。"""
