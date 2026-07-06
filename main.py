@@ -6177,8 +6177,32 @@ async def consolidate_memories_for_date_range(start_date, end_date):
     return result
 
 
+CONSOLIDATE_CHUNK_SIZE = int(os.getenv("CONSOLIDATE_CHUNK_SIZE", "40"))
+
+
 async def _consolidate_fragment_batch(fragments, event_date):
-    """整理一批碎片的核心：AI 按事件分组合并 → 写 layer2 事件记忆 → 停用碎片"""
+    """整理一批碎片：超过 CONSOLIDATE_CHUNK_SIZE 条先按时间顺序分块，每块单独调 AI。
+    大日子(2026-07-05 有 110 条)一次全喂，输出必撞 max_tokens 截断，事件被砍掉大半。"""
+    if len(fragments) <= CONSOLIDATE_CHUNK_SIZE:
+        return await _consolidate_fragment_chunk(fragments, event_date)
+
+    total = {"status": "ok", "fragments_processed": 0, "events_created": 0,
+             "fragments_uncovered": 0, "chunks": []}
+    for i in range(0, len(fragments), CONSOLIDATE_CHUNK_SIZE):
+        r = await _consolidate_fragment_chunk(fragments[i:i + CONSOLIDATE_CHUNK_SIZE], event_date)
+        total["chunks"].append(r)
+        if r.get("status") == "ok":
+            total["fragments_processed"] += r.get("fragments_processed", 0)
+            total["events_created"] += r.get("events_created", 0)
+            total["fragments_uncovered"] += r.get("fragments_uncovered", 0)
+        else:
+            # 某块失败不影响其它块；失败块的碎片未被停用，下一轮整理自动重试
+            total["status"] = "partial"
+    return total
+
+
+async def _consolidate_fragment_chunk(fragments, event_date):
+    """整理一块碎片的核心：AI 按事件分组合并 → 写 layer2 事件记忆 → 停用被合并的碎片"""
     import re
 
     # 构建碎片文本
@@ -6238,7 +6262,12 @@ async def _consolidate_fragment_batch(fragments, event_date):
 
             data = response.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            
+            if data.get("choices", [{}])[0].get("finish_reason") == "length":
+                # 输出被 max_tokens 截断：直接放弃本块（碎片保持活跃，下轮重试），
+                # 绝不拿半截 JSON 去"修复"——修出来的残缺事件会让漏掉的碎片被误停用
+                return {"status": "error",
+                        "error": f"输出被max_tokens截断(碎片{len(fragments)}条)，本块跳过"}
+
             # 解析 JSON（三层容错）
             json_match = re.search(r'\[[\s\S]*\]', content)
             if json_match:
@@ -6287,8 +6316,17 @@ async def _consolidate_fragment_batch(fragments, event_date):
             
             # 创建事件记忆并停用碎片
             created_count = 0
+            fed_ids = {f['id'] for f in fragments}
+            covered_ids = set()
             for event in events:
-                merged_ids = event.get("merged_ids", [])
+                merged_ids = []
+                for x in event.get("merged_ids", []):
+                    try:
+                        xi = int(x)
+                    except (TypeError, ValueError):
+                        continue
+                    if xi in fed_ids:  # 只认本块真喂进去的 ID，防模型幻觉编号
+                        merged_ids.append(xi)
                 if merged_ids:
                     await create_event_memory(
                         title=event.get("title", ""),
@@ -6298,15 +6336,18 @@ async def _consolidate_fragment_batch(fragments, event_date):
                         merged_from=merged_ids
                     )
                     created_count += 1
-            
-            # 停用所有已处理的碎片
-            all_fragment_ids = [f['id'] for f in fragments]
-            await deactivate_memories(all_fragment_ids)
-            
+                    covered_ids.update(merged_ids)
+
+            # 只停用真的被合并进事件的碎片——AI 漏掉的碎片保持活跃等下轮，
+            # 绝不"喂了就算处理过"整批停用(2026-07-05 因此丢过一整晚 100 条)
+            if covered_ids:
+                await deactivate_memories(sorted(covered_ids))
+
             return {
                 "status": "ok",
                 "fragments_processed": len(fragments),
-                "events_created": created_count
+                "events_created": created_count,
+                "fragments_uncovered": len(fed_ids - covered_ids)
             }
             
     except Exception as e:
