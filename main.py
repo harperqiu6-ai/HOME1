@@ -704,12 +704,12 @@ def _find_all(hay: str, needle: str) -> list:
     return out
 
 
-def _mem_snippet(text: str, keywords=None) -> str:
-    """把长记忆压到 MEMORY_INJECT_CHAR_CAP 字以内，但**围绕所有命中关键词的多个片段各取一小段拼起来**
+def _mem_snippet(text: str, keywords=None, cap: int = None) -> str:
+    """把长记忆压到 cap 字以内（默认 MEMORY_INJECT_CHAR_CAP），但**围绕所有命中关键词的多个片段各取一小段拼起来**
     （用 … 连接），保证同一条长记忆里**分散在不同位置的多个相关事实都能被带出来**，不会因只取单个窗口而断章。
     无任何关键词命中时退化为取开头。短记忆原样返回。"""
     t = (text or "").strip()
-    cap = MEMORY_INJECT_CHAR_CAP
+    cap = MEMORY_INJECT_CHAR_CAP if cap is None else cap
     if cap <= 0 or len(t) <= cap:
         return t
     kws = [str(k) for k in (keywords or []) if k]
@@ -4201,9 +4201,9 @@ async def api_recall_agent(request: Request):
     except (TypeError, ValueError):
         limit = 5
     try:
-        max_chars = max(60, min(300, int(data.get("max_chars") or 220)))
+        max_chars = max(60, min(600, int(data.get("max_chars") or 300)))
     except (TypeError, ValueError):
-        max_chars = 220
+        max_chars = 300
     if len(q) < 2:
         return {"memories": [], "mode": "skip"}
     mems = []
@@ -4218,6 +4218,13 @@ async def api_recall_agent(request: Request):
     except Exception as e:
         print(f"📝 agent召回失败: {e}")
         return {"memories": [], "mode": "error"}
+    import re as _re
+    try:
+        q_kws = list(extract_search_keywords(q) or [])
+    except Exception:
+        q_kws = []
+    if 2 <= len(q) <= 12 and q not in q_kws:
+        q_kws.append(q)  # 短查询整句也当关键词（短语兜底同款）
     tz_offset = timezone(timedelta(hours=TIMEZONE_HOURS))
     out = []
     for m in mems[:limit]:
@@ -4225,7 +4232,14 @@ async def api_recall_agent(request: Request):
         if not c:
             continue
         if len(c) > max_chars:
-            c = c[:max_chars].rstrip() + "…"
+            # 回忆墙/归档类结构化条目：给〔检索摘要〕(为检索而写的浓缩)，别掐正文开头
+            _mm = _re.search(r'〔检索摘要〕\s*(.+?)(?:\n\n|$)', c, _re.S)
+            if c.startswith("【回忆") and _mm:
+                _head = c.split("\n", 1)[0].strip()
+                c = (_head + " " + _mm.group(1).strip())[:max_chars].rstrip()
+            else:
+                # 围绕命中关键词的窗口截取——治"长记忆掐头300字，关键细节在后半段"(2026-07-06 萤火虫632事故)
+                c = _mem_snippet(c, keywords=q_kws, cap=max_chars)
         date_s = ""
         dt = m.get("created_at")
         if dt is not None:
