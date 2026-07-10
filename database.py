@@ -1624,7 +1624,7 @@ async def search_memories(query: str, limit: int = 10):
 
         sql = f"""
             SELECT
-                id, content, importance, created_at, mw_meta, valence, arousal,
+                id, content, importance, created_at, event_date, mw_meta, valence, arousal,
                 ({whit_expr}) AS whit,
                 ({WEIGHT_KEYWORD} * ({whit_expr}) / {sum_w:.4f}) AS kw_score,
                 (
@@ -1803,7 +1803,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
             params.append(limit * 3)
 
             kw_sql = f"""
-                SELECT id, content, importance, created_at,
+                SELECT id, content, importance, created_at, event_date,
                        ({hit_count_expr}) AS hit_count,
                        (({whit_expr}) / {sum_w:.4f}) AS kw_score
                 FROM memories
@@ -1821,6 +1821,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
                     'content': r['content'],
                     'importance': r['importance'],
                     'created_at': r['created_at'],
+                    'event_date': r['event_date'],
                     'hit_count': r['hit_count'],
                     'kw_score': float(r['kw_score']),
                     'similarity': 0.0,
@@ -1831,7 +1832,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
             if HAS_PGVECTOR:
                 vec_str = '[' + ','.join(str(f) for f in query_embedding) + ']'
                 sem_rows = await conn.fetch("""
-                    SELECT id, content, importance, created_at,
+                    SELECT id, content, importance, created_at, event_date,
                            1 - (embedding <=> $1::vector) as similarity
                     FROM memories
                     WHERE embedding IS NOT NULL AND is_active = TRUE
@@ -1843,7 +1844,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
                 # Python端计算cosine
                 import json
                 all_mem = await conn.fetch("""
-                    SELECT id, content, importance, created_at, embedding_json
+                    SELECT id, content, importance, created_at, event_date, embedding_json
                     FROM memories WHERE embedding_json IS NOT NULL AND is_active = TRUE
                       AND content IS NOT NULL AND btrim(content) <> ''
                 """)
@@ -1871,6 +1872,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
                         'content': r['content'],
                         'importance': r['importance'],
                         'created_at': r['created_at'],
+                        'event_date': r['event_date'],
                         'hit_count': 0,
                         'kw_score': 0.0,
                         'similarity': sim,
@@ -1912,6 +1914,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
                 'content': info['content'],
                 'importance': info['importance'],
                 'created_at': info['created_at'],
+                'event_date': info.get('event_date'),
                 'hit_count': info['hit_count'],
                 'similarity': info['similarity'],
                 'score': score,

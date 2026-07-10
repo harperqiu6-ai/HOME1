@@ -744,6 +744,34 @@ def _mem_snippet(text: str, keywords=None, cap: int = None) -> str:
     return res
 
 
+def _mem_display_date(mem) -> str:
+    """记忆注入时的展示日期：优先 event_date（真实事件日），没有才退回 created_at 折算本地日。
+    created_at 是"入库时间"——整理/迁移产生的记忆入库日≠事件日（2026-07-10 时差事故：
+    前天的对话次日凌晨整理成事件记忆，标签显示入库日，被模型当成"昨天发生的"）。"""
+    try:
+        ed = mem.get("event_date")
+    except Exception:
+        ed = None
+    if ed:
+        s = str(ed)[:10]
+        if len(s) == 10 and s[4] == "-":
+            return s
+    try:
+        ca = mem.get("created_at")
+    except Exception:
+        ca = None
+    if not ca:
+        return ""
+    try:
+        if isinstance(ca, str):
+            dt = datetime.strptime(ca[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        else:
+            dt = ca if getattr(ca, "tzinfo", None) else ca.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone(timedelta(hours=TIMEZONE_HOURS))).strftime("%Y-%m-%d")
+    except Exception:
+        return str(ca)[:10]
+
+
 # ============================================================
 # 「递纸条」召回扩展 — 实现
 # ============================================================
@@ -1077,19 +1105,12 @@ async def build_system_prompt_with_memories(user_message: str, drift: bool = Tru
             except Exception as _e:
                 print(f"⚠️ 心情漂移调度失败: {_e}")
 
-        # 格式化记忆文本（带日期，帮助模型判断新旧）
+        # 格式化记忆文本（带日期，帮助模型判断新旧；日期=事件日优先，见 _mem_display_date）
         _kws = extract_search_keywords(user_message)
         memory_lines = []
         for mem in memories:
-            date_str = ""
-            if mem.get("created_at"):
-                try:
-                    utc_str = str(mem['created_at'])[:19]
-                    utc_dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                    local_dt = utc_dt + timedelta(hours=TIMEZONE_HOURS)
-                    date_str = f"[{local_dt.strftime('%Y-%m-%d')}] "
-                except:
-                    date_str = f"[{str(mem['created_at'])[:10]}] "
+            _d = _mem_display_date(mem)
+            date_str = f"[{_d}] " if _d else ""
             _c = (mem.get('content') or '').strip()
             if not _c:
                 continue  # 空 content 兜底：跳过（双保险，绝不让空行崩注入）
@@ -1662,14 +1683,8 @@ async def generate_dream(session_id: str, date_s: str) -> dict:
         _lines = []
         for m in _old_mems[:8]:
             _c = (m.get("content") or "").strip()[:250]
-            _date = ""
-            if m.get("created_at"):
-                try:
-                    _utc = str(m["created_at"])[:19]
-                    _dt = datetime.strptime(_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                    _date = f"[{(_dt + timedelta(hours=TIMEZONE_HOURS)).strftime('%Y-%m-%d')}] "
-                except Exception:
-                    pass
+            _dd = _mem_display_date(m)
+            _date = f"[{_dd}] " if _dd else ""
             if _c:
                 _lines.append(f"- {_date}{_c}")
         if _lines:
@@ -3085,15 +3100,8 @@ async def build_memory_text(user_message: str, drift: bool = True) -> str:
         _kws = extract_search_keywords(user_message)
         memory_lines = []
         for idx, mem in enumerate(memories):
-            date_str = ""
-            if mem.get("created_at"):
-                try:
-                    utc_str = str(mem['created_at'])[:19]
-                    utc_dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                    local_dt = utc_dt + timedelta(hours=TIMEZONE_HOURS)
-                    date_str = f"[{local_dt.strftime('%Y-%m-%d')}] "
-                except:
-                    date_str = f"[{str(mem['created_at'])[:10]}] "
+            _d = _mem_display_date(mem)
+            date_str = f"[{_d}] " if _d else ""
             _w = mood_word(mem.get("valence"), mem.get("arousal"))
             _feel = f"（当时的感觉：{_w}）" if _w else ""
             mw = mem.get("mw_meta")
@@ -4225,7 +4233,6 @@ async def api_recall_agent(request: Request):
         q_kws = []
     if 2 <= len(q) <= 12 and q not in q_kws:
         q_kws.append(q)  # 短查询整句也当关键词（短语兜底同款）
-    tz_offset = timezone(timedelta(hours=TIMEZONE_HOURS))
     out = []
     for m in mems[:limit]:
         c = (m.get("content") or "").strip()
@@ -4240,15 +4247,7 @@ async def api_recall_agent(request: Request):
             else:
                 # 围绕命中关键词的窗口截取——治"长记忆掐头300字，关键细节在后半段"(2026-07-06 萤火虫632事故)
                 c = _mem_snippet(c, keywords=q_kws, cap=max_chars)
-        date_s = ""
-        dt = m.get("created_at")
-        if dt is not None:
-            try:
-                if getattr(dt, "tzinfo", None) is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                date_s = dt.astimezone(tz_offset).strftime("%Y-%m-%d")
-            except Exception:
-                date_s = ""
+        date_s = _mem_display_date(m)
         out.append({"id": m.get("id"), "date": date_s, "content": c})
     print(f"📝 agent召回({mode}): {q[:40]!r} → {len(out)}条")
     return {"memories": out, "mode": mode}
@@ -4779,14 +4778,8 @@ async def _decide_and_write(persona: str, transcript: str, silence_min: float, i
         _lines = []
         for m in old_mems[:10]:
             _c = (m.get("content") or "").strip()[:200]
-            _date = ""
-            if m.get("created_at"):
-                try:
-                    _utc = str(m["created_at"])[:19]
-                    _dt = datetime.strptime(_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                    _date = f"[{(_dt + timedelta(hours=TIMEZONE_HOURS)).strftime('%Y-%m-%d')}] "
-                except Exception:
-                    pass
+            _dd = _mem_display_date(m)
+            _date = f"[{_dd}] " if _dd else ""
             if _c:
                 _lines.append(f"- {_date}{_c}")
         if _lines:
