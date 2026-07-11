@@ -2490,12 +2490,15 @@ def _is_rp_line() -> bool:
     return sid != PARTITION_SESSION_ID and sid.startswith("rp")
 
 
-async def _compose_main_background() -> str:
-    """所有子线(rp/tg)通用：实时读主线(PARTITION_SESSION_ID)的【当前摘要 + 最近N轮逐字尾巴】拼成一段文本，
-    供拼进人设(同一system块,不新增缓存断点)，让 V 在子线也实时知道主线最近(含今天)的事，零时差。主线自己返回空。"""
+async def _compose_main_background_parts() -> tuple:
+    """所有子线(rp/tg)通用：实时读主线(PARTITION_SESSION_ID)近况，让 V 在子线也实时知道主线最近(含今天)的事，零时差。
+    返回 (summary_part, tail_part) 两段，主线自己返回 ("", "")：
+    - summary_part：主线摘要（early+summary_parts），只在主线轮转(~每X轮)时才变 → 拼进人设 system 块
+      (同一块不新增缓存断点，避免超4断点上限→502)，缓存前缀不再被主线每一轮打穿。
+    - tail_part：主线最近N轮逐字，主线每说一句就变 → 塞当前轮动态区（不进缓存块），新鲜度不变。"""
     main_sid = PARTITION_SESSION_ID
     if not main_sid or get_active_session_id() == main_sid:   # 任何非主线(rp/tg)都借主线近况,消除时差;只有主线自己返回空
-        return ""
+        return "", ""
     try:
         st = await get_session_cache_state(main_sid)
         parts = st.get("summary_parts") or []
@@ -2518,18 +2521,18 @@ async def _compose_main_background() -> str:
         if parts:
             seg.append("\n".join(parts))
         body = "\n".join(seg).strip()
-        if not body and not tail_txt.strip():
-            return ""
-        out = (f"\n\n【主线近况——这是同一个你和{USER_NAME}在主线最近的真实对话，"
-               f"在这条线里也要记得这些、保持连续，别像换了个人或停在过去】\n")
+        summary_part = ""
         if body:
-            out += body + "\n"
+            summary_part = (f"\n\n【主线近况·摘要——这是同一个你和{USER_NAME}在主线之前对话的摘要，"
+                            f"在这条线里也要记得这些、保持连续，别像换了个人或停在过去】\n" + body)
+        tail_part = ""
         if tail_txt.strip():
-            out += "最近逐字对话：\n" + tail_txt
-        return out.rstrip()
+            tail_part = (f"【主线刚刚的逐字对话——这是同一个你和{USER_NAME}在主线最近的真实对话（不是本线的消息），"
+                         f"在这条线里也要记得、自然接上，别像换了个人或停在过去】\n" + tail_txt.rstrip())
+        return summary_part, tail_part
     except Exception as _e:
         print(f"⚠️ 主线近况背景组装失败: {_e}")
-        return ""
+        return "", ""
 
 
 async def _compose_tg_digest_for_main() -> str:
@@ -2724,10 +2727,11 @@ async def build_partitioned_messages(
             asyncio.create_task(_bg_summary_cap(session_id))
     
     # 拼装messages
-    # 主线近况：非主线(rp)把主线摘要+最近N轮逐字【拼进人设文本】(同一system块,不新增缓存断点/不新增消息,避免超4断点上限→502)
-    _mbg = await _compose_main_background()
-    if _mbg:
-        base_prompt = (base_prompt or "") + _mbg
+    # 主线近况拆快慢两半：摘要(慢,主线~每X轮才变)拼进人设system块(不新增断点,避免超4断点→502)；
+    # 逐字尾巴(快,主线每句都变)挪去当前轮动态区——不然主线每说一句,子线整个人设块缓存就作废一次
+    _mbg_sum, _mbg_tail = await _compose_main_background_parts()
+    if _mbg_sum:
+        base_prompt = (base_prompt or "") + _mbg_sum
     result = []
     if base_prompt:
         _sys_block = {"type": "text", "text": base_prompt}
@@ -2804,6 +2808,10 @@ async def build_partitioned_messages(
             if mem_text:
                 parts.append(mem_text)
 
+        # 主线逐字尾巴(非主线)：每轮现读现塞，零时差不变，但不再进缓存块打穿人设前缀
+        if _mbg_tail:
+            parts.append(_mbg_tail)
+
         # 贴身身份锚(非主线rp)：离生成点最近，强提醒别认错人/别写泛，治冷启动写跑偏
         _anchor = _compose_identity_anchor()
         if _anchor:
@@ -2840,10 +2848,10 @@ async def _build_basic_cached(
     drift: bool = True,
 ) -> list:
     """基础版prompt caching（历史不够分区时的降级模式）"""
-    # 主线近况：非主线(rp)把主线摘要+最近N轮逐字【拼进人设文本】(同一system块,不新增缓存断点/不新增消息,避免超4断点上限→502)
-    _mbg = await _compose_main_background()
-    if _mbg:
-        base_prompt = (base_prompt or "") + _mbg
+    # 主线近况拆快慢两半：摘要进人设块、逐字尾巴进动态区（同 build_partitioned_messages，见那边注释）
+    _mbg_sum, _mbg_tail = await _compose_main_background_parts()
+    if _mbg_sum:
+        base_prompt = (base_prompt or "") + _mbg_sum
     result = []
     if base_prompt:
         _sys_block = {"type": "text", "text": base_prompt}
@@ -2887,6 +2895,10 @@ async def _build_basic_cached(
             mem_text = await build_memory_text(user_message, drift=drift)
             if mem_text:
                 parts.append(mem_text)
+
+        # 主线逐字尾巴(非主线)：每轮现读现塞，零时差不变，但不再进缓存块打穿人设前缀
+        if _mbg_tail:
+            parts.append(_mbg_tail)
 
         # 贴身身份锚(非主线rp)：离生成点最近，强提醒别认错人/别写泛，治冷启动写跑偏
         _anchor = _compose_identity_anchor()
