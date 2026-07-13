@@ -18,11 +18,13 @@ import time
 import uuid
 import asyncio
 import secrets
+import hashlib
 import contextvars
 import httpx
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -40,6 +42,7 @@ from database import count_conversations_between, fetch_conversations_between, d
 from database import count_memories_between, fetch_memories_between, delete_memories_between, restore_memories
 from database import save_feel, get_recent_feels, get_all_feels, set_feel_explicit, save_image_memory, photo_hash_exists
 from database import count_conversations_since, delete_conversations_since, count_memories_since, delete_memories_since
+from database import create_intimacy_submission, list_intimacy_submissions, get_intimacy_submission, claim_intimacy_submission, reply_intimacy_submission, delete_intimacy_submission
 from database import save_persona_suggestion, list_persona_suggestions, update_persona_suggestion, save_l5_candidate, list_l5_candidates, update_l5_candidate, get_l5_candidate
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, tag_emotions_batch, tag_explicit_batch
@@ -626,6 +629,20 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="AI Memory Gateway", version="2.0.0", lifespan=lifespan)
 
+# 亲密小屋部署在 GitHub Pages。只允许该 HTTPS 来源跨域访问；
+# 即使来源匹配，公开接口仍必须通过独立的 X-Intimacy-Key。
+INTIMACY_ALLOWED_ORIGIN = os.getenv(
+    "INTIMACY_ALLOWED_ORIGIN", "https://harperqiu6-ai.github.io"
+).rstrip("/")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[INTIMACY_ALLOWED_ORIGIN],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Intimacy-Key"],
+    max_age=600,
+)
+
 # 静态文件和模板配置
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
@@ -636,7 +653,7 @@ templates = Jinja2Templates(directory="templates")
 # ============================================================
 
 # 不需要鉴权的路径（根路径精确匹配，其余按前缀匹配）
-PUBLIC_PATHS = ("/", "/static/", "/health", "/favicon.ico", "/telegram/")
+PUBLIC_PATHS = ("/", "/static/", "/health", "/favicon.ico", "/telegram/", "/intimacy/")
 
 @app.middleware("http")
 async def gateway_auth_middleware(request: Request, call_next):
@@ -3434,6 +3451,145 @@ async def health_check():
         "memory_count": memory_count,
         "memory_extract_interval": MEMORY_EXTRACT_INTERVAL,
     }
+
+
+# ============================================================
+# 亲密小屋：独立、最小权限的网页收件箱
+# ============================================================
+
+INTIMACY_MAX_BODY_BYTES = 32 * 1024
+INTIMACY_MAX_RESPONSE_CHARS = 24000
+_intimacy_rate_windows = {}
+
+
+def _intimacy_hash(value: str) -> str:
+    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
+
+
+async def _intimacy_authorized(request: Request) -> bool:
+    provided = (request.headers.get("X-Intimacy-Key", "") or "").strip()
+    if len(provided) < 24:
+        return False
+    expected = (await get_gateway_config("intimacy_access_hash", "") or "").strip()
+    return bool(expected) and secrets.compare_digest(_intimacy_hash(provided), expected)
+
+
+def _intimacy_rate_allowed(request: Request, limit: int = 30) -> bool:
+    now = time.time()
+    host = request.client.host if request.client else "unknown"
+    recent = [stamp for stamp in _intimacy_rate_windows.get(host, []) if now - stamp < 60]
+    if len(recent) >= limit:
+        _intimacy_rate_windows[host] = recent
+        return False
+    recent.append(now)
+    _intimacy_rate_windows[host] = recent
+    if len(_intimacy_rate_windows) > 500:
+        cutoff = now - 60
+        for key in list(_intimacy_rate_windows):
+            kept = [stamp for stamp in _intimacy_rate_windows[key] if stamp >= cutoff]
+            if kept:
+                _intimacy_rate_windows[key] = kept
+            else:
+                _intimacy_rate_windows.pop(key, None)
+    return True
+
+
+def _intimacy_error(status_code: int, message: str):
+    return JSONResponse(status_code=status_code, content={"error": message})
+
+
+@app.post("/api/intimacy/setup")
+async def api_intimacy_setup():
+    """Master-key protected: rotate the one-purpose browser key and return it once."""
+    access_key = secrets.token_urlsafe(32)
+    await set_gateway_config("intimacy_access_hash", _intimacy_hash(access_key))
+    return {"status": "ok", "access_key": access_key}
+
+
+@app.post("/api/intimacy/claim")
+async def api_intimacy_claim(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    item = await claim_intimacy_submission(body.get("lease_minutes", 10))
+    return {"submission": item}
+
+
+@app.post("/api/intimacy/{submission_id}/reply")
+async def api_intimacy_reply(submission_id: str, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return _intimacy_error(400, "invalid_json")
+    response_text = str(body.get("response_text") or "").strip()
+    response_payload = body.get("response_payload")
+    if not response_text:
+        return _intimacy_error(400, "response_text_required")
+    if len(response_text) > INTIMACY_MAX_RESPONSE_CHARS:
+        return _intimacy_error(413, "response_too_large")
+    if response_payload is not None:
+        encoded = json.dumps(response_payload, ensure_ascii=False)
+        if len(encoded.encode("utf-8")) > INTIMACY_MAX_BODY_BYTES:
+            return _intimacy_error(413, "response_payload_too_large")
+    item = await reply_intimacy_submission(submission_id, response_text, response_payload)
+    if not item:
+        return _intimacy_error(404, "submission_not_found")
+    return {"status": "ok", "submission": item}
+
+
+@app.post("/intimacy/api/submissions")
+async def intimacy_submit(request: Request):
+    if not await _intimacy_authorized(request):
+        return _intimacy_error(401, "invalid_intimacy_key")
+    if not _intimacy_rate_allowed(request):
+        return _intimacy_error(429, "too_many_requests")
+    raw = await request.body()
+    if len(raw) > INTIMACY_MAX_BODY_BYTES:
+        return _intimacy_error(413, "submission_too_large")
+    try:
+        body = json.loads(raw)
+    except Exception:
+        return _intimacy_error(400, "invalid_json")
+    kind = str(body.get("kind") or "").strip().lower()
+    author = str(body.get("author") or "Harper").strip()[:40] or "Harper"
+    payload = body.get("payload")
+    if kind not in {"map", "sri", "replay", "wish"}:
+        return _intimacy_error(400, "invalid_kind")
+    if not isinstance(payload, dict):
+        return _intimacy_error(400, "payload_must_be_object")
+    item = await create_intimacy_submission(kind, author, payload)
+    return JSONResponse(status_code=201, content={"status": "ok", "submission": item})
+
+
+@app.get("/intimacy/api/submissions")
+async def intimacy_list(request: Request, limit: int = 30):
+    if not await _intimacy_authorized(request):
+        return _intimacy_error(401, "invalid_intimacy_key")
+    if not _intimacy_rate_allowed(request, 60):
+        return _intimacy_error(429, "too_many_requests")
+    items = await list_intimacy_submissions(limit)
+    return {"submissions": items}
+
+
+@app.get("/intimacy/api/submissions/{submission_id}")
+async def intimacy_get(submission_id: str, request: Request):
+    if not await _intimacy_authorized(request):
+        return _intimacy_error(401, "invalid_intimacy_key")
+    item = await get_intimacy_submission(submission_id)
+    if not item:
+        return _intimacy_error(404, "submission_not_found")
+    return {"submission": item}
+
+
+@app.delete("/intimacy/api/submissions/{submission_id}")
+async def intimacy_delete(submission_id: str, request: Request):
+    if not await _intimacy_authorized(request):
+        return _intimacy_error(401, "invalid_intimacy_key")
+    deleted = await delete_intimacy_submission(submission_id)
+    if not deleted:
+        return _intimacy_error(404, "submission_not_found")
+    return {"status": "ok", "deleted": True}
 
 
 @app.get("/v1/models")

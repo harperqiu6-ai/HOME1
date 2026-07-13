@@ -10,6 +10,7 @@
 import os
 import re
 import json
+import uuid
 from typing import Optional, List
 from datetime import datetime, timedelta, timezone as dt_timezone
 
@@ -146,6 +147,31 @@ async def init_tables():
                 key     TEXT PRIMARY KEY,
                 value   TEXT DEFAULT ''
             );
+        """)
+
+        # 亲密小屋：Harper 网页提交 → cyberboss/V 认领 → 回答写回。
+        # 只存短文本/JSON，不与记忆表混放，便于单独删除和限额。
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS intimacy_submissions (
+                id               TEXT PRIMARY KEY,
+                kind             TEXT NOT NULL,
+                author           TEXT NOT NULL DEFAULT 'Harper',
+                payload          JSONB NOT NULL DEFAULT '{}'::jsonb,
+                status           TEXT NOT NULL DEFAULT 'pending',
+                response_text    TEXT NOT NULL DEFAULT '',
+                response_payload JSONB,
+                created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                claimed_at       TIMESTAMPTZ,
+                responded_at     TIMESTAMPTZ,
+                deleted_at       TIMESTAMPTZ,
+                CONSTRAINT intimacy_kind_check CHECK (kind IN ('map', 'sri', 'replay', 'wish')),
+                CONSTRAINT intimacy_status_check CHECK (status IN ('pending', 'processing', 'responded'))
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_intimacy_pending
+            ON intimacy_submissions (status, created_at)
+            WHERE deleted_at IS NULL;
         """)
         
         # 分区缓存状态表（存储每个session的轮转状态）
@@ -3144,6 +3170,122 @@ async def cleanup_old_fragments(days: int = 30):
         # 解析删除数量，格式如 "DELETE 5"
         deleted = int(result.split()[-1]) if result else 0
         return deleted
+
+
+def _decode_json_value(value, fallback):
+    if value is None:
+        return fallback
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _intimacy_row(row):
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "author": row["author"],
+        "payload": _decode_json_value(row["payload"], {}),
+        "status": row["status"],
+        "response_text": row["response_text"] or "",
+        "response_payload": _decode_json_value(row["response_payload"], None),
+        "created_at": row["created_at"].isoformat() if row["created_at"] else "",
+        "claimed_at": row["claimed_at"].isoformat() if row["claimed_at"] else "",
+        "responded_at": row["responded_at"].isoformat() if row["responded_at"] else "",
+    }
+
+
+async def create_intimacy_submission(kind: str, author: str, payload: dict):
+    submission_id = str(uuid.uuid4())
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO intimacy_submissions (id, kind, author, payload)
+            VALUES ($1, $2, $3, $4::jsonb)
+            RETURNING *
+        """, submission_id, kind, author, json.dumps(payload, ensure_ascii=False))
+    return _intimacy_row(row)
+
+
+async def list_intimacy_submissions(limit: int = 30):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT * FROM intimacy_submissions
+            WHERE deleted_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT $1
+        """, max(1, min(int(limit), 100)))
+    return [_intimacy_row(row) for row in rows]
+
+
+async def get_intimacy_submission(submission_id: str):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT * FROM intimacy_submissions
+            WHERE id = $1 AND deleted_at IS NULL
+        """, submission_id)
+    return _intimacy_row(row)
+
+
+async def claim_intimacy_submission(lease_minutes: int = 10):
+    """Atomically claim the oldest pending item; stale processing leases may be reclaimed."""
+    lease_minutes = max(2, min(int(lease_minutes), 60))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow("""
+                SELECT * FROM intimacy_submissions
+                WHERE deleted_at IS NULL
+                  AND (
+                    status = 'pending'
+                    OR (status = 'processing' AND claimed_at < NOW() - ($1::int * INTERVAL '1 minute'))
+                  )
+                ORDER BY created_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            """, lease_minutes)
+            if not row:
+                return None
+            row = await conn.fetchrow("""
+                UPDATE intimacy_submissions
+                SET status = 'processing', claimed_at = NOW()
+                WHERE id = $1
+                RETURNING *
+            """, row["id"])
+    return _intimacy_row(row)
+
+
+async def reply_intimacy_submission(submission_id: str, response_text: str, response_payload=None):
+    pool = await get_pool()
+    encoded_payload = None if response_payload is None else json.dumps(response_payload, ensure_ascii=False)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE intimacy_submissions
+            SET status = 'responded', response_text = $2,
+                response_payload = $3::jsonb, responded_at = NOW()
+            WHERE id = $1 AND deleted_at IS NULL
+            RETURNING *
+        """, submission_id, response_text, encoded_payload)
+    return _intimacy_row(row)
+
+
+async def delete_intimacy_submission(submission_id: str):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE intimacy_submissions
+            SET deleted_at = NOW()
+            WHERE id = $1 AND deleted_at IS NULL
+            RETURNING id
+        """, submission_id)
+    return bool(row)
 
 
 async def revert_merge(memory_id: int):
