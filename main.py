@@ -233,6 +233,17 @@ _request_skip_log = contextvars.ContextVar("request_skip_log", default=False)
 # 时区偏移（小时），用于记忆注入时的日期显示，默认 UTC+8
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
 
+# ② L2今日的"逻辑日"分界：凌晨 N 点前算前一天。熬夜聊过 0 点时，凌晨的消息仍属"昨晚"，
+# 别让跨 0 点刷新把昨晚场景盖上新一天的日期章(2026-07-13 周一早上被周日晚浓缩冒充"今天"的事故)。
+# 改这里必须与 cyberboss app.js 开场注入守卫的同名逻辑保持一致。
+L2_DAY_CUTOVER_HOUR = int(os.getenv("L2_DAY_CUTOVER_HOUR", "4"))
+
+
+def _l2_logical_today():
+    """L2 专用"逻辑今天"(date 对象)：本地时间凌晨 L2_DAY_CUTOVER_HOUR 点前算前一天。"""
+    return (datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS - L2_DAY_CUTOVER_HOUR)).date()
+
+
 # 轮次计数器
 _round_counter = 0
 # ② L2今日状态（非缓存当前轮注入；后台每N轮刷新；启动时从 gateway_config 恢复）
@@ -1527,7 +1538,7 @@ async def generate_today_digest(session_id: str) -> str:
         return ""
     if not rows:
         return ""
-    today = (datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date()
+    today = _l2_logical_today()   # 逻辑日：凌晨4点前算前一天，熬夜跨0点的场景不换日
     convo = ""
     for m in rows:
         ts = m.get("created_at")
@@ -1535,7 +1546,7 @@ async def generate_today_digest(session_id: str) -> str:
             try:
                 if getattr(ts, "tzinfo", None) is None:
                     ts = ts.replace(tzinfo=timezone.utc)
-                if (ts + timedelta(hours=TIMEZONE_HOURS)).date() != today:
+                if (ts + timedelta(hours=TIMEZONE_HOURS - L2_DAY_CUTOVER_HOUR)).date() != today:
                     continue
             except Exception:
                 pass
@@ -1585,10 +1596,10 @@ async def generate_today_digest(session_id: str) -> str:
 
 async def refresh_l2(session_id: str) -> str:
     """生成并存今日浓缩；跨天则把昨日 today 转成一句桥（临时，L3 上线后撤）。"""
-    today_s = str((datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date())
+    today_s = str(_l2_logical_today())   # 逻辑日：凌晨4点前算前一天
     if _l2_state.get("date") and _l2_state["date"] != today_s:
         # 昨日桥用「真实的昨天」：状态日期可能因刷新中断冻在多天前，别把一周前当"昨日"
-        _yday = str((datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date() - timedelta(days=1))
+        _yday = str(_l2_logical_today() - timedelta(days=1))
         _mw_summary = ""
         try:
             _mw_summary = await get_memorywall_summary_by_date(_yday)
@@ -1622,8 +1633,8 @@ def _compose_l2_block() -> str:
     if b:
         blocks.append(f"〔昨日〕{b}")
     t = (_l2_state.get("today") or "").strip()
-    # 日期守卫：状态不是今天的(重启恢复的旧浓缩/刷新失败冻住)→旧"今日"绝不冒充今天注入
-    if t and _l2_state.get("date") != str((datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date()):
+    # 日期守卫：状态不是今天的(重启恢复的旧浓缩/刷新失败冻住)→旧"今日"绝不冒充今天注入（逻辑日，与刷新一致）
+    if t and _l2_state.get("date") != str(_l2_logical_today()):
         t = ""
     if t:
         blocks.append(t)
@@ -3253,7 +3264,7 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
         # ② L2今日：每 N 轮刷新今日浓缩（独立于提取间隔，后台不阻塞回复）。
         # 状态日期不是今天(跨天第一句/部署重启把轮次计数清零)也立刻刷,别让旧"今日"一直挂着。
         if L2_TODAY_ENABLED and L2_REFRESH_N > 0:
-            _l2_today_s = str((datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date())
+            _l2_today_s = str(_l2_logical_today())   # 逻辑日：凌晨4点前算前一天
             if (_round_counter % L2_REFRESH_N == 0) or (_l2_state.get("date") != _l2_today_s):
                 try:
                     asyncio.create_task(refresh_l2(session_id))
