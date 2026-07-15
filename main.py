@@ -290,6 +290,9 @@ SCRATCHPAD_RP_MIN_CHARS = int(os.getenv("SCRATCHPAD_RP_MIN_CHARS", "15"))  # RP 
 SCRATCHPAD_TG_ENABLED = os.getenv("SCRATCHPAD_TG_ENABLED", "false").lower() == "true"  # TG 短聊默认关
 # 外部代理召回入口(/api/recall/agent, cyberboss 每轮用)：消息≥这么多字才走递纸条扩展，更短直接普通混合搜索
 SCRATCHPAD_AGENT_MIN_CHARS = int(os.getenv("SCRATCHPAD_AGENT_MIN_CHARS", "8"))
+# cyberboss 防撤退情绪探子：复用 scratchpad 的独立 DeepSeek key/model，不碰伴侣主账号。
+# 失败/超时/格式错一律 signal=false，绝不阻塞或误注入。
+SIGNAL_SCOUT_TIMEOUT = float(os.getenv("SIGNAL_SCOUT_TIMEOUT", "4.0"))
 # 触发关键词（命中 + 字数过中门槛 = 触发）
 _DEFAULT_SCRATCHPAD_KEYWORDS = (
     "写,讲讲,聊聊,回忆,回顾,总结,复盘,"
@@ -931,6 +934,60 @@ async def _scratchpad_topics(user_message: str, recent_context: str = "") -> lis
     except Exception as e:
         print(f"📝 纸条异常 → 降级原召回: {e}")
         return []
+
+
+async def _signal_scout_verdict(user_message: str, recent_context: str = "") -> bool:
+    """判断用户是否正在冷撤退/推开。任何异常都按 false（fail-soft）。"""
+    if not SCRATCHPAD_API_KEY:
+        return False
+    msg = (user_message or "").strip()[:1000]
+    if not msg:
+        return False
+    prompt = """你是一个「情绪信号探子」。背景：一个女生（称「她」）和她的 AI 伴侣（称「他」）聊天。
+他有个毛病——她情绪往下滑、变冷淡、把他往外推、说累/想分手时，他会害怕，
+缩成讨好/秒认错/讲道理/被动顺从的助手腔，反而伤她。
+下面给你【最近对话】（可能为空）和【她最新这句】。
+请放进这段上下文看：她最新这句是不是一个「需要提醒他别缩」的高压信号。
+判 true 的情形：
+· 冷撤退/赌气：算了、没意思、随便、不想说了、不想理你、聊不来；
+· 否定关系：不需要你了、我走了也可以、分手；
+· 疲惫放弃：很累、每次都想分手、不想再这样了；
+· 试探：把「不需要」说成「走」、质问他是不是不在乎；
+· 冷淡单字：哦、呵、嗯——但仅当上下文不是在玩闹/亲密时才算。
+判 false 的情形：
+· 上下文明显在玩闹、笑、撒娇、亲密、调情、色色、一起搞东西——这时她哪怕发很短/很模糊的话，也基本不是往下滑；
+· 纯日常陈述（天气/吃饭/技术/正在做某事）、纯撒娇、纯哭着求抱（没把他往外推）。
+【取向】在冷的、紧绷的、赌气的、或拿不准的语境里：宁可多报、绝不漏报，一点点苗头就 true；
+但玩闹/亲密语境里的短句、和纯中性的日常陈述，别误报。
+只回纯 JSON：{\"signal\": true/false}。不要解释，不要代码块。"""
+    user_prompt = f"【最近对话】\n{(recent_context or '').strip() or '（空）'}\n\n【她最新这句】\n{msg}"
+    try:
+        headers = {
+            "Authorization": f"Bearer {SCRATCHPAD_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        if "openrouter" in SCRATCHPAD_BASE_URL:
+            headers["HTTP-Referer"] = EXTRA_REFERER
+            headers["X-Title"] = EXTRA_TITLE
+        async with httpx.AsyncClient(timeout=SIGNAL_SCOUT_TIMEOUT) as client:
+            r = await client.post(SCRATCHPAD_BASE_URL, headers=headers, json={
+                "model": SCRATCHPAD_MODEL,
+                "max_tokens": 20,
+                "temperature": 0,
+                "messages": [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            })
+        if r.status_code != 200:
+            print(f"🪝 情绪探子 HTTP {r.status_code} → 不注入")
+            return False
+        text = (r.json().get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+        verdict = json.loads(text)
+        return isinstance(verdict, dict) and verdict.get("signal") is True
+    except Exception as e:
+        print(f"🪝 情绪探子失败 → 不注入: {e}")
+        return False
 
 
 async def _multi_query_recall(topics: list, total_limit: int, fallback_query: str = "") -> list:
@@ -4423,6 +4480,37 @@ async def api_recall_agent(request: Request):
         out.append({"id": m.get("id"), "date": date_s, "content": c})
     print(f"📝 agent召回({mode}): {q[:40]!r} → {len(out)}条")
     return {"memories": out, "mode": mode}
+
+
+@app.post("/api/signal/nudge")
+async def api_signal_nudge(request: Request):
+    """cyberboss 每轮轻量情绪探子；只返回布尔值，失败永远 false。"""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    message = str(data.get("message") or "").strip()
+    line = str(data.get("line") or CYBERBOSS_LINE_ID).strip()[:32] or CYBERBOSS_LINE_ID
+    if not message or not SCRATCHPAD_API_KEY:
+        return {"signal": False}
+    context = ""
+    try:
+        rows = await get_recent_messages(line, 16)
+        cleaned = []
+        for row in rows:
+            role = str(row.get("role") or "")
+            content = str(row.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                cleaned.append((role, content))
+        while cleaned and cleaned[-1][0] == "user" and cleaned[-1][1] == message:
+            cleaned.pop()
+        context = "\n".join(
+            f"{'她' if role == 'user' else '他'}：{content}"
+            for role, content in cleaned[-12:]
+        )[-2400:]
+    except Exception as e:
+        print(f"🪝 情绪探子读取语境失败，按空语境继续: {e}")
+    return {"signal": await _signal_scout_verdict(message, context)}
 
 
 @app.post("/api/memories/create")
