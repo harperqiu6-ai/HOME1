@@ -7045,7 +7045,7 @@ async def api_list_l5_candidates(status: str = "pending", target: str = None):
 
 @app.post("/api/l5-candidates/clear")
 async def api_clear_l5_candidates():
-    """记忆控制台:软清所有 pending L5 根基候选(→ignored,不删数据)。决定②。须声明在 /{cand_id} 之前。"""
+    """彻底删除已下线的里程碑候选队列全部历史数据。须声明在 /{cand_id} 之前。"""
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
     n = await clear_l5_candidates()

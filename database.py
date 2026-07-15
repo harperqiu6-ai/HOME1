@@ -1134,10 +1134,10 @@ async def clear_persona_suggestions() -> int:
 
 
 async def clear_l5_candidates() -> int:
-    """软清:把所有 pending L5 根基候选置 ignored(不删数据)。返回清理条数。"""
+    """彻底删除已下线的 L5/回忆墙候选队列全部历史记录。返回删除条数。"""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        res = await conn.execute("UPDATE l5_candidates SET status = 'ignored' WHERE status = 'pending'")
+        res = await conn.execute("DELETE FROM l5_candidates")
         try:
             return int(res.split()[-1])
         except Exception:
