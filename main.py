@@ -1063,17 +1063,16 @@ async def _multi_query_recall(topics: list, total_limit: int, fallback_query: st
                     seen[mid] = m
             else:
                 seen[mid] = m
+    base_mems = []
     if fallback_query:
         try:
             base_mems = await search_memories(fallback_query, limit=total_limit)
-            for m in base_mems:
-                mid = m.get("id")
-                if mid is not None and mid not in seen:
-                    seen[mid] = m
         except Exception as e:
             print(f"📝 兜底召回失败: {e}")
-    merged = sorted(seen.values(), key=lambda x: -float(x.get("score") or 0))
-    return merged[:total_limit]
+    expanded = sorted(seen.values(), key=lambda x: -float(x.get("score") or 0))
+    if base_mems:
+        return _merge_agent_recall_results(base_mems, expanded, total_limit)
+    return expanded[:total_limit]
 
 
 async def _expand_recall_with_scratchpad(user_message: str, total_limit: int, recent_context: str = "") -> list:
@@ -4500,15 +4499,12 @@ async def api_recall_agent(request: Request):
     mems = []
     mode = "plain"
     try:
-        # 原句直搜是关键词保底；scratchpad 只能扩充，不能覆盖它。
-        direct_mems = await search_memories(q, limit=limit)
         if SCRATCHPAD_ENABLED and SCRATCHPAD_API_KEY and len(q) >= SCRATCHPAD_AGENT_MIN_CHARS:
-            expanded_mems = await _expand_recall_with_scratchpad(q, limit)
-            if expanded_mems:
-                mems = _merge_agent_recall_results(direct_mems, expanded_mems, limit)
+            mems = await _expand_recall_with_scratchpad(q, limit)
+            if mems:
                 mode = "scratchpad+plain"
         if not mems:
-            mems = direct_mems
+            mems = await search_memories(q, limit=limit)
     except Exception as e:
         print(f"📝 agent召回失败: {e}")
         return {"memories": [], "mode": "error"}
