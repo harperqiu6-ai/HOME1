@@ -248,7 +248,6 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border:none;border-ra
     <div class="panel wide">
       <div class="panel-h"><span class="en">SUGGESTIONS</span><span class="cn">建议队列 · 人来挑</span><i class="ti ti-list-check"></i></div>
       <div class="row"><div><div class="label">人设建议</div><div class="hint" id="h-persona"></div></div><div class="ctl sld"><span class="label" style="font-size:11px">门槛 imp≥</span><input type="range" data-num="PERSONA_SUGGESTION_MIN_IMPORTANCE" data-via="settings"><span class="val" id="val-PERSONA_SUGGESTION_MIN_IMPORTANCE"></span><label class="tg"><input type="checkbox" id="tg-persona"><span class="track"></span><span class="knob"></span></label><button class="btn sm warn" id="persona-clear">清空待审 <span id="cnt-persona"></span></button></div></div>
-      <div class="row"><div><div class="label">L5 根基候选</div><div class="hint">机器提里程碑 → 你确认才进根基(在「层视图」审)</div></div><div class="ctl"><button class="btn sm warn" id="l5-clear">清空待审 <span id="cnt-l5"></span></button></div></div>
     </div>
 
     <!-- MAINTENANCE -->
@@ -320,7 +319,6 @@ function render(){
   const c=DATA.counts||{};
   document.getElementById('cnt-explicit').textContent = c.is_explicit ?? '–';
   document.getElementById('cnt-persona').textContent = '('+(c.persona_pending ?? 0)+')';
-  document.getElementById('cnt-l5').textContent = '('+(c.l5_pending ?? 0)+')';
   document.getElementById('cnt-decaybatch').textContent = '('+(c.decay_last_batch ?? 0)+')';
   document.getElementById('chips-keys').innerHTML = (DATA.intimacy_keys||[]).map(k=>`<span class="chip">${k}</span>`).join('') || '<span class="chip" style="opacity:.5">未设暗号</span>';
   // decay run 仅在衰减开时可用
@@ -436,7 +434,6 @@ function bind(){
   document.getElementById('decay-run').addEventListener('click',decayRun);
   document.getElementById('decay-undo').addEventListener('click',decayUndo);
   document.getElementById('persona-clear').addEventListener('click',()=>clearQueue('persona'));
-  document.getElementById('l5-clear').addEventListener('click',()=>clearQueue('l5'));
   document.getElementById('dream-run').addEventListener('click',async()=>{ if(!confirm('补做未覆盖的过去日(后台)?'))return; try{const j=await api('/api/dreams/run',{method:'POST',body:{dry_run:false}});toast(j.status||'已触发(后台)');}catch(e){toast('失败:'+e.message);} });
   document.getElementById('l2-refresh').addEventListener('click',async()=>{ try{await api('/api/l2/refresh',{method:'POST',body:{}});toast('已刷新今日');}catch(e){toast('失败:'+e.message);} });
   document.getElementById('fold-drift').addEventListener('click',function(){ this.classList.toggle('open'); document.getElementById('foldb-drift').classList.toggle('open'); });
@@ -628,7 +625,7 @@ async function capApply(){
     const j=await api('/api/summary/cap-apply',{method:'POST',body:{dry_run:false}});
     if(j.error){ el.textContent='失败:'+j.error; return; }
     if(j.reason){ el.textContent=j.reason; return; }
-    el.innerHTML='✅ 已封顶：卷了 <b>'+(j.rolled||0)+'</b> 段→早期小结('+(j.early_chars||0)+'字)，保留最近 '+(j.parts_after||0)+' 段，里程碑候选 '+(j.candidates||0)+' 条。可去 OpenRouter 看 token 是否下降。';
+    el.innerHTML='✅ 已封顶：卷了 <b>'+(j.rolled||0)+'</b> 段→早期小结('+(j.early_chars||0)+'字)，保留最近 '+(j.parts_after||0)+' 段。可去 OpenRouter 看 token 是否下降。';
     toast('已封顶');
   }catch(e){ el.textContent='失败:'+e.message; }
 }

@@ -123,8 +123,6 @@ EXPLICIT_REDACT_NOTE = (
 # 人设建议自动生成：开关 + importance 门槛（默认开着但门槛抬高，平凡偏好如"回复别太长"不收；可随时关）
 PERSONA_SUGGESTION_ENABLED = os.getenv("PERSONA_SUGGESTION_ENABLED", "true").lower() == "true"
 PERSONA_SUGGESTION_MIN_IMPORTANCE = int(os.getenv("PERSONA_SUGGESTION_MIN_IMPORTANCE", "7"))
-# ② L5根基候选自动生成:提取到 is_milestone 里程碑时自动入 L5 待审。默认开(行为不变);控制台可关→阮阮纯手动 curate
-L5_AUTO_ENABLED = os.getenv("L5_AUTO_ENABLED", "true").lower() == "true"
 # 看图(多模态透传):分区拼 prompt 时保留当前 user 的 image_url 块转发给 opus(默认关到验收;控制台开关)。关=原行为(拍扁纯文本)
 IMAGE_ENABLED = os.getenv("IMAGE_ENABLED", "false").lower() == "true"
 
@@ -475,7 +473,6 @@ async def lifespan(app: FastAPI):
                         "MOOD_DRIFT_SKIP_MEMORYWALL": lambda v: _parse_bool(v),
                         "PERSONA_SUGGESTION_ENABLED": lambda v: _parse_bool(v),
                         "PERSONA_SUGGESTION_MIN_IMPORTANCE": int,
-                        "L5_AUTO_ENABLED": lambda v: _parse_bool(v),
                         "IMAGE_ENABLED": lambda v: _parse_bool(v),
                         "IMAGE_GEN_ENABLED": lambda v: _parse_bool(v),
                         "IMAGE_GEN_MODEL": str, "IMAGE_GEN_BASE_URL": str,
@@ -1348,6 +1345,8 @@ async def _roll_early_summary(old_parts: list, target: int = 520) -> str:
 
 async def _detect_milestones(parts_text: str) -> list:
     """从卷掉的老段里检出"定义性大事"→[{content,target}]。target: l5(关系结构/根基) | wall(值得纪念的具体事件)。"""
+    # 待审里程碑功能已下线：摘要卷制只做浓缩，不再生成候选。
+    return []
     if not (parts_text or "").strip():
         return []
     prompt = f"""下面是 {USER_NAME} 和 {_ai_self()} 一些更早的对话摘要。**只挑出"定义性的大事"**——会改变两人关系结构、重要的第一次、承诺与约定、身份/称呼的确立、反复出现的核心主题。普通日常一律不要。
@@ -3403,13 +3402,6 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
                 is_explicit=mem.get("is_explicit", False),
             )
             saved += 1
-            # ② L5根基：若是【改变关系结构的里程碑】，额外塞进 L5 待审队列（不进 L5 正文，等阮阮审）。L5_AUTO_ENABLED 关则不自动收
-            if L5_AUTO_ENABLED and mem.get("is_milestone"):
-                try:
-                    await save_l5_candidate(mem["content"], mem.get("event_date"), session_id)
-                    print(f"🏛️ 里程碑→L5待审: {mem['content'][:40]}...")
-                except Exception as le:
-                    print(f"⚠️ L5候选保存失败: {le}")
             # A2 冲突处理：新事实推翻旧事实 → 把被推翻的旧条目置 inactive（不再并存打架）
             rid = mem.get("replaces_id")
             if rid:
@@ -8385,7 +8377,6 @@ async def save_settings(request: Request):
             "MOOD_DRIFT_SKIP_MEMORYWALL": lambda v: _parse_bool(v),
             "PERSONA_SUGGESTION_ENABLED": lambda v: _parse_bool(v),
             "PERSONA_SUGGESTION_MIN_IMPORTANCE": int,
-            "L5_AUTO_ENABLED":       lambda v: _parse_bool(v),
             "IMAGE_ENABLED":         lambda v: _parse_bool(v),
             "IMAGE_GEN_ENABLED":     lambda v: _parse_bool(v),
             "IMAGE_GEN_MODEL":       str,
@@ -8536,7 +8527,6 @@ async def api_console():
         "mood_drift":        {"on": MOOD_DRIFT_ENABLED,      "default": True,  "key": "MOOD_DRIFT_ENABLED", "sensitive": True},
         "drift_skip_mw":     {"on": MOOD_DRIFT_SKIP_MEMORYWALL, "default": True, "key": "MOOD_DRIFT_SKIP_MEMORYWALL"},
         "persona":           {"on": PERSONA_SUGGESTION_ENABLED, "default": True, "key": "PERSONA_SUGGESTION_ENABLED"},
-        "l5_auto":           {"on": L5_AUTO_ENABLED, "default": True, "key": "L5_AUTO_ENABLED"},
         "image":             {"on": IMAGE_ENABLED, "default": False, "key": "IMAGE_ENABLED", "sensitive": True},
         "extract":           {"on": MEMORY_EXTRACT_ENABLED,  "default": True,  "key": "MEMORY_EXTRACT_ENABLED", "sensitive": True},
         "l2_today":          {"on": L2_TODAY_ENABLED,        "default": True,  "key": "L2_TODAY_ENABLED"},
@@ -8570,7 +8560,6 @@ async def api_console():
             counts["is_explicit"] = await count_explicit_memories()
             counts["active_memories"] = await count_active_memories()
             counts["persona_pending"] = len(await list_persona_suggestions("pending"))
-            counts["l5_pending"] = len(await list_l5_candidates("pending"))
             _b = await get_gateway_config("decay_last_batch", "")
             counts["decay_last_batch"] = len(json.loads(_b)) if _b else 0
         except Exception as e:
