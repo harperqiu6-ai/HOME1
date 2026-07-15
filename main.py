@@ -772,6 +772,37 @@ def _mem_snippet(text: str, keywords=None, cap: int = None) -> str:
     return res
 
 
+def _agent_recall_excerpt(text: str, keywords=None, cap: int = 300) -> str:
+    """为外部 agent 压缩单条召回结果。
+
+    回忆墙通常优先给标题 + 检索摘要；但若查询词只命中正文、摘要没有，必须改给
+    关键词窗口。否则会出现“搜索命中了正确长记忆，递给模型的却是无关摘要”的假失忆。
+    """
+    import re as _re
+
+    c = (text or "").strip()
+    if not c or len(c) <= cap:
+        return c
+    kws = [str(k).strip() for k in (keywords or []) if str(k).strip()]
+    summary_match = _re.search(r'〔检索摘要〕\s*(.+?)(?:\n\n|$)', c, _re.S)
+    if c.startswith("【回忆") and summary_match:
+        head = c.split("\n", 1)[0].strip()
+        summary = summary_match.group(1).strip()
+        summary_view = f"{head} {summary}".strip()
+        summary_low = summary_view.lower()
+        body_low = c.lower()
+        # 只要至少一个查询词确实命中正文、却不在摘要里，就把真正命中的正文窗口递出去。
+        # 忽略单字，避免“的/我”等虚词把摘要分支误判成正文命中。
+        body_only_hits = [
+            kw for kw in kws
+            if len(kw) >= 2 and kw.lower() in body_low and kw.lower() not in summary_low
+        ]
+        if body_only_hits:
+            return _mem_snippet(c, keywords=body_only_hits, cap=cap)
+        return summary_view[:cap].rstrip()
+    return _mem_snippet(c, keywords=kws, cap=cap)
+
+
 def _mem_display_date(mem) -> str:
     """记忆注入时的展示日期：优先 event_date（真实事件日），没有才退回 created_at 折算本地日。
     created_at 是"入库时间"——整理/迁移产生的记忆入库日≠事件日（2026-07-10 时差事故：
@@ -4455,7 +4486,6 @@ async def api_recall_agent(request: Request):
     except Exception as e:
         print(f"📝 agent召回失败: {e}")
         return {"memories": [], "mode": "error"}
-    import re as _re
     try:
         q_kws = list(extract_search_keywords(q) or [])
     except Exception:
@@ -4468,14 +4498,7 @@ async def api_recall_agent(request: Request):
         if not c:
             continue
         if len(c) > max_chars:
-            # 回忆墙/归档类结构化条目：给〔检索摘要〕(为检索而写的浓缩)，别掐正文开头
-            _mm = _re.search(r'〔检索摘要〕\s*(.+?)(?:\n\n|$)', c, _re.S)
-            if c.startswith("【回忆") and _mm:
-                _head = c.split("\n", 1)[0].strip()
-                c = (_head + " " + _mm.group(1).strip())[:max_chars].rstrip()
-            else:
-                # 围绕命中关键词的窗口截取——治"长记忆掐头300字，关键细节在后半段"(2026-07-06 萤火虫632事故)
-                c = _mem_snippet(c, keywords=q_kws, cap=max_chars)
+            c = _agent_recall_excerpt(c, keywords=q_kws, cap=max_chars)
         date_s = _mem_display_date(m)
         out.append({"id": m.get("id"), "date": date_s, "content": c})
     print(f"📝 agent召回({mode}): {q[:40]!r} → {len(out)}条")
