@@ -803,6 +803,29 @@ def _agent_recall_excerpt(text: str, keywords=None, cap: int = 300) -> str:
     return _mem_snippet(c, keywords=kws, cap=cap)
 
 
+def _merge_agent_recall_results(direct, expanded, limit: int):
+    """合并原句直搜与 scratchpad 扩搜，保留最多两条原词锚点。
+
+    扩搜擅长联想，但不能把用户原话的强关键词命中全部挤掉；否则“意淫”会被扩写成
+    泛亲密主题，正确的围裙记忆反而消失。其余位置仍优先留给扩搜结果。
+    """
+    cap = max(1, int(limit or 1))
+    direct = list(direct or [])
+    expanded = list(expanded or [])
+    ordered = direct[:min(2, cap)] + expanded + direct[min(2, cap):]
+    out = []
+    seen = set()
+    for item in ordered:
+        key = ("id", item.get("id")) if item.get("id") is not None else ("content", item.get("content"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+        if len(out) >= cap:
+            break
+    return out
+
+
 def _mem_display_date(mem) -> str:
     """记忆注入时的展示日期：优先 event_date（真实事件日），没有才退回 created_at 折算本地日。
     created_at 是"入库时间"——整理/迁移产生的记忆入库日≠事件日（2026-07-10 时差事故：
@@ -4477,12 +4500,15 @@ async def api_recall_agent(request: Request):
     mems = []
     mode = "plain"
     try:
+        # 原句直搜是关键词保底；scratchpad 只能扩充，不能覆盖它。
+        direct_mems = await search_memories(q, limit=limit)
         if SCRATCHPAD_ENABLED and SCRATCHPAD_API_KEY and len(q) >= SCRATCHPAD_AGENT_MIN_CHARS:
-            mems = await _expand_recall_with_scratchpad(q, limit)
-            if mems:
-                mode = "scratchpad"
+            expanded_mems = await _expand_recall_with_scratchpad(q, limit)
+            if expanded_mems:
+                mems = _merge_agent_recall_results(direct_mems, expanded_mems, limit)
+                mode = "scratchpad+plain"
         if not mems:
-            mems = await search_memories(q, limit=limit)
+            mems = direct_mems
     except Exception as e:
         print(f"📝 agent召回失败: {e}")
         return {"memories": [], "mode": "error"}

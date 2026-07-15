@@ -6,14 +6,14 @@ import unittest
 def _load_excerpt_helpers():
     source = Path(__file__).resolve().parents[1].joinpath("main.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
-    wanted = {"_find_all", "_mem_snippet", "_agent_recall_excerpt"}
+    wanted = {"_find_all", "_mem_snippet", "_agent_recall_excerpt", "_merge_agent_recall_results"}
     nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {"MEMORY_INJECT_CHAR_CAP": 260}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "main.py", "exec"), namespace)
-    return namespace["_agent_recall_excerpt"]
+    return namespace["_agent_recall_excerpt"], namespace["_merge_agent_recall_results"]
 
 
-_agent_recall_excerpt = _load_excerpt_helpers()
+_agent_recall_excerpt, _merge_agent_recall_results = _load_excerpt_helpers()
 
 
 class AgentRecallExcerptTests(unittest.TestCase):
@@ -51,6 +51,32 @@ class AgentRecallExcerptTests(unittest.TestCase):
         excerpt = _agent_recall_excerpt(text, keywords=["萤火虫632"], cap=120)
 
         self.assertIn("萤火虫632", excerpt)
+
+    def test_direct_keyword_hits_survive_scratchpad_expansion(self):
+        direct = [
+            {"id": 2437, "content": "裸体围裙与意淫"},
+            {"id": 2438, "content": "昨晚睡眠"},
+            {"id": 1116, "content": "亲密习惯"},
+        ]
+        expanded = [
+            {"id": 9001, "content": "扩写结果一"},
+            {"id": 9002, "content": "扩写结果二"},
+            {"id": 9003, "content": "扩写结果三"},
+            {"id": 9004, "content": "扩写结果四"},
+            {"id": 9005, "content": "扩写结果五"},
+        ]
+
+        merged = _merge_agent_recall_results(direct, expanded, limit=5)
+
+        self.assertEqual([item["id"] for item in merged], [2437, 2438, 9001, 9002, 9003])
+
+    def test_merge_deduplicates_results_found_by_both_paths(self):
+        direct = [{"id": 2437, "content": "直搜"}]
+        expanded = [{"id": 2437, "content": "扩搜"}, {"id": 9001, "content": "另一条"}]
+
+        merged = _merge_agent_recall_results(direct, expanded, limit=5)
+
+        self.assertEqual([item["id"] for item in merged], [2437, 9001])
 
 
 if __name__ == "__main__":
