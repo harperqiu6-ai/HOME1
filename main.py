@@ -249,6 +249,8 @@ def _l2_logical_today():
 _round_counter = 0
 # ② L2今日状态（非缓存当前轮注入；后台每N轮刷新；启动时从 gateway_config 恢复）
 _l2_state = {"date": None, "today": "", "bridge": ""}
+_l2_refresh_running = False
+_cyberboss_l2_round_counter = 0
 
 # 强制流式传输（部分客户端不发stream=true导致thinking数据丢失，开启后强制所有请求走流式）
 FORCE_STREAM = os.getenv("FORCE_STREAM", "false").lower() == "true"
@@ -1655,12 +1657,12 @@ async def _scrub_digest_explicit(d: str) -> str:
 
 
 async def generate_today_digest(session_id: str) -> str:
-    """把【今天】的对话压成约 800-1000字"今天到哪了"，保质感（接铁则一：留阮阮情绪+触发现场，别压成第三人称干事实）。"""
-    if not session_id:
-        return ""
+    """把【今天】ECHO/TG 共用的 cyberboss 线压成"今天到哪了"。"""
+    digest_session_id = _l2_digest_session_id()
     try:
-        rows = await get_conversation_messages(session_id, limit=10000)
-    except Exception:
+        rows = await get_conversation_messages(digest_session_id, limit=10000)
+    except Exception as e:
+        print(f"⚠️ L2读取 cyberboss 对话线失败: {e}")
         return ""
     if not rows:
         return ""
@@ -1720,6 +1722,11 @@ async def generate_today_digest(session_id: str) -> str:
         return ""
 
 
+def _l2_digest_session_id() -> str:
+    """ECHO 是当前主入口，TG 是备用入口；两者统一抄送到这条陪伴主线。"""
+    return str(globals().get("CYBERBOSS_LINE_ID", "cyberboss") or "cyberboss").strip() or "cyberboss"
+
+
 async def refresh_l2(session_id: str) -> str:
     """生成并存今日浓缩；跨天则把昨日 today 转成一句桥（临时，L3 上线后撤）。"""
     today_s = str(_l2_logical_today())   # 逻辑日：凌晨4点前算前一天
@@ -1750,6 +1757,25 @@ async def refresh_l2(session_id: str) -> str:
         except Exception:
             pass
     return digest
+
+
+async def _refresh_l2_guarded(session_id: str):
+    """最多只跑一个 L2 请求；并发入口只需等下一轮，不让旧结果竞态覆盖新结果。"""
+    global _l2_refresh_running
+    if _l2_refresh_running:
+        return ""
+    _l2_refresh_running = True
+    try:
+        return await refresh_l2(session_id)
+    finally:
+        _l2_refresh_running = False
+
+
+def _schedule_l2_refresh(session_id: str):
+    try:
+        asyncio.create_task(_refresh_l2_guarded(session_id))
+    except Exception as e:
+        print(f"⚠️ L2刷新调度失败: {e}")
 
 
 def _compose_l2_block() -> str:
@@ -3392,10 +3418,9 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
         if L2_TODAY_ENABLED and L2_REFRESH_N > 0:
             _l2_today_s = str(_l2_logical_today())   # 逻辑日：凌晨4点前算前一天
             if (_round_counter % L2_REFRESH_N == 0) or (_l2_state.get("date") != _l2_today_s):
-                try:
-                    asyncio.create_task(refresh_l2(session_id))
-                except Exception as _le:
-                    print(f"⚠️ L2刷新调度失败: {_le}")
+                # cyberboss 的逐字抄送在 /api/line/log 自己计轮，避免这里重复调度。
+                if not (skip_conversation_log and session_id == globals().get("CYBERBOSS_LINE_ID", "cyberboss")):
+                    _schedule_l2_refresh(session_id)
 
         # ③-2 做梦懒触发：本地日变了(跨天)的第一句话→后台补做未覆盖的过去日(含昨天)。
         # 请求触发、无需 cron/常驻；维护成本只在跨天那一次。
@@ -4595,6 +4620,16 @@ async def api_line_log(request: Request):
     # cyberboss 线自动记忆提取：assistant 落地=一轮结束。凑齐紧邻的 user+assistant 对，
     # 就走与主线完全同款的后台提取管线（skip_conversation_log=True 防止双份入库；
     # 垃圾过滤/查重/feel/做梦懒触发等副作用与主线一致）。
+    if role == "assistant" and line == CYBERBOSS_LINE_ID:
+        global _cyberboss_l2_round_counter
+        _cyberboss_l2_round_counter += 1
+        if L2_TODAY_ENABLED and L2_REFRESH_N > 0:
+            _l2_today_s = str(_l2_logical_today())
+            if (
+                _cyberboss_l2_round_counter % L2_REFRESH_N == 0
+                or _l2_state.get("date") != _l2_today_s
+            ):
+                _schedule_l2_refresh(line)
     if role == "assistant" and line == CYBERBOSS_LINE_ID and MEMORY_ENABLED:
         try:
             rows = await get_conversation_messages(line, limit=10000)
@@ -5983,12 +6018,10 @@ async def api_summary_scrub_status():
 
 @app.post("/api/l2/dry")
 async def api_l2_dry(request: Request):
-    """L2 dry-run（只读·不写）：用新 prompt 对活跃线今天跑一遍 generate_today_digest，看新样子。"""
+    """L2 dry-run（只读·不写）：对 ECHO/TG 共用的 cyberboss 线生成今日浓缩。"""
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
-    sid = get_active_session_id()
-    if not sid:
-        return {"error": "无活跃对话线"}
+    sid = _l2_digest_session_id()
     d = await generate_today_digest(sid)
     return {"dry_run": True, "session": sid, "model": CACHE_SUMMARY_MODEL, "len": len(d or ""), "digest": d}
 
@@ -7226,14 +7259,14 @@ async def api_update_l5_candidate(cand_id: int, request: Request):
 
 @app.post("/api/l2/refresh")
 async def api_l2_refresh(request: Request):
-    """② L2今日：手动刷新今日浓缩（默认对活跃会话；返回生成的 digest 供查看/L2视图）。"""
+    """② L2今日：手动刷新 ECHO/TG 共用陪伴线的今日浓缩。"""
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
     try:
         body = await request.json()
     except Exception:
         body = {}
-    sid = (body.get("session_id") or get_active_session_id() or "").strip()
+    sid = _l2_digest_session_id()
     digest = await refresh_l2(sid)
     return {"status": "ok", "session_id": sid, "len": len(digest or ""),
             "today": _l2_state.get("today", ""), "bridge": _l2_state.get("bridge", "")}
