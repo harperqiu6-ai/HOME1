@@ -29,7 +29,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Res
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_recent_messages, extract_search_keywords, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge, apply_mood_drift, get_emotion_backfill_targets, update_emotion_only, update_memory_emotion
+from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_recent_messages, extract_search_keywords, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge, apply_mood_drift, get_emotion_backfill_targets, update_emotion_only, update_memory_emotion, enqueue_proactive_push, claim_proactive_push, ack_proactive_push
 from database import save_migrated_memory, find_memory_by_mw_id, save_photo, link_photo_to_memory, get_photo, memory_photo_count, delete_memory_photos, get_mw_meta, update_mw_meta, find_photo_id_by_hash, refresh_memory_embedding
 from database import list_memorywall, get_memorywall_one, update_memorywall, get_memory_photos, set_memory_active
 from database import get_memories_explicit_flags, set_memory_explicit, get_explicit_backfill_candidates, get_high_arousal_memories
@@ -5018,6 +5018,7 @@ PUSH_DEFAULTS = {
     "push_icon":         "https://pic1.imgdb.cn/item/6a3ce18bbb21102f81d40039.jpg",  # 推送图标(公网直链,需 iOS15+;留空=默认图标)
     "push_tg_token":     "",      # 双投递:vesper TG bot 的 token(留空=只发Bark)
     "push_tg_chat":      "",      # 双投递:主人的 TG chat_id
+    "push_echo_enabled": False,   # ECHO 主投递：写待送箱，由 VPS/cyberboss 认领
 }
 
 
@@ -5206,7 +5207,7 @@ async def maybe_send_proactive(force: bool = False) -> dict:
     cfg = await get_push_config()
     if not force and not cfg["push_enabled"]:
         return {"sent": False, "reason": "disabled"}
-    if not cfg["bark_url"]:
+    if not cfg.get("push_echo_enabled") and not cfg["bark_url"]:
         return {"sent": False, "reason": "no_bark_url"}
     sid = await _resolve_push_session()
     if not sid:
@@ -5319,10 +5320,21 @@ async def maybe_send_proactive(force: bool = False) -> dict:
             return {"sent": False, "reason": "quiet_hours_not_urgent"}
 
     title = AI_NAME or "AI"
-    ok_bark = await _bark_push(cfg["bark_url"], title, text, urgent=urgent, icon=cfg.get("push_icon", ""))
+    echo_item = None
+    if cfg.get("push_echo_enabled"):
+        try:
+            echo_item = await enqueue_proactive_push(text, urgent=urgent)
+        except Exception as _ee:
+            print(f"⚠️ ECHO主动私信入待送箱失败，回退 Bark/TG: {_ee}")
+
+    # ECHO 入箱成功就是主投递；只有入箱失败/未启用时才走旧 Bark/TG，避免一条消息弹三份。
+    echo_queued = bool(echo_item and echo_item.get("id"))
+    ok_bark = False
+    if not echo_queued:
+        ok_bark = await _bark_push(cfg["bark_url"], title, text, urgent=urgent, icon=cfg.get("push_icon", ""))
     # 双投递：vesper TG bot 也发一份(梯子不稳时 Bark 兜底；TG 可直接回复接着聊)
     ok_tg = False
-    if cfg.get("push_tg_token") and cfg.get("push_tg_chat"):
+    if not echo_queued and cfg.get("push_tg_token") and cfg.get("push_tg_chat"):
         try:
             _r = await _tg_api(cfg["push_tg_token"], "sendMessage",
                                {"chat_id": cfg["push_tg_chat"], "text": text,
@@ -5331,24 +5343,27 @@ async def maybe_send_proactive(force: bool = False) -> dict:
         except Exception as _te:
             print(f"⚠️ 主动私信TG(vesper)投递失败: {_te}")
     # 旧 TG bot 通道保留(当前已停用,不影响)
-    try:
-        _tgc = await get_tg_config()
-        if _tgc["tg_enabled"] and _tgc["tg_bot_token"] and _tgc["tg_chat_id"]:
-            await _tg_send(_tgc["tg_bot_token"], _tgc["tg_chat_id"], text)
-    except Exception as _te:
-        print(f"⚠️ TG 主动推送失败: {_te}")
-    if not ok_bark and not ok_tg:
+    if not echo_queued:
+        try:
+            _tgc = await get_tg_config()
+            if _tgc["tg_enabled"] and _tgc["tg_bot_token"] and _tgc["tg_chat_id"]:
+                await _tg_send(_tgc["tg_bot_token"], _tgc["tg_chat_id"], text)
+        except Exception as _te:
+            print(f"⚠️ TG 主动推送失败: {_te}")
+    if not echo_queued and not ok_bark and not ok_tg:
         return {"sent": False, "reason": "delivery_failed", "message": text}
     try:
         meta = _json_push.dumps({"proactive_push": True, "urgent": urgent})
         await save_message(sid, "assistant", text, PROACTIVE_MODEL, metadata=meta)
-        # TG 送达成功就抄一份进 cyberboss 线：TG分身开新线程时"重开前尾巴"能看到这条,接得住她的回复
+        # ECHO 主投递会由 cyberboss 真正发进 Chat，并由 Echo adapter 抄入 cyberboss 线。
+        # TG 送达成功才在这里直接抄一份，避免 ECHO 路径双写。
         if ok_tg and CYBERBOSS_LINE_ID and CYBERBOSS_LINE_ID != sid:
             await save_message(CYBERBOSS_LINE_ID, "assistant", text, PROACTIVE_MODEL, metadata=meta)
     except Exception as e:
         print(f"⚠️ 主动私信存库失败: {e}")
-    print(f"💌 主动私信已推送(bark={ok_bark} tg={ok_tg} urgent={urgent}): {text[:40]}")
+    print(f"💌 主动私信已投递(echo_queue={echo_queued} bark={ok_bark} tg={ok_tg} urgent={urgent}): {text[:40]}")
     return {"sent": True, "message": text, "urgent": urgent, "streak": streak + 1,
+            "echo_queued": echo_queued, "echo_outbox_id": echo_item.get("id") if echo_queued else None,
             "bark": ok_bark, "tg": ok_tg}
 
 
@@ -5396,6 +5411,32 @@ async def api_push_test():
     msg = "测试推送：能收到这条就说明 Bark 通了～"
     ok = await _bark_push(cfg["bark_url"], AI_NAME or "AI", msg, urgent=False, icon=cfg.get("push_icon", ""))
     return {"sent": ok, "message": msg if ok else "", "reason": "" if ok else "bark_failed"}
+
+
+@app.post("/api/push/echo/claim")
+async def api_push_echo_claim(request: Request):
+    """VPS/cyberboss 认领一条 HOME1 主动私信；网关鉴权由全局中间件负责。"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    item = await claim_proactive_push(body.get("lease_minutes", 10))
+    return {"push": item}
+
+
+@app.post("/api/push/echo/{push_id}/ack")
+async def api_push_echo_ack(push_id: int):
+    item = await ack_proactive_push(push_id)
+    if not item:
+        return JSONResponse(status_code=404, content={"error": "push_not_found"})
+    return {"status": "ok", "push": item}
+
+
+@app.post("/api/push/echo/test")
+async def api_push_echo_test():
+    """只入待送箱；用于验证 VPS→V→ECHO Chat→锁屏整条链。"""
+    item = await enqueue_proactive_push("ECHO 主动消息测试：以后我想起你，会从这里来找你。", urgent=False)
+    return {"status": "queued", "push": item}
 
 
 @app.post("/api/push/run")

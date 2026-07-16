@@ -173,6 +173,25 @@ async def init_tables():
             ON intimacy_submissions (status, created_at)
             WHERE deleted_at IS NULL;
         """)
+
+        # 主动私信待送箱：Render 只负责生成，VPS/cyberboss 认领后交给 ECHO。
+        # claimed_at 是租约；VPS 在 ack 前宕机时，过期后可重领，避免消息永久丢失。
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS proactive_push_outbox (
+                id           BIGSERIAL PRIMARY KEY,
+                message      TEXT NOT NULL,
+                urgent       BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                claimed_at   TIMESTAMPTZ,
+                delivered_at TIMESTAMPTZ,
+                attempts     INTEGER NOT NULL DEFAULT 0
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_proactive_push_outbox_pending
+            ON proactive_push_outbox (created_at)
+            WHERE delivered_at IS NULL;
+        """)
         
         # 分区缓存状态表（存储每个session的轮转状态）
         await conn.execute("""
@@ -3286,6 +3305,71 @@ async def delete_intimacy_submission(submission_id: str):
             RETURNING id
         """, submission_id)
     return bool(row)
+
+
+def _proactive_outbox_row(row):
+    if not row:
+        return None
+    return {
+        "id": int(row["id"]),
+        "message": row["message"] or "",
+        "urgent": bool(row["urgent"]),
+        "created_at": row["created_at"].isoformat() if row["created_at"] else "",
+        "claimed_at": row["claimed_at"].isoformat() if row["claimed_at"] else "",
+        "delivered_at": row["delivered_at"].isoformat() if row["delivered_at"] else "",
+        "attempts": int(row["attempts"] or 0),
+    }
+
+
+async def enqueue_proactive_push(message: str, urgent: bool = False):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO proactive_push_outbox (message, urgent)
+            VALUES ($1, $2)
+            RETURNING *
+        """, message, bool(urgent))
+    return _proactive_outbox_row(row)
+
+
+async def claim_proactive_push(lease_minutes: int = 10):
+    """Atomically claim the oldest undelivered push; expired leases may be reclaimed."""
+    lease_minutes = max(2, min(int(lease_minutes), 60))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow("""
+                SELECT * FROM proactive_push_outbox
+                WHERE delivered_at IS NULL
+                  AND (
+                    claimed_at IS NULL
+                    OR claimed_at < NOW() - ($1::int * INTERVAL '1 minute')
+                  )
+                ORDER BY created_at ASC, id ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            """, lease_minutes)
+            if not row:
+                return None
+            row = await conn.fetchrow("""
+                UPDATE proactive_push_outbox
+                SET claimed_at = NOW(), attempts = attempts + 1
+                WHERE id = $1 AND delivered_at IS NULL
+                RETURNING *
+            """, row["id"])
+    return _proactive_outbox_row(row)
+
+
+async def ack_proactive_push(push_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE proactive_push_outbox
+            SET delivered_at = COALESCE(delivered_at, NOW())
+            WHERE id = $1
+            RETURNING *
+        """, int(push_id))
+    return _proactive_outbox_row(row)
 
 
 async def revert_merge(memory_id: int):
