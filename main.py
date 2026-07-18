@@ -31,7 +31,7 @@ from fastapi.templating import Jinja2Templates
 
 from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_recent_messages, extract_search_keywords, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge, apply_mood_drift, get_emotion_backfill_targets, update_emotion_only, update_memory_emotion, enqueue_proactive_push, claim_proactive_push, ack_proactive_push
 from database import save_migrated_memory, find_memory_by_mw_id, save_photo, link_photo_to_memory, get_photo, memory_photo_count, delete_memory_photos, get_mw_meta, update_mw_meta, find_photo_id_by_hash, refresh_memory_embedding
-from database import list_memorywall, get_memorywall_one, update_memorywall, get_memory_photos, set_memory_active
+from database import list_memorywall, get_memorywall_one, update_memorywall, get_memory_photos, set_memory_active, supersede_fragment
 from database import get_memories_explicit_flags, set_memory_explicit, get_explicit_backfill_candidates, get_high_arousal_memories
 from database import get_long_memories, split_memory_into, undo_split, undo_split_one
 from database import get_fragments_by_time_window
@@ -630,6 +630,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AI Memory Gateway", version="2.0.0", lifespan=lifespan)
+
+# 大响应(如 /api/memories 全量 1.3MB)走跨境隧道裸传极慢，gzip 后约 1/4
+from fastapi.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # 亲密小屋部署在 GitHub Pages。只允许该 HTTPS 来源跨域访问；
 # 即使来源匹配，公开接口仍必须通过独立的 X-Intimacy-Key。
@@ -2580,7 +2584,7 @@ async def _expand_draw_prompt(raw: str, line: str = None) -> str:
         return ""
 
 
-_imagegen_last_error = ""      # 最近一次存图失败的真实报错(给 /api/imagegen/status,Render 日志看不到时用)
+_imagegen_last_error = ""      # 最近一次存图失败的真实报错(给 /api/imagegen/status,远端日志看不到时用)
 
 
 async def _store_generated_image(prompt: str, mime: str, data: bytes, session_id: str):
@@ -3538,12 +3542,15 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
             )
             saved += 1
             # A2 冲突处理：新事实推翻旧事实 → 把被推翻的旧条目置 inactive（不再并存打架）
+            # 只准推翻 layer1 普通碎片：回忆墙/事件记忆受保护(2026-07-18 曾被误翻掉整篇当日回忆墙)
             rid = mem.get("replaces_id")
             if rid:
                 try:
-                    await set_memory_active(int(rid), False)
-                    superseded += 1
-                    print(f"♻️ 新事实推翻旧记忆 #{rid}，已置 inactive: {mem['content'][:40]}...")
+                    if await supersede_fragment(int(rid)):
+                        superseded += 1
+                        print(f"♻️ 新事实推翻旧记忆 #{rid}，已置 inactive: {mem['content'][:40]}...")
+                    else:
+                        print(f"🛡️ replaces_id={rid} 指向受保护记忆(回忆墙/事件)或不存在，忽略推翻")
                 except Exception as ce:
                     print(f"⚠️ 置旧记忆 inactive 失败 (#{rid}): {ce}")
 
@@ -3560,6 +3567,7 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
 # ============================================================
 
 @app.get("/")
+@app.get("/health")
 async def health_check():
     """健康检查"""
     memory_count = 0
@@ -5197,7 +5205,7 @@ async def _decide_and_write(persona: str, transcript: str, silence_min: float, i
 
 # 「问过就别再问」冷却：LLM 判定过"不发"后，只要用户没有新消息(对话没变化)，
 # 冷却期内不再花钱去问同一个问题。用户一说话 last_user_ts 变了，冷却自动作废。
-# (内存变量,Render 重启即清,最坏多问一次,可接受)
+# (内存变量,服务重启即清,最坏多问一次,可接受)
 PROACTIVE_SKIP_COOLDOWN_MIN = float(os.getenv("PROACTIVE_SKIP_COOLDOWN_MIN", "45"))
 _proactive_skip_state = {"decided_at": None, "last_user_ts": None}
 
@@ -5457,7 +5465,7 @@ async def api_push_run(request: Request):
 #   只服务"绑定的主人"(tg_chat_id, 首条消息自动锁定), 陌生人忽略
 # ============================================================
 TG_API_BASE = "https://api.telegram.org"
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://home1-htca.onrender.com").rstrip("/")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
 
 TG_DEFAULTS = {
     "tg_enabled":   False,   # 总开关

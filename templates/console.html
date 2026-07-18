@@ -275,7 +275,15 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border:none;border-ra
 
 <script>
 const KEY = new URLSearchParams(location.search).get('gateway_key') || '';
-document.getElementById('back-link').href = '/dashboard' + (KEY ? ('?gateway_key=' + encodeURIComponent(KEY)) : '');
+function computeBasePath(){
+  const p = location.pathname || '';
+  const stripped = p.replace(/\\/(dashboard|console)\\/?$/, '');
+  if (!stripped || stripped === '/') return '';
+  return stripped.replace(/\/$/, '');
+}
+const BASE = computeBasePath();
+function apiPath(path){ return BASE + path; }
+document.getElementById('back-link').href = BASE + '/' + (KEY ? ('?gateway_key=' + encodeURIComponent(KEY)) : '');
 let DATA = null;
 
 function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove('show'),2600); }
@@ -283,7 +291,7 @@ function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg
 async function api(path, opt){
   opt = opt || {}; opt.headers = Object.assign({'X-Gateway-Key': KEY}, opt.headers||{});
   if(opt.body && typeof opt.body!=='string'){ opt.body=JSON.stringify(opt.body); opt.headers['Content-Type']='application/json'; }
-  const r = await fetch(path, opt); let j=null; try{ j=await r.json(); }catch(e){}
+  const r = await fetch(apiPath(path), opt); let j=null; try{ j=await r.json(); }catch(e){}
   if(!r.ok) throw new Error((j&&j.error)||('HTTP '+r.status));
   return j;
 }

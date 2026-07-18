@@ -1531,6 +1531,20 @@ async def set_memory_active(memory_id: int, active: bool):
         await conn.execute("UPDATE memories SET is_active = $2 WHERE id = $1", memory_id, active)
 
 
+async def supersede_fragment(memory_id: int) -> bool:
+    """A2 冲突处理专用：只允许推翻 layer1 普通碎片。回忆墙/事件记忆(layer>1 或 mw_meta 非空)受保护——
+    提取模型的 replaces_id 是小模型自由发挥的，2026-07-18 曾把前夜刚生成的当日回忆墙(#2596)整篇推翻。
+    返回 True=真的停用了；False=目标受保护或不存在，调用方应忽略这次推翻。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE memories SET is_active = FALSE "
+            "WHERE id = $1 AND layer = 1 AND mw_meta IS NULL "
+            "RETURNING id",
+            memory_id)
+        return row is not None
+
+
 # ---- 人设建议（A4）：行为/相处偏好的收集，供主理人贴 persona ----
 
 async def save_l5_candidate(content: str, event_date=None, source_session: str = "", target: str = "l5"):
