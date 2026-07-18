@@ -4,6 +4,9 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>HOME1 · 记忆页</title>
+  <link rel="stylesheet" href="static/css/fonts.css">
+  <link rel="stylesheet" href="static/css/theme.css">
+  <link rel="stylesheet" href="static/css/dashboard.css?v=4.1-rooms">
   <style>
     :root{
       --bg:#08111f;
@@ -341,8 +344,201 @@
       .stats{grid-template-columns:1fr}
     }
   </style>
+  <style>
+    .hero{display:none!important}
+    .wrap{padding-top:0}
+    .dashboard-shell{
+      max-width:1260px;
+      margin:18px auto 0;
+      padding:0 18px;
+      display:grid;
+      grid-template-columns:240px minmax(0,1fr);
+      gap:18px;
+    }
+    .sidebar{
+      position:sticky;
+      top:18px;
+      align-self:start;
+      border:1px solid rgba(197,165,90,.18);
+      border-radius:22px;
+      background:linear-gradient(180deg,rgba(16,26,45,.96),rgba(8,17,31,.98));
+      box-shadow:0 24px 80px rgba(0,0,0,.32);
+      overflow:hidden;
+    }
+    .sidebar-header{
+      padding:20px 18px 16px;
+      border-bottom:1px solid rgba(255,255,255,.08);
+    }
+    .logo{
+      width:34px;height:34px;border-radius:12px;
+      display:grid;place-items:center;
+      border:1px solid rgba(231,90,124,.35);
+      background:rgba(231,90,124,.08);
+      color:#e75a7c;
+    }
+    .logo-text{display:block;margin-top:10px;font-size:16px;letter-spacing:.12em;color:var(--gold2)}
+    .sidebar-nav{display:grid;padding:10px}
+    .nav-item{
+      display:flex;align-items:center;gap:12px;
+      padding:10px 12px;border-radius:14px;
+      text-decoration:none;color:var(--text);
+      border:1px solid transparent;
+    }
+    .nav-item:hover,.nav-item.active{
+      background:rgba(255,255,255,.04);
+      border-color:rgba(197,165,90,.16);
+      color:var(--gold2);
+    }
+    .nav-icon{width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center;color:#e75a7c;flex:0 0 auto}
+    .nav-label{font-size:14px}
+    .sidebar-footer{padding:10px;border-top:1px solid rgba(255,255,255,.08)}
+    .shell-main{min-width:0}
+    .home-wrap{
+      position:relative;
+      border:1px solid rgba(197,165,90,.18);
+      border-radius:24px;
+      background:linear-gradient(180deg,rgba(16,26,45,.96),rgba(8,17,31,.98));
+      box-shadow:0 24px 80px rgba(0,0,0,.35);
+      padding:26px 24px 20px;
+      overflow:hidden;
+    }
+    .home-header{text-align:center;padding:10px 0 8px}
+    .home-title{font-family:var(--font-serif, serif);font-size:28px;letter-spacing:.18em;color:var(--gold2)}
+    .home-sub{margin-top:8px;color:var(--muted);line-height:1.7}
+    .home-days{margin-top:10px;color:var(--muted)}
+    .home-days b{color:var(--gold2)}
+    .today-wave{
+      margin-top:16px;
+      padding:16px 18px;
+      border-radius:18px;
+      border:1px solid rgba(255,255,255,.08);
+      background:rgba(255,255,255,.025);
+    }
+    .wave-header{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+    .wave-label,.wave-label-cn{font-size:12px;letter-spacing:.2em;color:var(--muted)}
+    .wave-date{margin-top:10px;color:var(--gold2);font-size:15px}
+    .wave-quote{margin-top:10px;font-size:18px;line-height:1.8;color:#efe6d1}
+    .wave-author{margin-top:10px;font-size:13px;color:var(--muted);text-align:right}
+    .rooms-label{text-align:center;margin:18px 0 12px;letter-spacing:.35em;color:var(--muted);font-size:12px}
+    .rooms{
+      display:grid;
+      grid-template-columns:repeat(3,minmax(0,1fr));
+      gap:12px;
+    }
+    .room{
+      position:relative;
+      border:1px solid rgba(197,165,90,.16);
+      border-radius:18px;
+      padding:16px 14px 14px;
+      background:rgba(255,255,255,.03);
+      min-height:126px;
+      cursor:pointer;
+      display:flex;
+      flex-direction:column;
+      justify-content:space-between;
+    }
+    .room:hover{transform:translateY(-1px);border-color:rgba(242,228,186,.36)}
+    .room-numeral{position:absolute;top:10px;right:12px;font-size:12px;color:var(--muted);letter-spacing:.18em}
+    .room-icon{font-size:22px;color:#e75a7c;margin-bottom:8px}
+    .room-title{font-size:18px;color:var(--gold2)}
+    .room-en{font-size:12px;letter-spacing:.12em;color:var(--muted);text-transform:uppercase}
+    .room-count{display:block;margin-top:8px;font-size:12px;color:var(--muted)}
+    .home-foot{text-align:center;margin-top:16px;color:var(--muted);letter-spacing:.28em;font-size:12px}
+    .mini-shell{
+      margin-top:18px;
+      border:1px solid rgba(197,165,90,.16);
+      border-radius:22px;
+      background:rgba(8,17,31,.72);
+      padding:18px;
+    }
+    .mini-shell h2{margin:0;color:var(--gold2);font-size:20px}
+    .mini-shell .section-desc{margin:6px 0 0;color:var(--muted)}
+    .mini-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:12px;margin-top:14px}
+    .mini-card{
+      border:1px solid rgba(255,255,255,.08);
+      background:rgba(255,255,255,.03);
+      border-radius:16px;
+      padding:14px;
+    }
+    .mini-title{font-size:14px;color:var(--gold2);margin-bottom:8px}
+    .mini-text{line-height:1.8;color:#e3dccd;white-space:pre-wrap}
+    .mini-muted{color:var(--muted);font-size:13px;line-height:1.7}
+    @media (max-width: 980px){
+      .dashboard-shell{grid-template-columns:1fr}
+      .sidebar{position:static}
+    }
+    @media (max-width: 700px){
+      .rooms{grid-template-columns:1fr}
+      .mini-grid{grid-template-columns:1fr}
+    }
+  </style>
 </head>
 <body>
+  <div class="dashboard-shell">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="logo">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/>
+            <path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/>
+          </svg>
+        </div>
+        <span class="logo-text">Memory Gateway</span>
+      </div>
+      <nav class="sidebar-nav">
+        <a href="#home" class="nav-item active" data-section="home"><span class="nav-icon">⌂</span><span class="nav-label">家</span></a>
+        <a href="#moment" class="nav-item" data-section="moment"><span class="nav-icon">◔</span><span class="nav-label">他在读</span></a>
+        <a href="#foundation" class="nav-item" data-section="foundation"><span class="nav-icon">◆</span><span class="nav-label">里程碑</span></a>
+        <a href="#wall" class="nav-item" data-section="wall"><span class="nav-icon">♥</span><span class="nav-label">回忆墙</span></a>
+        <a href="#memories" class="nav-item" data-section="memories"><span class="nav-icon">▤</span><span class="nav-label">记忆管理</span></a>
+        <a href="#dreams" class="nav-item" data-section="dreams"><span class="nav-icon">☾</span><span class="nav-label">梦境日记</span></a>
+        <a href="/console" class="nav-item" id="consoleLinkNav"><span class="nav-icon">⚙</span><span class="nav-label">操作间</span></a>
+      </nav>
+      <div class="sidebar-footer">
+        <a class="nav-item" href="https://github.com/harperqiu6-ai/HOME1" target="_blank" rel="noreferrer"><span class="nav-icon">↗</span><span class="nav-label">GitHub</span></a>
+      </div>
+    </aside>
+    <main class="shell-main">
+      <section id="home" class="home-wrap">
+        <div class="home-header">
+          <div class="home-title" id="home-title">OUR HOME</div>
+          <div class="home-sub" id="home-sub">正在读取首页数据…</div>
+          <div class="home-days" id="home-days-wrap" style="display:none">在一起的第 <b id="home-days">—</b> 天</div>
+        </div>
+        <div class="today-wave">
+          <div class="wave-header"><span class="wave-label">TODAY WAVE</span><span class="wave-label-cn">今日电波 · 此刻想说的</span></div>
+          <div class="wave-date" id="home-wave-date">今天</div>
+          <div class="wave-quote" id="home-wave-quote">…</div>
+          <div class="wave-author" id="home-author"></div>
+        </div>
+        <div class="rooms-label">— 推 门 进 去 —</div>
+        <div class="rooms">
+          <div class="room" data-room="memories"><span class="room-numeral">I</span><span class="room-icon">▤</span><div><div class="room-title">记忆</div><div class="room-en">Memory</div><span class="room-count"><span id="home-c-memory">—</span> 条</span></div></div>
+          <div class="room" data-room="moment"><span class="room-numeral">II</span><span class="room-icon">◔</span><div><div class="room-title">他在读</div><div class="room-en">This Moment</div><span class="room-count">现在正在看什么</span></div></div>
+          <div class="room" data-room="dreams"><span class="room-numeral">III</span><span class="room-icon">☾</span><div><div class="room-title">梦境</div><div class="room-en">Dreams</div><span class="room-count"><span id="home-c-dreams">—</span> 篇</span></div></div>
+          <div class="room" data-room="foundation"><span class="room-numeral">IV</span><span class="room-icon">◆</span><div><div class="room-title">里程碑</div><div class="room-en">Foundation</div><span class="room-count">关系骨架</span></div></div>
+          <div class="room" data-room="wall"><span class="room-numeral">V</span><span class="room-icon">♥</span><div><div class="room-title">回忆墙</div><div class="room-en">Keepsakes</div><span class="room-count"><span id="home-c-wall">—</span> 条</span></div></div>
+          <div class="room" data-room="console"><span class="room-numeral">VI</span><span class="room-icon">⚙</span><div><div class="room-title">操作间</div><div class="room-en">Console</div><span class="room-count">旋钮</span></div></div>
+        </div>
+        <div class="home-foot"><span id="home-foot-text">♦ Memory Gateway ♦</span></div>
+      </section>
+      <section id="moment" class="mini-shell">
+        <div class="section-header"><h2>他在读</h2><p class="section-desc">当前线的摘要 + 最近几轮逐字</p></div>
+        <div class="mini-grid">
+          <div class="mini-card"><div class="mini-title">当前摘要</div><div class="mini-text" id="moment-summary">加载中…</div></div>
+          <div class="mini-card"><div class="mini-title">最近对话</div><div class="mini-text" id="moment-recent">加载中…</div></div>
+        </div>
+      </section>
+      <section id="foundation" class="mini-shell">
+        <div class="section-header"><h2>里程碑</h2><p class="section-desc">关系骨架 / L5 Foundation</p></div>
+        <div class="mini-card">
+          <div class="mini-title">当前里程碑</div>
+          <div class="mini-text" id="foundation-text">加载中…</div>
+          <div class="card-actions" style="margin-top:12px;"><a class="btn small" href="/console">去操作间查看</a></div>
+        </div>
+      </section>
+    </main>
+  </div>
   <div class="wrap">
     <header class="hero">
       <div class="eyebrow">HOME1 · MEMORY PAGE</div>
@@ -1184,6 +1380,44 @@
         setStats(memCount, wallCount, dreamCount, KEY ? '已载入' : '未设置');
       }catch(e){}
     }
+    async function loadHomeData(){
+      try{
+        const [home, recent, settings] = await Promise.all([
+          KEY ? api('/api/home') : Promise.resolve(null),
+          KEY ? api('/api/line/recent') : Promise.resolve(null),
+          KEY ? api('/api/settings') : Promise.resolve(null),
+        ]);
+        if (home && home.home) {
+          $('home-title').textContent = home.home.title || 'OUR HOME';
+          $('home-sub').textContent = home.home.subtitle || '';
+          if (home.home.since) {
+            const since = String(home.home.since).slice(0,10);
+            $('home-days-wrap').style.display = 'block';
+            $('home-days').textContent = since;
+          }
+          $('home-wave-date').textContent = (home.wave && home.wave.date) || '今天';
+          $('home-wave-quote').textContent = (home.wave && home.wave.quote) || '…';
+          $('home-author').textContent = (home.wave && home.wave.source) ? `— ${home.wave.source}` : '';
+          $('home-c-memory').textContent = home.counts && typeof home.counts.memory !== 'undefined' ? home.counts.memory : '—';
+          $('home-c-wall').textContent = home.counts && typeof home.counts.wall !== 'undefined' ? home.counts.wall : '—';
+          $('home-c-dreams').textContent = home.counts && typeof home.counts.dreams !== 'undefined' ? home.counts.dreams : '—';
+        }
+        if (recent) {
+          $('moment-summary').textContent = recent.summary || '—';
+          const recentLines = (recent.recent || []).map(r => `${r.role === 'user' ? '她' : '他'}：${r.content}`).join('\n\n');
+          $('moment-recent').textContent = recentLines || '—';
+        }
+        if (settings && settings.l5Foundation) {
+          $('foundation-text').textContent = settings.l5Foundation || '—';
+        } else if (settings && settings.systemPrompt) {
+          $('foundation-text').textContent = settings.systemPrompt || '—';
+        }
+      }catch(e){
+        $('moment-summary').textContent = '读取失败：' + e.message;
+        $('moment-recent').textContent = '读取失败：' + e.message;
+        $('foundation-text').textContent = '读取失败：' + e.message;
+      }
+    }
     async function reloadAll(){
       if (!KEY) {
         updateLinks();
@@ -1193,7 +1427,7 @@
         $('dreamSummary').textContent = '先输入 gateway key。';
         return;
       }
-      await Promise.all([loadMemories(), loadWall(), loadDreams()]);
+      await Promise.all([loadHomeData(), loadMemories(), loadWall(), loadDreams()]);
       updateLinks();
     }
     function openMemoryOverlay(){ $('memoryOverlay').style.display = 'flex'; }
@@ -1210,10 +1444,34 @@
     function initialLoad(){
       if (KEY) $('gatewayKey').value = KEY;
       updateLinks();
+      $('consoleLinkNav').href = pageLink('/console');
+      document.querySelectorAll('.room').forEach(el => {
+        el.addEventListener('click', () => {
+          const room = el.dataset.room;
+          if (room === 'console') { location.href = pageLink('/console'); return; }
+          const target = document.getElementById(room === 'memories' ? 'memories' : room);
+          if (target) target.scrollIntoView({behavior:'smooth', block:'start'});
+        });
+      });
+      document.querySelectorAll('.sidebar-nav .nav-item[data-section]').forEach(a => {
+        a.addEventListener('click', (e) => {
+          const id = a.dataset.section;
+          const target = document.getElementById(id === 'home' ? 'home' : id);
+          if (target) {
+            e.preventDefault();
+            target.scrollIntoView({behavior:'smooth', block:'start'});
+          }
+        });
+      });
       if (KEY) {
         reloadAll();
       } else {
         setStats('—','—','—','先输入钥匙');
+        $('home-title').textContent = 'OUR HOME';
+        $('home-sub').textContent = '先输入 gateway key 再读取首页数据。';
+        $('moment-summary').textContent = '先输入 gateway key。';
+        $('moment-recent').textContent = '先输入 gateway key。';
+        $('foundation-text').textContent = '先输入 gateway key。';
         $('memoryList').innerHTML = '<div class="empty">先输入 gateway key 再打开记忆。</div>';
         $('wallList').innerHTML = '<div class="empty">先输入 gateway key 再打开回忆墙。</div>';
         $('dreamList').innerHTML = '<div class="empty">先输入 gateway key 再打开做梦。</div>';
