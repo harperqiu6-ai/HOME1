@@ -404,9 +404,9 @@ body {
 /* 表格内输入框 */
 .content-textarea {
     width: 100%;
-    min-height: 50px;
+    min-height: 110px;
     padding: 10px 12px;
-    font-size: 13px;
+    font-size: 14px;
     line-height: 1.5;
     border: 1px solid var(--border);
     border-radius: var(--radius-xs);
@@ -1333,6 +1333,7 @@ body {
 .mw-thumb:hover { transform:scale(1.04); }
 .mw-body { font-size:13px; color:var(--text-light); line-height:1.7; cursor:pointer; }
 .mw-body.mw-collapsed { display:-webkit-box; -webkit-line-clamp:4; -webkit-box-orient:vertical; overflow:hidden; }
+.mw-summary { font-size:13px; color:var(--text); line-height:1.65; padding:10px 12px; background:var(--bg); border-left:3px solid var(--primary); border-radius:6px; }
 .mw-danger { color:var(--danger); }
 .mw-danger:hover { background:var(--danger-bg); border-color:var(--danger); }
 .mw-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.4); z-index:1000; display:flex; align-items:center; justify-content:center; padding:20px; }

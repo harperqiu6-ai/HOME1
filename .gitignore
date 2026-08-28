@@ -18,3 +18,17 @@ seed_memories.py
 # OS
 .DS_Store
 Thumbs.db
+
+# Private arousal lexicon (repository keeps only arousal/lexicon.example.json)
+private/arousal_lexicon.json
+
+# Local safety snapshots created during iterative repairs
+*.bak
+*.bak.*
+*.bak-*
+
+# Turritopsis canonical knowledge is tracked; working/rolling files are local
+.turritopsis/backups/
+.turritopsis/bodies/
+.turritopsis/*.lock
+.turritopsis/updates.json

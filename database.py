@@ -15,9 +15,23 @@ from typing import Optional, List
 from datetime import datetime, timedelta, timezone as dt_timezone
 
 import asyncpg
+from consolidation_transaction import commit_l2_and_absorb_sources
 
 # 时区偏移（和 main.py 保持一致）
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
+L2_DAY_CUTOVER_HOUR = int(os.getenv("L2_DAY_CUTOVER_HOUR", "4"))
+
+
+def logical_day_for_timestamp(value):
+    """本地逻辑日：凌晨4点前仍归入前一天；原始created_at不变。"""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt_timezone.utc)
+    local = value.astimezone(dt_timezone(timedelta(hours=TIMEZONE_HOURS)))
+    if local.hour < L2_DAY_CUTOVER_HOUR:
+        local = local - timedelta(days=1)
+    return local.date()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
@@ -146,6 +160,44 @@ async def init_tables():
             CREATE TABLE IF NOT EXISTS gateway_config (
                 key     TEXT PRIMARY KEY,
                 value   TEXT DEFAULT ''
+            );
+        """)
+
+        # 欲望语境批分类待处理队列：先落库，成功分类后删除，服务重启不丢。
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS desire_pending_classifications (
+                id                       TEXT PRIMARY KEY,
+                text                     TEXT NOT NULL,
+                context                  TEXT NOT NULL DEFAULT '',
+                intimate_scene_open      BOOLEAN NOT NULL DEFAULT FALSE,
+                intimate_scene_id        TEXT NOT NULL DEFAULT '',
+                intimate_window_minutes  INTEGER NOT NULL DEFAULT 0,
+                current_implicit         BOOLEAN NOT NULL DEFAULT FALSE,
+                status                   TEXT NOT NULL DEFAULT 'pending',
+                attempt_count            INTEGER NOT NULL DEFAULT 0,
+                next_retry_at             TIMESTAMPTZ,
+                last_error               TEXT NOT NULL DEFAULT '',
+                created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            ALTER TABLE desire_pending_classifications ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
+            ALTER TABLE desire_pending_classifications ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE desire_pending_classifications ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ;
+            ALTER TABLE desire_pending_classifications ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL DEFAULT '';
+            CREATE INDEX IF NOT EXISTS idx_desire_pending_due
+                ON desire_pending_classifications(status,next_retry_at,created_at);
+            CREATE TABLE IF NOT EXISTS desire_classification_dead_letters (
+                id                       TEXT PRIMARY KEY,
+                text                     TEXT NOT NULL,
+                context                  TEXT NOT NULL DEFAULT '',
+                intimate_scene_open      BOOLEAN NOT NULL DEFAULT FALSE,
+                intimate_scene_id        TEXT NOT NULL DEFAULT '',
+                intimate_window_minutes  INTEGER NOT NULL DEFAULT 0,
+                current_implicit         BOOLEAN NOT NULL DEFAULT FALSE,
+                attempt_count            INTEGER NOT NULL,
+                last_error               TEXT NOT NULL DEFAULT '',
+                created_at               TIMESTAMPTZ NOT NULL,
+                dead_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
         """)
 
@@ -290,6 +342,27 @@ async def init_tables():
                     ALTER TABLE memories ADD COLUMN decayed_at TIMESTAMPTZ DEFAULT NULL;
                 END IF;
             END $$;
+        """)
+
+        # memory kind: fact=普通事实；musing=V的原声随想，永久活跃且不进入夜间整理。
+        # 旧前缀只负责一次性兼容回填；后续所有生命周期判断以独立字段为准。
+        await conn.execute("""
+            ALTER TABLE memories
+            ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'fact';
+            UPDATE memories
+            SET kind = 'musing', is_active = TRUE, decayed_at = NULL
+            WHERE content LIKE '【V的随想】%' AND kind <> 'musing';
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'memories_kind_check'
+                ) THEN
+                    ALTER TABLE memories
+                    ADD CONSTRAINT memories_kind_check
+                    CHECK (kind IN ('fact', 'musing'));
+                END IF;
+            END $$;
+            CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories (kind);
         """)
 
         # 情绪①-第二步 心情漂移：每条记忆每日漂移次数（防跑飞的「每条每日封顶」用；这两列仅作计数，不碰正文/importance/日期）
@@ -725,6 +798,19 @@ async def get_last_user_content(session_id: str) -> str:
         return row['content'] if row else ""
 
 
+async def get_last_user_message(session_id: str):
+    """Return the latest user message with its durable timestamp."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT content, created_at FROM conversations
+            WHERE session_id = $1 AND role = 'user'
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, session_id)
+        return dict(row) if row else None
+
+
 async def update_last_assistant_message(session_id: str, new_content: str, model: str = ""):
     """覆盖指定session最后一条assistant消息的content（用于re-roll去重）"""
     pool = await get_pool()
@@ -838,17 +924,49 @@ async def update_message_content(message_id: int, new_content: str):
 # 记忆操作
 # ============================================================
 
-async def save_memory(content: str, importance: int = 5, source_session: str = "", valence: float = 0.0, arousal: float = 0.2, is_explicit: bool = False):
+SUIXIANG_TAG = "【V的随想】"
+_SUIXIANG_HEAD_RE = re.compile(
+    r"^\s*[\[【〔「(（]\s*[VvＶ]\s*的?\s*随想\s*[\]】〕」)）]\s*[:：]?\s*"
+)
+
+
+def normalize_suixiang_content(content: str, force: bool = False) -> str:
+    """Keep the familiar display prefix canonical without using it as storage state."""
+    if not content:
+        return content
+    match = _SUIXIANG_HEAD_RE.match(content)
+    if match:
+        return SUIXIANG_TAG + content[match.end():]
+    if force:
+        return SUIXIANG_TAG + content.lstrip()
+    return content
+
+
+async def save_memory(content: str, importance: int = 5, source_session: str = "",
+                      valence: float = 0.0, arousal: float = 0.2,
+                      is_explicit: bool = False, kind: str = "fact",
+                      suixiang: bool = False):
+    normalized_kind = str(kind or "fact").strip().lower()
+    if normalized_kind not in {"fact", "musing"}:
+        normalized_kind = "fact"
+    if suixiang or _SUIXIANG_HEAD_RE.match(str(content or "")):
+        normalized_kind = "musing"
+    content = normalize_suixiang_content(
+        content, force=(normalized_kind == "musing")
+    )
     pool = await get_pool()
     async with pool.acquire() as conn:
         # 情绪① 夹紧到合法范围（arousal 默认 0.2 兼作地板，避免后续衰减乘到 0 退化）
         _val = max(-1.0, min(1.0, float(valence if valence is not None else 0.0)))
         _aro = max(0.0, min(1.0, float(arousal if arousal is not None else 0.2)))
         # 实时写入的碎片：event_date 直接落本地"今天"，供回忆墙生成后按事件日归档当天碎片用
-        _event_date = (datetime.now(dt_timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date()
+        _event_date = logical_day_for_timestamp(datetime.now(dt_timezone.utc))
         row = await conn.fetchrow(
-            "INSERT INTO memories (content, importance, source_session, valence, arousal, is_explicit, event_date) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
-            content, importance, source_session, _val, _aro, bool(is_explicit), _event_date,
+            "INSERT INTO memories (content, importance, source_session, valence, arousal, "
+            "is_explicit, event_date, kind) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
+            "RETURNING id",
+            content, importance, source_session, _val, _aro, bool(is_explicit),
+            _event_date, normalized_kind,
         )
         
         # MEMORY_VECTOR_ENABLED 时自动计算 embedding
@@ -869,6 +987,7 @@ async def get_long_memories(min_len: int = 300, limit: int = 500):
             """SELECT id, content, importance, valence, arousal, is_explicit, created_at
                FROM memories
                WHERE is_active = TRUE AND mw_meta IS NULL
+                 AND kind <> 'musing'
                  AND content IS NOT NULL AND char_length(btrim(content)) > $1
                ORDER BY char_length(content) DESC
                LIMIT $2""",
@@ -905,7 +1024,11 @@ async def split_memory_into(original_id: int, contents: list) -> list:
                         await save_memory_embedding(conn, nid, emb)
                 except Exception as e:
                     print(f"⚠️ 拆分子记忆 {nid} 向量失败: {e}")
-        await conn.execute("UPDATE memories SET is_active = FALSE WHERE id = $1", original_id)
+        await conn.execute(
+            "UPDATE memories SET is_active = FALSE "
+            "WHERE id = $1 AND kind <> 'musing'",
+            original_id,
+        )
     return new_ids
 
 
@@ -1070,6 +1193,7 @@ async def get_decay_candidates(age_days: int = 7, imp_max: int = 4,
             "       FLOOR(EXTRACT(EPOCH FROM (NOW()-COALESCE(last_accessed,created_at)))/86400)::int AS idle_days "
             "FROM memories "
             "WHERE is_active = TRUE AND mw_meta IS NULL AND content IS NOT NULL AND btrim(content) <> '' "
+            "  AND kind <> 'musing' "
             "  AND COALESCE(importance,5) <= $1 "
             "  AND COALESCE(arousal,0) < $2 "
             "  AND created_at < NOW() - make_interval(days => $3) "
@@ -1113,7 +1237,8 @@ async def archive_decayed_memories(memory_ids: list):
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE memories SET is_active = FALSE, decayed_at = NOW() WHERE id = ANY($1::int[])",
+            "UPDATE memories SET is_active = FALSE, decayed_at = NOW() "
+            "WHERE id = ANY($1::int[]) AND kind <> 'musing'",
             memory_ids)
 
 
@@ -1238,7 +1363,7 @@ async def get_avg_arousal_for_date(date_s) -> float:
 
 
 async def get_fragment_ids_for_date(date_s) -> list:
-    """某个本地日期当天、还活跃的 layer1 碎片 id 列表(排除做梦写的可检索条目和RP归档总结)，
+    """某个逻辑日(04:00~次日04:00)、还活跃的 layer1 碎片 id 列表(排除做梦、V的随想和RP归档总结)，
     供回忆墙生成后归档当天碎片用(回忆墙已经覆盖,碎片留着只是冗余,占检索名额)。
     RP归档总结豁免：archive_line() 写的那条是整条RP线的唯一可检索精华(回忆墙日记是文学化叙事,
     替代不了它)，被扫掉=其它线(TG/主线)永远搜不到这场RP → 曾造成"归档后TG说没搜到"事故(2026-07-04)。
@@ -1250,7 +1375,10 @@ async def get_fragment_ids_for_date(date_s) -> list:
         y, m, d = (int(x) for x in date_s.split("-"))
     else:
         y, m, d = date_s.year, date_s.month, date_s.day
-    start_utc = datetime(y, m, d, tzinfo=local_tz).astimezone(dt_timezone.utc)
+    # Must match get_all_conversations_for_date() and nightly consolidation.
+    # A midnight boundary here archives 00:00~04:00 fragments under the wrong
+    # wall day even though the diary itself correctly treats them as yesterday.
+    start_utc = datetime(y, m, d, L2_DAY_CUTOVER_HOUR, tzinfo=local_tz).astimezone(dt_timezone.utc)
     end_utc = start_utc + timedelta(days=1)
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -1259,29 +1387,33 @@ async def get_fragment_ids_for_date(date_s) -> list:
             "WHERE layer = 1 AND is_active = TRUE AND mw_meta IS NULL "
             "AND (event_date = $1::text::date OR (event_date IS NULL AND created_at >= $2 AND created_at < $3)) "
             "AND content NOT LIKE '%晚上做的一场梦，不是真实发生的事%' "
+            "AND kind <> 'musing' "
             "AND content NOT LIKE '%一段亲密/RP 互动的回顾%'",
             date_str, start_utc, end_utc)
         return [r["id"] for r in rows]
 
 
 async def get_memorywall_summary_by_date(date_s: str) -> str:
-    """取某个事件日期的回忆墙当日总结(mw_meta.summary)，给"昨日桥"用——优先用真实记录，不用梦。"""
+    """取某个事件日期的每日真实小结摘要，给"昨日桥"用。"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT mw_meta->>'summary' AS summary FROM memories "
             "WHERE mw_meta IS NOT NULL AND is_active = TRUE AND event_date = $1::text::date "
+            "AND mw_meta->>'source' = 'daily_diary' "
             "ORDER BY created_at DESC LIMIT 1",
             str(date_s))
         return (row["summary"] or "").strip() if row else ""
 
 
 async def get_memorywall_dates() -> set:
-    """回忆墙已覆盖的事件日期集合（YYYY-MM-DD），做梦时跳过这些日子。"""
+    """每日真实小结已覆盖的事件日期集合（YYYY-MM-DD）。"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT DISTINCT event_date FROM memories WHERE mw_meta IS NOT NULL AND event_date IS NOT NULL AND is_active = TRUE")
+            "SELECT DISTINCT event_date FROM memories "
+            "WHERE mw_meta IS NOT NULL AND event_date IS NOT NULL AND is_active = TRUE "
+            "AND mw_meta->>'source' = 'daily_diary'")
         return {str(r["event_date"]) for r in rows if r["event_date"]}
 
 
@@ -1540,6 +1672,7 @@ async def supersede_fragment(memory_id: int) -> bool:
         row = await conn.fetchrow(
             "UPDATE memories SET is_active = FALSE "
             "WHERE id = $1 AND layer = 1 AND mw_meta IS NULL "
+            "AND kind <> 'musing' "
             "RETURNING id",
             memory_id)
         return row is not None
@@ -2146,6 +2279,58 @@ async def get_all_memories_detail(limit: int = None, layer: int = None, active_o
         return [dict(r) for r in rows]
 
 
+async def get_memories_detail_page(page: int = 1, per_page: int = 50, layer: int = None,
+                                   include_inactive: bool = False, query: str = "",
+                                   date_value: str = "", sort: str = "id-desc",
+                                   suixiang_only: bool = False):
+    """Dashboard server-side pagination over the complete memory library."""
+    page = max(1, int(page or 1))
+    per_page = max(1, min(100, int(per_page or 50)))
+    conditions = [] if include_inactive else ["is_active = TRUE"]
+    params = []
+
+    def add_param(value):
+        params.append(value)
+        return f"${len(params)}"
+
+    if layer is not None:
+        conditions.append(f"layer = {add_param(int(layer))}")
+        if int(layer) == 1 and not suixiang_only:
+            conditions.append("kind <> 'musing'")
+    if suixiang_only:
+        conditions.append("layer = 1 AND kind = 'musing'")
+    query = (query or "").strip()
+    if query:
+        token = add_param(f"%{query}%")
+        conditions.append(f"(content ILIKE {token} OR COALESCE(title, '') ILIKE {token})")
+    date_value = (date_value or "").strip()
+    if date_value:
+        conditions.append(
+            f"(created_at AT TIME ZONE 'Asia/Singapore')::date = {add_param(date_value)}::date"
+        )
+
+    order_by = {
+        "id-asc": "id ASC",
+        "imp-desc": "importance DESC, id DESC",
+        "imp-asc": "importance ASC, id DESC",
+    }.get(sort, "id DESC")
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        total = await conn.fetchval(f"SELECT COUNT(*) FROM memories {where}", *params)
+        offset = (page - 1) * per_page
+        rows = await conn.fetch(f"""
+            SELECT id, content, importance, source_session, created_at,
+                   layer, title, is_active, merged_from, event_date, valence, arousal,
+                   drift_day, drift_today, is_explicit, (mw_meta IS NOT NULL) AS is_mw
+            FROM memories
+            {where}
+            ORDER BY {order_by}
+            LIMIT {add_param(per_page)} OFFSET {add_param(offset)}
+        """, *params)
+        return [dict(r) for r in rows], int(total or 0)
+
+
 async def get_emotion_backfill_targets(include_memorywall: bool = True, ids: list = None, limit: int = None):
     """情绪回填：选出 valence/arousal 仍为默认(≈0 / ≈0.2)的活跃记忆。纯只读。"""
     pool = await get_pool()
@@ -2267,16 +2452,48 @@ async def get_all_gateway_config() -> dict:
 # 对话历史读取（分区缓存用）
 # ============================================================
 
-async def get_conversation_messages(session_id: str, limit: int = 100):
-    """按时间正序读取session的消息"""
+async def get_conversation_messages(session_id: str, limit: int = None):
+    """按时间正序读取session的消息；limit=None(默认)＝整条线不限量。
+    2026-08-17：limit 是"从最早开始最多取 N 条"，超额丢的是【最新】的消息，而且不报错。
+    cyberboss 线满 10000 条那天(07:51)，所有传 limit=10000 的调用当场冻在那一刻：
+    今日浓缩反复浓缩早上那半天、记忆提取重复嚼同一个窗口。
+    → 只需要近况的调用一律改用 get_recent_conversation_messages(丢最老的)；
+      真的要整条线的调用不要再填大数字，直接不传 limit。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if limit is None:
+            rows = await conn.fetch("""
+                SELECT role, content, metadata, created_at
+                FROM conversations
+                WHERE session_id = $1
+                ORDER BY created_at ASC, id ASC
+            """, session_id)
+        else:
+            rows = await conn.fetch("""
+                SELECT role, content, metadata, created_at
+                FROM conversations
+                WHERE session_id = $1
+                ORDER BY created_at ASC, id ASC
+                LIMIT $2
+            """, session_id, limit)
+        return [dict(r) for r in rows]
+
+
+async def get_recent_conversation_messages(session_id: str, limit: int = 500):
+    """取这条线【最新】的 limit 条，仍按时间正序返回（尾部对齐，dict 同 get_conversation_messages）。
+    给只看近况的调用用(今日浓缩/跨线小抄/记忆提取/近况接口/feel 试跑)：
+    线再长也不会漏掉刚说的话，超额丢的是最老的，不是最新的。"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT role, content, metadata, created_at
-            FROM conversations
-            WHERE session_id = $1
-            ORDER BY created_at ASC
-            LIMIT $2
+            SELECT role, content, metadata, created_at FROM (
+                SELECT role, content, metadata, created_at, id
+                FROM conversations
+                WHERE session_id = $1
+                ORDER BY created_at DESC, id DESC
+                LIMIT $2
+            ) t
+            ORDER BY created_at ASC, id ASC
         """, session_id, limit)
         return [dict(r) for r in rows]
 
@@ -2300,7 +2517,8 @@ async def get_all_conversation_dates(days_back: int = 60) -> set:
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"""
-            SELECT DISTINCT ((created_at AT TIME ZONE 'UTC') + INTERVAL '{int(TIMEZONE_HOURS)} hours')::date AS d
+            SELECT DISTINCT (((created_at AT TIME ZONE 'UTC') + INTERVAL '{int(TIMEZONE_HOURS)} hours'
+                              - INTERVAL '{int(L2_DAY_CUTOVER_HOUR)} hours'))::date AS d
             FROM conversations
             WHERE created_at > NOW() - INTERVAL '{int(days_back)} days'
         """)
@@ -2312,7 +2530,8 @@ async def get_all_conversations_for_date(date_s) -> list:
     供回忆墙日记"跨线合读"用：让当天 RP 线等其它线的内容也折进同一篇当日回忆墙。"""
     local_tz = dt_timezone(timedelta(hours=TIMEZONE_HOURS))
     y, m, d = (int(x) for x in str(date_s).split("-"))
-    start_utc = datetime(y, m, d, tzinfo=local_tz).astimezone(dt_timezone.utc)
+    start_local = datetime(y, m, d, L2_DAY_CUTOVER_HOUR, tzinfo=local_tz)
+    start_utc = start_local.astimezone(dt_timezone.utc)
     end_utc = start_utc + timedelta(days=1)
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -2868,6 +3087,10 @@ async def get_fragments_by_date(event_date):
             SELECT id, content, importance, created_at
             FROM memories
             WHERE layer = 1 AND is_active = TRUE
+            -- 2026-07-20：梦境曾被浓缩误收编并改写成“用户的梦”，梦必须留在独立通道。
+            AND content NOT LIKE '【这是我在%做的一场梦%'
+            -- V的随想保留原声，永久留在独立通道，不参与L2整理。
+            AND kind <> 'musing'
             AND created_at >= $1 AND created_at < $2
             ORDER BY created_at
         """, start_utc, end_utc)
@@ -2888,6 +3111,10 @@ async def get_fragments_by_date_range(start_date, end_date):
             SELECT id, content, importance, created_at
             FROM memories
             WHERE layer = 1 AND is_active = TRUE
+            -- 2026-07-20：梦境曾被浓缩误收编并改写成“用户的梦”，梦必须留在独立通道。
+            AND content NOT LIKE '【这是我在%做的一场梦%'
+            -- V的随想保留原声，永久留在独立通道，不参与L2整理。
+            AND kind <> 'musing'
             AND created_at >= $1 AND created_at < $2
             ORDER BY created_at
         """, start_utc, end_utc)
@@ -2901,11 +3128,82 @@ async def get_fragments_by_time_window(start_utc, end_utc):
         rows = await conn.fetch("""
             SELECT id, content, importance, created_at
             FROM memories
-            WHERE layer = 1 AND is_active = TRUE
+            WHERE layer = 1
+            -- 2026-07-20：回忆墙 00:04 扫盘曾饿死 05:15 浓缩；带 decayed_at 的归档碎片仍待吸收。
+            AND (is_active = TRUE OR (is_active = FALSE AND decayed_at IS NOT NULL))
+            -- 2026-07-20：梦境曾被浓缩误收编并改写成“用户的梦”，梦必须留在独立通道。
+            AND content NOT LIKE '【这是我在%做的一场梦%'
+            -- V的随想保留原声，永久留在独立通道，不参与L2整理。
+            AND kind <> 'musing'
             AND created_at >= $1 AND created_at < $2
             ORDER BY created_at
         """, start_utc, end_utc)
         return [dict(r) for r in rows]
+
+
+async def get_uncovered_fragments_by_time_window(start_utc, end_utc):
+    """Return L1 not covered by any L2, including archived L1.
+
+    This query is reserved for an explicitly forced operator rescue. Normal
+    nightly scans keep their active/decayed selection unchanged.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT f.id, f.content, f.importance, f.created_at
+            FROM memories f
+            WHERE f.layer = 1
+              AND f.content NOT LIKE '【这是我在%做的一场梦%'
+              AND f.kind <> 'musing'
+              AND f.created_at >= $1 AND f.created_at < $2
+              AND NOT EXISTS (
+                  SELECT 1 FROM memories e
+                  WHERE e.layer = 2
+                    AND f.id = ANY(COALESCE(e.merged_from, '{}'::int[]))
+              )
+            ORDER BY f.created_at, f.id
+        """, start_utc, end_utc)
+        return [dict(r) for r in rows]
+
+
+async def get_daily_diary_fragments(start_utc, end_utc):
+    """All layer1 fragments for a logical day, including already consolidated/archived ones.
+
+    The nightly job consolidates before it writes the wall, so an active-only
+    query would lose exactly the fragments that were successfully merged.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, content, importance, created_at
+            FROM memories
+            WHERE layer = 1 AND mw_meta IS NULL
+              AND content NOT LIKE '【这是我在%做的一场梦%'
+              AND content NOT LIKE '%一段亲密/RP 互动的回顾%'
+              AND created_at >= $1 AND created_at < $2
+            ORDER BY created_at, id
+        """, start_utc, end_utc)
+        return [dict(row) for row in rows]
+
+
+async def get_daily_diary_events(event_date):
+    """Active final L2 events for one logical day, with source-L1 time bounds."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT e.id, e.title, e.content, e.importance, e.merged_from,
+                   MIN(f.created_at) AS started_at,
+                   MAX(f.created_at) AS ended_at
+            FROM memories e
+            LEFT JOIN LATERAL
+                unnest(COALESCE(e.merged_from, '{}'::int[])) source_id ON TRUE
+            LEFT JOIN memories f ON f.id = source_id
+            WHERE e.layer = 2 AND e.is_active = TRUE
+              AND e.event_date = $1::text::date
+            GROUP BY e.id, e.title, e.content, e.importance, e.merged_from
+            ORDER BY MIN(f.created_at) NULLS LAST, e.id
+        """, str(event_date))
+        return [dict(row) for row in rows]
 
 
 async def create_event_memory(title: str, content: str, importance: int,
@@ -2933,6 +3231,38 @@ async def create_event_memory(title: str, content: str, importance: int,
         return new_id
 
 
+async def commit_consolidation_events(events: list, event_date,
+                                      source_ids: list) -> list:
+    """Insert final L2 events and absorb only their covered L1 sources atomically."""
+    if not events:
+        return []
+    covered_ids = sorted({
+        int(value)
+        for event in events
+        for value in event.get("merged_ids", [])
+    })
+    if source_ids:
+        allowed_ids = {int(value) for value in source_ids}
+        covered_ids = [value for value in covered_ids if value in allowed_ids]
+    pool = await get_pool()
+    created_ids = await commit_l2_and_absorb_sources(
+        pool, events, event_date, covered_ids
+    )
+
+    # Embeddings are secondary. A provider outage must not roll back the
+    # already atomic factual L2/L1 commit.
+    if MEMORY_VECTOR_ENABLED:
+        for event, memory_id in zip(events, created_ids):
+            try:
+                embedding = await compute_embedding(event.get("content", ""))
+                if embedding:
+                    async with pool.acquire() as conn:
+                        await save_memory_embedding(conn, memory_id, embedding)
+            except Exception as exc:
+                print(f"⚠️ 事件记忆embedding计算失败（id={memory_id}）: {exc}")
+    return created_ids
+
+
 async def deactivate_memories(memory_ids: list):
     """将记忆标记为不活跃（合并后的碎片）"""
     if not memory_ids:
@@ -2941,7 +3271,21 @@ async def deactivate_memories(memory_ids: list):
     async with pool.acquire() as conn:
         await conn.execute("""
             UPDATE memories SET is_active = FALSE
+            WHERE id = ANY($1::int[]) AND kind <> 'musing'
+        """, memory_ids)
+
+
+async def absorb_consolidated_memories(memory_ids: list):
+    """标记已被夜间浓缩吸收的碎片，并清掉待整理标记。"""
+    if not memory_ids:
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # 2026-07-20：回忆墙归档碎片若保留 decayed_at，会被 05:15 浓缩每晚重复选中。
+        await conn.execute("""
+            UPDATE memories SET is_active = FALSE, decayed_at = NULL
             WHERE id = ANY($1::int[])
+            AND kind <> 'musing'
         """, memory_ids)
 
 
@@ -3160,6 +3504,7 @@ async def get_layer_statistics():
             "layer_1": {"total": 0, "active": 0},  # 原始碎片
             "layer_2": {"total": 0, "active": 0},  # 事件记忆
             "layer_3": {"total": 0, "active": 0},  # 核心记忆
+            "suixiang": {"total": 0, "active": 0},  # V的随想
         }
         
         for row in rows:
@@ -3170,6 +3515,19 @@ async def get_layer_statistics():
                     "total": row['count'],
                     "active": row['active_count']
                 }
+
+        thought_row = await conn.fetchrow("""
+            SELECT COUNT(*) AS count,
+                   COUNT(*) FILTER (WHERE is_active = TRUE) AS active_count
+            FROM memories
+            WHERE layer = 1 AND kind = 'musing'
+        """)
+        stats["suixiang"] = {
+            "total": thought_row["count"],
+            "active": thought_row["active_count"],
+        }
+        stats["layer_1"]["total"] -= thought_row["count"]
+        stats["layer_1"]["active"] -= thought_row["active_count"]
         
         return stats
 
@@ -3182,6 +3540,7 @@ async def cleanup_old_fragments(days: int = 30):
     - is_active = FALSE（已归档）
     - created_at 在 days 天之前
     - decayed_at IS NULL（②衰减归档的项豁免——归档≠删除,记忆不能丢；这类靠 reactivate 复活,绝不硬删）
+    - 不清理 kind='musing' 的「V的随想」独立通道
 
     Returns:
         删除的记忆数量
@@ -3197,6 +3556,7 @@ async def cleanup_old_fragments(days: int = 30):
             WHERE layer = 1
             AND is_active = FALSE
             AND decayed_at IS NULL
+            AND kind <> 'musing'
             AND created_at < $1
         """, cutoff_date)
         
@@ -3324,6 +3684,13 @@ async def delete_intimacy_submission(submission_id: str):
 def _proactive_outbox_row(row):
     if not row:
         return None
+    raw_intent = row.get("intent")
+    if isinstance(raw_intent, str):
+        try:
+            raw_intent = json.loads(raw_intent)
+        except (TypeError, ValueError):
+            raw_intent = None
+    intent = raw_intent if isinstance(raw_intent, dict) else None
     return {
         "id": int(row["id"]),
         "message": row["message"] or "",
@@ -3332,17 +3699,19 @@ def _proactive_outbox_row(row):
         "claimed_at": row["claimed_at"].isoformat() if row["claimed_at"] else "",
         "delivered_at": row["delivered_at"].isoformat() if row["delivered_at"] else "",
         "attempts": int(row["attempts"] or 0),
+        "origin": row.get("origin", "haiku_proactive") or "haiku_proactive",
+        "intent": intent,
     }
 
 
-async def enqueue_proactive_push(message: str, urgent: bool = False):
+async def enqueue_proactive_push(message: str, urgent: bool = False, origin: str = "haiku_proactive", intent=None):
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO proactive_push_outbox (message, urgent)
-            VALUES ($1, $2)
+            INSERT INTO proactive_push_outbox (message, urgent, origin, intent)
+            VALUES ($1, $2, $3, $4::jsonb)
             RETURNING *
-        """, message, bool(urgent))
+        """, message, bool(urgent), str(origin or "haiku_proactive"), json.dumps(intent) if intent else None)
     return _proactive_outbox_row(row)
 
 
@@ -3384,6 +3753,14 @@ async def ack_proactive_push(push_id: int):
             RETURNING *
         """, int(push_id))
     return _proactive_outbox_row(row)
+
+
+async def count_capped_proactive_since(since) -> int:
+    """Count only Haiku/desire proactive origins; reminder/diary are contractual and excluded."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return int(await conn.fetchval("""SELECT COUNT(*) FROM proactive_push_outbox
+            WHERE created_at >= $1 AND (origin='haiku_proactive' OR origin LIKE 'desire_%')""", since) or 0)
 
 
 async def revert_merge(memory_id: int):

@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>亲密语境词表</title>
+<style>
+:root{--bg:#080c18;--card:#0f1525;--gold:#c5a55a;--light:#e8d5a3;--text:#d4cbb8;--dim:#7a8194;--line:rgba(197,165,90,.25);--warn:#c87878}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif}.wrap{max-width:920px;margin:auto;padding:26px 20px 60px}.back{color:var(--dim);text-decoration:none;font-size:13px}.head{text-align:center;padding:22px 0 30px}.head h1{font-family:Georgia,'Noto Serif SC',serif;font-weight:400;letter-spacing:7px;color:var(--light);font-size:25px;margin:0 0 8px}.head p,.note{color:var(--dim);font-size:12px;line-height:1.7}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:15px}.card{border:1px solid var(--line);background:linear-gradient(135deg,rgba(15,21,37,.9),rgba(8,12,24,.95));padding:18px;min-height:230px}.card h2{font:400 15px Georgia,'Noto Serif SC',serif;letter-spacing:2px;color:var(--gold);margin:0 0 5px}.card .desc{color:var(--dim);font-size:11px;min-height:34px}.add{display:flex;gap:7px;margin:14px 0}.add input{min-width:0;flex:1;background:#090e1c;border:1px solid var(--line);color:var(--text);padding:9px;border-radius:2px}.btn{border:1px solid var(--line);background:transparent;color:var(--light);padding:7px 12px;cursor:pointer;border-radius:2px}.btn:hover{background:#151d33}.terms{display:flex;flex-wrap:wrap;gap:7px}.term{display:flex;align-items:center;gap:6px;border:1px solid rgba(197,165,90,.18);border-radius:18px;padding:4px 5px 4px 10px;font-size:12px}.term button{border:0;background:transparent;color:var(--warn);cursor:pointer;font-size:15px}.audit{margin-top:18px;border:1px solid var(--line);padding:18px}.audit h2{font:400 15px Georgia,serif;letter-spacing:2px;color:var(--gold);margin:0 0 12px}.audit-list{max-height:280px;overflow:auto}.audit-row{display:grid;grid-template-columns:145px 48px 60px 110px 1fr;gap:8px;padding:7px 0;border-bottom:1px solid rgba(197,165,90,.07);font-size:11px;color:var(--dim)}.audit-row b{color:var(--text);font-weight:400}.status{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--line);padding:10px 18px;color:var(--light);font-size:12px;opacity:0;pointer-events:none;transition:.25s}.status.show{opacity:1}.empty{color:var(--dim);font-size:12px}.blocked{padding:30px;text-align:center;color:var(--warn)}
+@media(max-width:720px){.grid{grid-template-columns:1fr}.card{min-height:0}.audit-row{grid-template-columns:120px 42px 55px 1fr}.audit-row .reason{grid-column:1/-1}.head h1{font-size:20px;letter-spacing:4px}}
+</style>
+</head>
+<body><div class="wrap">
+<a class="back" id="back" href="#">‹ 返回操作间</a>
+<div class="head"><h1>亲 密 语 境 词 表</h1><p>Harper 与 V 都能逐词添加或删除。不会整份覆盖；每次操作都有记录。当前亲密窗口：<span id="window">…</span> 分钟。</p></div>
+<div id="content">
+  <div class="grid">
+    <section class="card"><h2>开场词</h2><div class="desc">单独出现时可打开一段亲密语境窗口。</div><div class="add"><input id="in-openers" placeholder="输入一个词"><button class="btn" data-add="openers">添加</button></div><div class="terms" id="g-openers"></div></section>
+    <section class="card"><h2>亲密词</h2><div class="desc">单独命中即可本地结算 libido，例如「蹭蹭」「舔舔」。</div><div class="add"><input id="in-implicit_terms" placeholder="输入一个词"><button class="btn" data-add="implicit_terms">添加</button></div><div class="terms" id="g-implicit_terms"></div></section>
+    <section class="card"><h2>排除短语</h2><div class="desc">命中这些工程/讨论措辞时，不把其中的亲密词当成真实互动。</div><div class="add"><input id="in-nonsexual_phrases" placeholder="输入一个短语"><button class="btn" data-add="nonsexual_phrases">添加</button></div><div class="terms" id="g-nonsexual_phrases"></div></section>
+  </div>
+  <section class="audit"><h2>最近修改记录</h2><div class="audit-list" id="audit"></div></section>
+</div>
+</div><div class="status" id="status"></div>
+<script>
+const KEY=new URLSearchParams(location.search).get('gateway_key')||'';
+const path=(location.pathname||'').replace(/\/desire-lexicon\/?$/,'').replace(/\/$/,'');
+const q=KEY?'?gateway_key='+encodeURIComponent(KEY):'';
+document.getElementById('back').href=(path||'')+'/console'+q;
+const labels={openers:'开场词',implicit_terms:'亲密词',nonsexual_phrases:'排除短语'};
+function say(s){const e=document.getElementById('status');e.textContent=s;e.classList.add('show');clearTimeout(e.t);e.t=setTimeout(()=>e.classList.remove('show'),2400)}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function api(url,opt={}){opt.headers=Object.assign({'X-Gateway-Key':KEY},opt.headers||{});if(opt.body&&typeof opt.body!=='string'){opt.body=JSON.stringify(opt.body);opt.headers['Content-Type']='application/json'}const r=await fetch((path||'')+url,opt);let j={};try{j=await r.json()}catch{}if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
+function render(data){document.getElementById('window').textContent=data.window_minutes||45;Object.entries(data.groups||{}).forEach(([group,items])=>{const box=document.getElementById('g-'+group);if(!box)return;box.innerHTML=items.length?items.map(term=>`<span class="term"><span>${esc(term)}</span><button title="删除" data-remove="${group}" data-term="${encodeURIComponent(term)}">×</button></span>`).join(''):'<span class="empty">还没有词</span>'});const rows=(data.audit||[]).slice().reverse();document.getElementById('audit').innerHTML=rows.length?rows.map(x=>`<div class="audit-row"><span>${esc(new Date(x.at).toLocaleString('zh-CN',{timeZone:'Asia/Singapore',hour12:false}))}</span><b>${x.actor==='v'?'V':'Harper'}</b><span>${x.action==='add'?'添加':'删除'}${x.changed===false?'（无变化）':''}</span><span>${esc(labels[x.group]||x.group)}：${esc(x.term)}</span><span class="reason">${esc(x.reason||'')}</span></div>`).join(''):'<span class="empty">暂无修改记录</span>';bindRemove()}
+async function load(){if(!KEY){document.getElementById('content').innerHTML='<div class="blocked">缺少访问钥匙，请从 HOME1 操作间进入。</div>';return}try{render(await api('/api/desire/lexicon'))}catch(e){say('加载失败：'+e.message)}}
+async function change(action,group,term){try{const data=await api('/api/desire/lexicon/mutate',{method:'POST',body:{action,group,term,actor:'harper',reason:'Harper 在操作间手动修改'}});render(data);say(data.changed?'已保存，下一条消息生效':'词表没有变化')}catch(e){say('失败：'+e.message)}}
+document.querySelectorAll('[data-add]').forEach(btn=>btn.addEventListener('click',()=>{const group=btn.dataset.add,input=document.getElementById('in-'+group),term=input.value.trim();if(!term)return say('先输入一个词');change('add',group,term).then(()=>{input.value=''})}));
+document.querySelectorAll('.add input').forEach(input=>input.addEventListener('keydown',e=>{if(e.key==='Enter')input.nextElementSibling.click()}));
+function bindRemove(){document.querySelectorAll('[data-remove]').forEach(btn=>btn.onclick=()=>{const term=decodeURIComponent(btn.dataset.term);if(confirm('确定删除「'+term+'」？'))change('remove',btn.dataset.remove,term)})}
+load();
+</script></body></html>

@@ -1,0 +1,21 @@
+{
+  "touch": [
+    {"kw": "按动", "delta": 0.8},
+    {"kw": "摩擦", "delta": 0.6},
+    {"kw": "触碰", "delta": 0.5}
+  ],
+  "contact": [
+    {"kw": "保持接触", "delta": 0.25, "passive": true}
+  ],
+  "address": [],
+  "feedback": [],
+  "body_parts": {
+    "敏感点": {"sensitivity": 0.95},
+    "锁骨": {"sensitivity": 0.7}
+  },
+  "postures": {
+    "贴近": 1.05
+  },
+  "release_phrases": [],
+  "release_blockers": []
+}

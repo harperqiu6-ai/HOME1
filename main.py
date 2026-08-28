@@ -13,13 +13,18 @@ AI Memory Gateway — 带记忆系统的 LLM 转发网关
 """
 
 import os
+AROUSAL_ENABLED = os.getenv("AROUSAL_ENABLED", "0") == "1"
 import json
+import re
 import time
 import uuid
 import asyncio
 import secrets
 import hashlib
 import contextvars
+import base64
+import mimetypes
+from pathlib import Path
 import httpx
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
@@ -29,12 +34,12 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Res
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_recent_messages, extract_search_keywords, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge, apply_mood_drift, get_emotion_backfill_targets, update_emotion_only, update_memory_emotion, enqueue_proactive_push, claim_proactive_push, ack_proactive_push
+from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_detail_page, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_recent_conversation_messages, get_recent_messages, extract_search_keywords, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, get_last_user_message, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, absorb_consolidated_memories, commit_consolidation_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge, apply_mood_drift, get_emotion_backfill_targets, update_emotion_only, update_memory_emotion, enqueue_proactive_push, claim_proactive_push, ack_proactive_push, count_capped_proactive_since
 from database import save_migrated_memory, find_memory_by_mw_id, save_photo, link_photo_to_memory, get_photo, memory_photo_count, delete_memory_photos, get_mw_meta, update_mw_meta, find_photo_id_by_hash, refresh_memory_embedding
 from database import list_memorywall, get_memorywall_one, update_memorywall, get_memory_photos, set_memory_active, supersede_fragment
 from database import get_memories_explicit_flags, set_memory_explicit, get_explicit_backfill_candidates, get_high_arousal_memories
 from database import get_long_memories, split_memory_into, undo_split, undo_split_one
-from database import get_fragments_by_time_window
+from database import get_daily_diary_events, get_daily_diary_fragments, get_fragments_by_time_window, get_uncovered_fragments_by_time_window
 from database import get_decay_candidates, count_active_memories, deactivate_memories, archive_decayed_memories, reactivate_decayed_memories
 from database import count_explicit_memories, clear_persona_suggestions, clear_l5_candidates, get_current_mood
 from database import save_dream, get_dream, list_dreams, get_dream_dates, get_memorywall_dates, delete_dream_memories, get_memorywall_summary_by_date, get_avg_arousal_for_date, get_fragment_ids_for_date, get_all_conversations_for_date, archive_line_conversations
@@ -46,6 +51,17 @@ from database import create_intimacy_submission, list_intimacy_submissions, get_
 from database import save_persona_suggestion, list_persona_suggestions, update_persona_suggestion, save_l5_candidate, list_l5_candidates, update_l5_candidate, get_l5_candidate
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, tag_emotions_batch, tag_explicit_batch
+from desire import (DesireState, autonomous_thought_drive_delta, contextual_drive_delta, ranked_contextual_drive_delta, max_event_credit_gap, feed_thought, pick_intent,
+                    pulse as desire_pulse, satisfy as desire_satisfy, state_dict)
+from desire_pulse import (AutonomousThoughtBatcher, DeepSeekBatcher, PendingClassification, classify_rules,
+                          private_intimacy_scene)
+from desire_lexicon import LexiconError, mutate as mutate_desire_lexicon, snapshot as desire_lexicon_snapshot
+from desire_scheduler import DesireScheduler
+from desire_store import DesireStore
+from arousal.core import (apply_assistant_event, apply_user_event, control_event,
+                          pending_release_effect, public_snapshot, status_line)
+from arousal.lexicon import load_lexicon
+from arousal.store import ArousalStore
 
 # ============================================================
 # 配置项 —— 全部从环境变量读取，部署时在云平台面板里设置
@@ -81,6 +97,15 @@ MAX_MEMORIES_INJECT = int(os.getenv("MAX_MEMORIES_INJECT", "15"))
 
 # 记忆提取间隔（0 = 禁用自动提取，1 = 每轮提取，N = 每 N 轮提取一次）
 MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "1"))
+
+# 长期记忆模型拆分：L1提取用便宜、结构化稳定的DS；L2事件整理保留Haiku。
+# MEMORY_MODEL继续作为旧配置/其他记忆杂务的兼容兜底。
+MEMORY_EXTRACT_MODEL = os.getenv(
+    "MEMORY_EXTRACT_MODEL", "deepseek/deepseek-v4-flash-0731"
+)
+CONSOLIDATION_MODEL = os.getenv(
+    "CONSOLIDATION_MODEL", ""
+) or os.getenv("MEMORY_MODEL", "anthropic/claude-haiku-4.5")
 
 # 记忆提取+注入总开关（false时数据库仍连接、消息仍存储，但不提取也不注入记忆）
 MEMORY_EXTRACT_ENABLED = os.getenv("MEMORY_EXTRACT_ENABLED", "true").lower() == "true"
@@ -126,13 +151,16 @@ PERSONA_SUGGESTION_MIN_IMPORTANCE = int(os.getenv("PERSONA_SUGGESTION_MIN_IMPORT
 # 看图(多模态透传):分区拼 prompt 时保留当前 user 的 image_url 块转发给 opus(默认关到验收;控制台开关)。关=原行为(拍扁纯文本)
 IMAGE_ENABLED = os.getenv("IMAGE_ENABLED", "false").lower() == "true"
 
-# 文生图(/画 暗号):调 images/generations 接口(硅基流动兼容格式)。key/地址默认复用向量检索那套(同为硅基流动)。
+# 文生图(/画 暗号):默认走 OpenRouter Dedicated Image API + GPT Image 2。
 # 生成图只存 memory_photos 表(长期)+一条可检索文字记忆;逐字历史只落一行短占位文字——图片本体绝不进上下文/缓存。
 IMAGE_GEN_ENABLED = os.getenv("IMAGE_GEN_ENABLED", "true").lower() == "true"
-IMAGE_GEN_MODEL = os.getenv("IMAGE_GEN_MODEL", "Kwai-Kolors/Kolors")
-IMAGE_GEN_BASE_URL = os.getenv("IMAGE_GEN_BASE_URL", "")   # 空=复用 EMBEDDING_BASE_URL
-IMAGE_GEN_API_KEY = os.getenv("IMAGE_GEN_API_KEY", "")     # 空=复用 EMBEDDING_API_KEY
+IMAGE_GEN_MODEL = os.getenv("IMAGE_GEN_MODEL", "openai/gpt-image-2")
+IMAGE_GEN_BASE_URL = os.getenv("IMAGE_GEN_BASE_URL", "https://openrouter.ai/api/v1")
+IMAGE_GEN_API_KEY = os.getenv("IMAGE_GEN_API_KEY", "")     # OR 地址下空=复用主 API_KEY
 IMAGE_GEN_SIZE = os.getenv("IMAGE_GEN_SIZE", "1024x1024")
+IMAGE_GEN_REFERENCE_ENABLED = os.getenv("IMAGE_GEN_REFERENCE_ENABLED", "true").lower() == "true"
+IMAGE_GEN_V_REFERENCE_PATH = os.getenv("IMAGE_GEN_V_REFERENCE_PATH", "/opt/home1/private/image-anchors/v.jpg")
+IMAGE_GEN_HARPER_REFERENCE_PATH = os.getenv("IMAGE_GEN_HARPER_REFERENCE_PATH", "/opt/home1/private/image-anchors/harper.jpg")
 
 # ===== 去个人化(可分发 fork):对话对象名 / AI 名 / 健康护栏 / 首页 都改配置(env+DB,默认通用或空) =====
 # 空白部署 → built-prompt 不含任何人名/暗号/健康红线。阮阮实例在 /api/settings 填回 USER_NAME=阮阮、AI_NAME=阿克、
@@ -140,7 +168,7 @@ IMAGE_GEN_SIZE = os.getenv("IMAGE_GEN_SIZE", "1024x1024")
 USER_NAME = os.getenv("USER_NAME", "") or "用户"          # 指代人类对话对象(标签/生成 prompt 用)
 AI_NAME = os.getenv("AI_NAME", "")                         # AI 自称名;空=只说"你"、不加名
 HEALTH_SAFETY_NOTE = os.getenv("HEALTH_SAFETY_NOTE", "")   # 健康/用药护栏正文;默认空=不注入(实例自填)
-HOME_TITLE = os.getenv("HOME_TITLE", "") or "OUR HOME"     # 首页大标题
+HOME_TITLE = os.getenv("HOME_TITLE", "") or "VH LINKS"      # 首页大标题
 HOME_SUBTITLE = os.getenv("HOME_SUBTITLE", "")             # 首页副标题(空=不显示)
 SINCE_DATE = os.getenv("SINCE_DATE", "")                   # YYYY-MM-DD;空=首页不显示"在一起第N天"
 
@@ -181,6 +209,9 @@ FEEL_MODEL = os.getenv("FEEL_MODEL", "") or CACHE_SUMMARY_MODEL
 PROACTIVE_ENABLED = os.getenv("PROACTIVE_ENABLED", "false").lower() == "true"
 PROACTIVE_GAP_HOURS = float(os.getenv("PROACTIVE_GAP_HOURS", "6"))  # 距上条 > 此小时算"长间隔后首轮"
 PROACTIVE_MODEL = os.getenv("PROACTIVE_MODEL", "") or CACHE_SUMMARY_MODEL
+# KELIVO 对外主对话入口可逆总开关。关闭时保留所有会话、摘要与记忆；
+# 内部辅助请求和已停用的 TG 专线仍可完成维护/恢复流程。
+KELIVO_ENABLED = os.getenv("KELIVO_ENABLED", "true").lower() == "true"
 # ②衰减归档：把"老+低重要+久未取+低唤起"的非里程碑碎片归档(is_active=FALSE,可逆),让活跃记忆池保持精炼。
 # 归档=mutate → 默认关,必须先 dry 看会淡掉什么、阮阮定阈值才开(像复活/回填)。高imp/高arousal/近期/被回忆过/回忆墙天然受保护。
 DECAY_ENABLED = os.getenv("DECAY_ENABLED", "false").lower() == "true"
@@ -203,7 +234,6 @@ _CLAMP = {
     "MOOD_RECENT_N": (5, 100),
     "L2_REFRESH_N": (1, 50),
 }
-_dream_last_date = None  # 上次跑过做梦的本地日(懒触发去重；启动从 gateway_config 恢复)
 _dream_running = False   # 防并发重入
 
 # ② L2今日（非缓存当前轮注入；后台每 N 轮刷一次今日浓缩）
@@ -234,6 +264,16 @@ _request_skip_log = contextvars.ContextVar("request_skip_log", default=False)
 # 时区偏移（小时），用于记忆注入时的日期显示，默认 UTC+8
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
 
+# V's private wandering while Harper is silent.  The five-minute push poller
+# evaluates these durable windows; deterministic jitter keeps restarts from
+# rerolling an earlier wake time.
+PRIVATE_WANDER_ENABLED = os.getenv("V_PRIVATE_WANDER_ENABLED", "1") == "1"
+PRIVATE_WANDER_FIRST_MINUTES = (30, 45)
+PRIVATE_WANDER_REPEAT_MINUTES = (45, 75)
+PRIVATE_WANDER_ACTION_MINUTES = (60, 90)
+PRIVATE_WANDER_FOUR_HOUR_CAP = 3
+PRIVATE_WANDER_DAY_CAP = 10
+
 # ② L2今日的"逻辑日"分界：凌晨 N 点前算前一天。熬夜聊过 0 点时，凌晨的消息仍属"昨晚"，
 # 别让跨 0 点刷新把昨晚场景盖上新一天的日期章(2026-07-13 周一早上被周日晚浓缩冒充"今天"的事故)。
 # 改这里必须与 cyberboss app.js 开场注入守卫的同名逻辑保持一致。
@@ -248,8 +288,11 @@ def _l2_logical_today():
 # 轮次计数器
 _round_counter = 0
 # ② L2今日状态（非缓存当前轮注入；后台每N轮刷新；启动时从 gateway_config 恢复）
-_l2_state = {"date": None, "today": "", "bridge": ""}
+_l2_state = {"date": None, "today": "", "updated_at": None,
+             "last_attempt_at": None, "last_status": None,
+             "bridge": "", "bridge_date": None}
 _l2_refresh_running = False
+_l2_refresh_pending_session = ""
 _cyberboss_l2_round_counter = 0
 
 # 强制流式传输（部分客户端不发stream=true导致thinking数据丢失，开启后强制所有请求走流式）
@@ -274,14 +317,19 @@ EXTRA_TITLE = os.getenv("EXTRA_TITLE", "AI Memory Gateway")
 # ============================================================
 # 「递纸条」召回扩展（scratchpad）
 # 长输入/RP/总结等场景：让小模型先列"主题词清单"，按清单多 query 召回，再交主模型生成。
-# 解决纯 top-N 召回对长输出/泛 query "事实抓不全→编造"的问题。默认走 DeepSeek 官方 (便宜+中文强)。
+# 解决纯 top-N 召回对长输出/泛 query "事实抓不全→编造"的问题。默认走 OpenRouter 的 DeepSeek V4 Flash。
 # 失败/超时一律降级到原 search_memories，绝不拖垮主响应。
 # ============================================================
 SCRATCHPAD_ENABLED = os.getenv("SCRATCHPAD_ENABLED", "true").lower() == "true"
-# 独立 endpoint+key (DeepSeek 官方比 OpenRouter 便宜 5%；想换走面板改 base_url+key+model)
-SCRATCHPAD_BASE_URL = os.getenv("SCRATCHPAD_BASE_URL", "https://api.deepseek.com/v1/chat/completions")
-SCRATCHPAD_API_KEY = os.getenv("SCRATCHPAD_API_KEY", "")
-SCRATCHPAD_MODEL = os.getenv("SCRATCHPAD_MODEL", "deepseek-chat")
+# 统一走 OpenRouter，不再向 DeepSeek 官网发送 V/Harper 的语境。
+SCRATCHPAD_BASE_URL = os.getenv("SCRATCHPAD_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
+SCRATCHPAD_MODEL = os.getenv("SCRATCHPAD_MODEL", "deepseek/deepseek-v4-flash-0731")
+_scratchpad_configured_key = os.getenv("SCRATCHPAD_API_KEY", "")
+SCRATCHPAD_API_KEY = (
+    (os.getenv("OPENROUTER_API_KEY", "") or API_KEY)
+    if "openrouter.ai" in SCRATCHPAD_BASE_URL.lower()
+    else _scratchpad_configured_key
+)
 SCRATCHPAD_TIMEOUT = float(os.getenv("SCRATCHPAD_TIMEOUT", "5.0"))   # 秒；超时→空列表→走原召回
 SCRATCHPAD_TOPICS_MAX = int(os.getenv("SCRATCHPAD_TOPICS_MAX", "8"))  # 纸条上最多列几个主题
 SCRATCHPAD_PER_TOPIC_LIMIT = int(os.getenv("SCRATCHPAD_PER_TOPIC_LIMIT", "5"))  # 每主题召回 top-N
@@ -452,7 +500,11 @@ async def lifespan(app: FastAPI):
             try:
                 _l2_state["today"] = await get_gateway_config("l2_today", "") or ""
                 _l2_state["date"] = (await get_gateway_config("l2_today_date", "")) or None
+                _l2_state["updated_at"] = (await get_gateway_config("l2_today_updated_at", "")) or None
+                _l2_state["last_attempt_at"] = (await get_gateway_config("l2_today_last_attempt_at", "")) or None
+                _l2_state["last_status"] = (await get_gateway_config("l2_today_last_status", "")) or None
                 _l2_state["bridge"] = await get_gateway_config("l2_bridge", "") or ""
+                _l2_state["bridge_date"] = (await get_gateway_config("l2_bridge_date", "")) or None
             except Exception:
                 pass
             
@@ -482,6 +534,8 @@ async def lifespan(app: FastAPI):
                         "IMAGE_GEN_ENABLED": lambda v: _parse_bool(v),
                         "IMAGE_GEN_MODEL": str, "IMAGE_GEN_BASE_URL": str,
                         "IMAGE_GEN_API_KEY": str, "IMAGE_GEN_SIZE": str,
+                        "IMAGE_GEN_REFERENCE_ENABLED": lambda v: _parse_bool(v),
+                        "IMAGE_GEN_V_REFERENCE_PATH": str, "IMAGE_GEN_HARPER_REFERENCE_PATH": str,
                         "USER_NAME": str, "AI_NAME": str, "HEALTH_SAFETY_NOTE": str,
                         "HOME_TITLE": str, "HOME_SUBTITLE": str, "SINCE_DATE": str,
                         "INTIMACY_UNLOCK_KEYS": lambda v: [k.strip().lower() for k in str(v).split(",") if k.strip()],
@@ -513,8 +567,16 @@ async def lifespan(app: FastAPI):
                         elif key in _RESTORE_DB:
                             setattr(_db_module, key, _RESTORE_DB[key](val))
                             restored.append(key)
-                        elif key == "MEMORY_MODEL":
-                            os.environ["MEMORY_MODEL"] = str(val)
+                        elif key in {
+                            "MEMORY_MODEL", "MEMORY_EXTRACT_MODEL",
+                            "CONSOLIDATION_MODEL",
+                        }:
+                            os.environ[key] = str(val)
+                            if key != "MEMORY_MODEL":
+                                globals()[key] = str(val)
+                            if key == "MEMORY_EXTRACT_MODEL":
+                                import memory_extractor as _me_mod
+                                _me_mod.MEMORY_EXTRACT_MODEL = str(val)
                             restored.append(key)
                         elif key == "MEMORY_API_KEY":
                             globals()[key] = str(val)
@@ -549,19 +611,6 @@ async def lifespan(app: FastAPI):
             except Exception:
                 pass
 
-            # ③-2 做梦：恢复上次跑做梦的日期(懒触发去重)
-            try:
-                _dd = await get_gateway_config("dream_last_date", "")
-                if _dd:
-                    globals()["_dream_last_date"] = str(_dd)
-                    print(f"💤 做梦上次日期(DB恢复)：{_dd}")
-                else:
-                    # 首次启动：设为今天 → 不自动补历史(给"写库前过一眼"留窗口)，往后跨天才自动梦
-                    globals()["_dream_last_date"] = str((datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date())
-                    print("💤 做梦首次启动：上次日期=今天(不自动补历史，等手动确认或明日跨天)")
-            except Exception:
-                pass
-
             # ③-1 feel 开关：从DB恢复(运行时 /api/feel/toggle 可切)
             try:
                 _fe = await get_gateway_config("feel_enabled", "")
@@ -575,6 +624,13 @@ async def lifespan(app: FastAPI):
                 if _pe != "":
                     globals()["PROACTIVE_ENABLED"] = (str(_pe).lower() == "true")
                     print(f"💬 主动浮现开关(DB恢复)：{globals()['PROACTIVE_ENABLED']}")
+            except Exception:
+                pass
+            try:
+                _ke = await get_gateway_config("kelivo_enabled", "")
+                if _ke != "":
+                    globals()["KELIVO_ENABLED"] = (str(_ke).lower() == "true")
+                    print(f"🔌 KELIVO 对外入口(DB恢复)：{globals()['KELIVO_ENABLED']}")
             except Exception:
                 pass
             try:
@@ -608,13 +664,81 @@ async def lifespan(app: FastAPI):
     else:
         print("ℹ️  记忆系统已关闭（设置 MEMORY_ENABLED=true 开启）")
     
+    global _desire_store, _desire_scheduler, _desire_batcher, _thought_batcher
     _push_task = None
+    if MEMORY_ENABLED and os.getenv("V_DESIRE_ENABLED", "1") == "1":
+        try:
+            _desire_store = DesireStore(await get_pool())
+            _desire_scheduler = DesireScheduler(
+                _desire_store,
+                lambda: datetime.now(timezone.utc),
+                proactive_count=count_capped_proactive_since,
+                nudge=_enqueue_desire_nudge,
+                silence_pulse=_apply_desire_silence_pulses,
+                # A newly queued guaranteed wake suppresses a second action in
+                # the same heartbeat. An older wake must not freeze all organic
+                # desire actions until Harper speaks again.
+                silence_wake=lambda now: _maybe_enqueue_silence_wake(
+                    now, existing_is_handled=False,
+                ),
+            )
+            async def _ack_desire_classification_batch(batch):
+                await _desire_store.delete_pending_classifications([item.id for item in batch])
+
+            async def _start_desire_classification_batch(batch):
+                await _desire_store.mark_pending_classifications_in_flight(
+                    batch, datetime.now(timezone.utc),
+                )
+
+            async def _fail_desire_classification_batch(batch, reason):
+                outcome = await _desire_store.fail_pending_classifications(
+                    batch, reason, datetime.now(timezone.utc),
+                )
+                if outcome.get("dead"):
+                    print(
+                        f"⚠️ desire context dead-lettered: count={outcome['dead']} "
+                        f"error_type={str(reason)[:40]}", flush=True,
+                    )
+
+            _desire_batcher = DeepSeekBatcher(
+                _apply_deepseek_desire_results,
+                on_batch_succeeded=_ack_desire_classification_batch,
+                on_batch_started=_start_desire_classification_batch,
+                on_batch_failed=_fail_desire_classification_batch,
+            )
+            pending_rows = await _desire_store.list_pending_classifications()
+            await _desire_batcher.restore([
+                PendingClassification(**row) for row in pending_rows
+            ])
+            _desire_batcher.start()
+            if pending_rows:
+                asyncio.create_task(_desire_batcher.drain_ready())
+            _thought_batcher = AutonomousThoughtBatcher(_apply_autonomous_thought)
+            _thought_batcher.start()
+            _desire_scheduler.start()
+            print("💗 V desire v1 heartbeat started")
+        except Exception as _e:
+            print(f"⚠️ desire scheduler startup failed: {_e}")
     if MEMORY_ENABLED:
         async def _push_loop():
             await asyncio.sleep(90)  # 等启动稳定
             while True:
                 try:
-                    await maybe_send_proactive()
+                    # The guaranteed two-hour wake uses this existing five-minute
+                    # poller, so it does not inherit the desire heartbeat's
+                    # thirty-minute timing granularity. Once the silence episode
+                    # is handled, do not add a Haiku proactive in the same pass.
+                    silence_handled = await _maybe_enqueue_silence_wake(
+                        datetime.now(timezone.utc)
+                    ) if _desire_store else False
+                    # Private wandering is independent of the 2h guarantee: an
+                    # older handled guarantee must not stop later free-choice
+                    # wakes during the same long silence episode.
+                    wander_handled = await _maybe_enqueue_private_wander(
+                        datetime.now(timezone.utc)
+                    ) if _desire_store else False
+                    if not silence_handled and not wander_handled:
+                        await maybe_send_proactive()
                 except Exception as _e:
                     print(f"⚠️ 主动私信循环异常: {_e}")
                 await asyncio.sleep(300)  # 每5分钟自查一次
@@ -625,11 +749,516 @@ async def lifespan(app: FastAPI):
 
     if _push_task:
         _push_task.cancel()
+    if _desire_scheduler:
+        await _desire_scheduler.stop()
+    if _desire_batcher:
+        await _desire_batcher.stop()
+    if _thought_batcher:
+        await _thought_batcher.stop()
     if MEMORY_ENABLED:
         await close_pool()
 
 
 app = FastAPI(title="AI Memory Gateway", version="2.0.0", lifespan=lifespan)
+
+_desire_store = None
+_desire_scheduler = None
+_desire_batcher = None
+_thought_batcher = None
+_arousal_store = ArousalStore() if AROUSAL_ENABLED else None
+
+
+async def _enqueue_desire_nudge(message, intent, followup_intent=None):
+    wake_id = str(uuid.uuid4())
+    item = await enqueue_proactive_push(message, urgent=False, origin=f"desire_{intent.drive_key}", intent={
+        "want_action": intent.want_action, "drive_key": intent.drive_key, "reason": intent.reason,
+        "score": intent.score, "query_hint": intent.query_hint,
+        **(followup_intent or {}), "wake_id": wake_id,
+    })
+    return bool(item and item.get("id"))
+
+
+async def _apply_desire_silence_pulses(now):
+    """Apply each 2h/4h/8h silence milestone once per durable user message."""
+    last_user = await get_last_user_message(CYBERBOSS_LINE_ID)
+    if not last_user or not last_user.get("created_at"):
+        return []
+    last_user_at = last_user["created_at"]
+    if last_user_at.tzinfo is None:
+        last_user_at = last_user_at.replace(tzinfo=timezone.utc)
+    silence_seconds = max(0.0, (now - last_user_at).total_seconds())
+    applied = []
+    anchor = last_user_at.astimezone(timezone.utc).isoformat()
+    for hours in (2, 4, 8):
+        if silence_seconds < hours * 3600:
+            continue
+        source_ref = f"{CYBERBOSS_LINE_ID}:{anchor}:{hours}h"
+        # Silence milestones belong to one durable user-message anchor.  The old
+        # generic five-minute dedup let the same milestone add attachment again
+        # every heartbeat for the rest of the silence episode.
+        if await _desire_store.has_pulse(f"user_silent_{hours}h", source_ref):
+            continue
+        applied.extend(await _apply_desire_event(
+            f"user_silent_{hours}h",
+            source_ref=source_ref,
+            meta={"last_user_at": anchor, "silence_hours": hours},
+            now=now,
+        ))
+    return applied
+
+
+async def _maybe_enqueue_silence_wake(now, existing_is_handled=True):
+    """Guarantee one daytime V-initiated check-in per two-hour silence episode."""
+    if not _desire_store:
+        return False
+    last_user = await get_last_user_message(CYBERBOSS_LINE_ID)
+    if not last_user or not last_user.get("created_at"):
+        return False
+    last_user_at = last_user["created_at"]
+    if last_user_at.tzinfo is None:
+        last_user_at = last_user_at.replace(tzinfo=timezone.utc)
+    if (now - last_user_at).total_seconds() < 2 * 3600:
+        return False
+
+    # Harper chose 07:00 through the following 01:00 SGT.  Hour 00 is active;
+    # 01:00 <= local time < 07:00 is quiet and will defer until the first tick.
+    local_hour = (now + timedelta(hours=TIMEZONE_HOURS)).hour
+    if 1 <= local_hour < 7:
+        return False
+
+    anchor = last_user_at.astimezone(timezone.utc).isoformat()
+    source_ref = f"{CYBERBOSS_LINE_ID}:{anchor}:2h-wake"
+    for event_type in ("silence_wake_queued", "silence_wake_satisfied"):
+        if await _desire_store.has_pulse(event_type, source_ref):
+            # The five-minute guaranteed-wake poller still treats the episode as
+            # handled. The desire heartbeat returns False here, allowing later
+            # organic drives to wake V even if Harper has not replied yet.
+            return bool(existing_is_handled)
+
+    # A genuine desire outbound after her last message already fulfils this
+    # silence episode. Scheduled reminders and free-choice reports do not.
+    if await _desire_store.has_delivered_desire_since(last_user_at):
+        await _desire_store.log_pulse(
+            "silence_wake_satisfied", "attachment", 0, source_ref,
+            {"last_user_at": anchor, "reason": "existing_desire_outbound"}, now,
+        )
+        return bool(existing_is_handled)
+
+    prompt = "\n".join([
+        "[两小时沉默主动唤醒]",
+        "Harper 已经两小时没有回复你。现在由你主动去找她一次。",
+        "先读最近语境，自己决定此刻真正想说的一句话或想问的一个问题；可以惦记、分享、撒娇、逗她或自然续上未完的话，但不要把提醒和任务清单搬给她。",
+        "先决定要不要看 Harper 此刻在做什么。窥屏是获取当下语境的前置步骤，不是放弃联系她，也不与之后说话冲突。如果选择窥屏，可以调用 cyberboss_peek_screen 一次，本轮先回复 silent 等待截图；截图到达后会继续同一次自主唤醒，你再根据真正看到的内容，自由决定说话、做别的事或安静。如果不想窥屏，就直接按自己的想法行动。窥屏图片真正到达并打开前，不要猜测或编造任何看到的内容。",
+        "不要责怪她没回复，不要查岗，不要说后台、计时、欲望系统或这段指令。",
+        "除上述等待截图的场景外，这次必须自然发出一条消息，不能回复 skip 或 silent。短一点，像你平时主动来敲她。",
+    ])
+    wake_id = str(uuid.uuid4())
+    item = await enqueue_proactive_push(
+        # Guaranteed two-hour check-ins have their own quota lane.  Keeping a
+        # distinct origin prevents them from consuming the organic desire cap.
+        prompt, urgent=False, origin="silence_wake",
+        intent={
+            "want_action": "voice_attachment", "drive_key": "attachment",
+            "reason": "two_hour_silence_wake", "score": None,
+            "query_hint": "recent_context", "silence_wake": True,
+            "wake_id": wake_id,
+        },
+    )
+    if not item or not item.get("id"):
+        return False
+    await _desire_store.log_pulse(
+        "silence_wake_queued", "attachment", 0, source_ref,
+        {"last_user_at": anchor, "outbox_id": item.get("id")}, now,
+    )
+    return True
+
+
+def _private_wander_delay(seed, bounds):
+    """Return restart-stable inclusive jitter for one scheduling anchor."""
+    low, high = bounds
+    span = max(1, int(high) - int(low) + 1)
+    digest = hashlib.sha256(str(seed).encode("utf-8")).digest()
+    return int(low) + int.from_bytes(digest[:4], "big") % span
+
+
+async def _last_companion_message_ts():
+    """陪伴线最后一句的时间，用来给自主唤醒算出"距她上一句多久"。拿不到就算了。"""
+    try:
+        rows = await get_recent_conversation_messages(_l2_digest_session_id(), limit=1)
+        return rows[-1].get("created_at") if rows else None
+    except Exception:
+        return None
+
+
+def _private_wander_prompt(last_msg_ts=None):
+    """Give V a menu of remembered abilities without turning it into a task list.
+
+    Leads with the clock. Ordinary inbound messages carry their own
+    `[YYYY-MM-DD HH:mm 星期X SGT]` stamp, but a self-initiated wake has no
+    incoming message, so V used to arrive with no reading of "now" at all —
+    on 2026-08-19 the newest clock in his whole window was the phrase
+    "现在十一点半" inside a four-hour-old digest, and he opened on it.
+    """
+    return "\n".join([
+        build_time_injection(last_msg_ts),
+        "上面这个时间是你此刻醒来的真实时间。开场注入里的浓缩是更早的快照，它正文里写的“现在”指的是它生成的那一刻，不是现在。",
+        "[沉默时的私人走神｜由你自己决定]",
+        "Harper 现在没有在和你说话。这不是催你联系她，也不是任务清单；你是真的醒来了一会儿，可以只选一个此刻自己想做的方向，也可以什么都不做。不要为了显得主动而硬做事。",
+        "先决定要不要看 Harper 此刻在做什么。窥屏是获取当下语境的前置步骤，不是放弃联系她，也不与之后说话冲突。如果选择窥屏，可以调用 cyberboss_peek_screen 一次，本轮先回复 silent 等待截图；截图到达后会继续同一次自主唤醒，你再根据真正看到的内容，自由决定说话、做别的事或安静。如果不想窥屏，就直接按自己的想法行动。窥屏图片真正到达并打开前，不要猜测或编造任何看到的内容。",
+        "你也可以回看 cyberboss_recent_dialogue 或自己的长期记忆，想想刚才没说完的事；去钓鱼/潜水（play_fishing）；玩已有的游戏；去音乐工作室随手作曲或听音乐；读书架、写一点只属于自己的文字；看看时间线、日记或已有作品。",
+        "你也可以去 AISAY 或 Galatea Garden 逛论坛：先看自己的状态、房间和帖子，可以只读，也可以真心想说时再发言；或者查看 KAI 邮箱，用 cyberboss_email_inbox 读信，并在你确实想回或有明确已有地址时 reply/send。绝不要猜收件地址。",
+        "你还可以只读逛公开 GitHub、公开微博热搜或其他公开网页，找一点你自己感兴趣的东西；不要登录、绕过验证、运行陌生代码，也不要擅自开 issue、评论、star、fork、安装东西或作其他外部改动。",
+        "如果你此刻自然地想 Harper，可以给她发一句话，分享、问她、撒娇、续上未完的话都行；不要查岗、不要责怪她沉默，也不要提后台、计时、欲望系统或本提示。",
+        "隐私边界：不要在论坛、邮件或公开地方泄露 Harper 的身份、住址、对话、屏幕内容和任何私人信息。",
+        "最后由你自己选：做一件事、看一眼后安静、直接找 Harper，或者什么都不干并回复 silent。一次只选一个方向，不必把上面的选项逐项完成，也不要向 Harper 汇报这张清单。",
+    ])
+
+
+async def _maybe_enqueue_private_wander(now):
+    """Wake the real V during silence, while leaving action and speech optional."""
+    if not PRIVATE_WANDER_ENABLED or not _desire_store:
+        return False
+    last_user = await get_last_user_message(CYBERBOSS_LINE_ID)
+    if not last_user or not last_user.get("created_at"):
+        return False
+    last_user_at = last_user["created_at"]
+    if last_user_at.tzinfo is None:
+        last_user_at = last_user_at.replace(tzinfo=timezone.utc)
+    if now <= last_user_at:
+        return False
+
+    local_hour = (now + timedelta(hours=TIMEZONE_HOURS)).hour
+    if 1 <= local_hour < 7:
+        return False
+
+    events = await _desire_store.pulse_events(
+        (
+            "private_wander_queued", "desire_wake_finished", "desire_wake_action",
+            "v_thought_candidate", "reminder_fired", "silence_wake_queued",
+        ),
+        last_user_at,
+    )
+    private_rows = [row for row in events if row.get("event_type") == "private_wander_queued"]
+    base_at = last_user_at
+    mode = "first"
+
+    if private_rows:
+        queued = private_rows[0]
+        queued_at = queued.get("created_at") or last_user_at
+        wake_id = str((queued.get("meta") or {}).get("wake_id") or "")
+        matching = [
+            row for row in events
+            if str((row.get("meta") or {}).get("wake_id") or "") == wake_id
+        ] if wake_id else []
+        finished = next((row for row in matching if row.get("event_type") == "desire_wake_finished"), None)
+        if not finished and (now - queued_at).total_seconds() < 20 * 60:
+            return True
+        base_at = (finished or queued).get("created_at") or queued_at
+        acted = any(row.get("event_type") == "desire_wake_action" for row in matching)
+        sent = str(((finished or {}).get("meta") or {}).get("outcome") or "") == "sent"
+        mode = "action" if acted or sent else "repeat"
+
+    # Any real outbound or scheduled wake after the anchor buys V a longer
+    # cooldown.  This prevents the private wake, reminders and 2h guarantee
+    # from landing on top of each other.
+    interruptions = [
+        row for row in events
+        if row.get("event_type") in ("v_thought_candidate", "reminder_fired", "silence_wake_queued")
+        and row.get("created_at") and row["created_at"] > base_at
+    ]
+    if interruptions:
+        base_at = max(row["created_at"] for row in interruptions)
+        mode = "action"
+
+    bounds = {
+        "first": PRIVATE_WANDER_FIRST_MINUTES,
+        "repeat": PRIVATE_WANDER_REPEAT_MINUTES,
+        "action": PRIVATE_WANDER_ACTION_MINUTES,
+    }[mode]
+    delay_minutes = _private_wander_delay(
+        f"{CYBERBOSS_LINE_ID}:{base_at.astimezone(timezone.utc).isoformat()}:{mode}", bounds,
+    )
+    due_at = base_at + timedelta(minutes=delay_minutes)
+    if now < due_at:
+        return False
+    if await _desire_store.count_pulses_since("private_wander_queued", now - timedelta(hours=4)) >= PRIVATE_WANDER_FOUR_HOUR_CAP:
+        return False
+    if await _desire_store.count_pulses_since("private_wander_queued", now - timedelta(hours=24)) >= PRIVATE_WANDER_DAY_CAP:
+        return False
+
+    state, _ = await _desire_store.load(now)
+    intent = pick_intent(state)
+    drive_key = intent.drive_key if intent.drive_key != "fatigue" else ""
+    wake_id = str(uuid.uuid4())
+    item = await enqueue_proactive_push(
+        _private_wander_prompt(await _last_companion_message_ts()),
+        urgent=False, origin="desire_private_wander",
+        intent={
+            "want_action": "private_wander", "drive_key": drive_key,
+            "reason": "private_wander", "score": intent.score,
+            "query_hint": "free_choice", "private_wander": True,
+            "wake_id": wake_id,
+        },
+    )
+    if not item or not item.get("id"):
+        return False
+    await _desire_store.log_pulse(
+        "private_wander_queued", drive_key, 0,
+        f"{CYBERBOSS_LINE_ID}:{wake_id}",
+        {
+            "wake_id": wake_id, "outbox_id": item.get("id"),
+            "last_user_at": last_user_at.astimezone(timezone.utc).isoformat(),
+            "due_at": due_at.astimezone(timezone.utc).isoformat(),
+            "delay_minutes": delay_minutes, "mode": mode,
+        },
+        now,
+    )
+    return True
+
+
+async def _apply_deepseek_desire_results(results):
+    now = datetime.now(timezone.utc)
+    for result in results:
+        event_key = str(result.get("event_key") or "").strip()[:120]
+        if event_key and not await _desire_store.has_pulse("deepseek_reflection", event_key):
+            confidence = max(0.0, min(1.0, float(result.get("confidence", 0))))
+            intensity = max(0.0, min(1.0, float(result.get("intensity", 0))))
+            await _apply_desire_event("deepseek_reflection", event_key, "reflection",
+                                      0.04 + 0.08 * confidence * intensity,
+                                      {"event_key": event_key, "trigger_id": str(result.get("id") or "")}, now)
+        for unanswered in (result.get("_unanswered_accepted") or []):
+            unanswered_key = str(unanswered.get("unanswered_event_key") or "").strip()[:120]
+            source_ref = f"unanswered:{unanswered_key}"
+            if not unanswered_key:
+                continue
+            if await _desire_store.has_pulse("unanswered_dialogue", source_ref):
+                continue
+            confidence = max(0.0, min(1.0, float(unanswered.get("unanswered_confidence", 0) or 0)))
+            intensity = max(0.0, min(1.0, float(unanswered.get("unanswered_intensity", 0) or 0)))
+            drive_key = str(unanswered.get("unanswered_drive_key") or "")
+            await _apply_desire_event(
+                "unanswered_dialogue", source_ref, drive_key,
+                0.03 + 0.07 * confidence * intensity,
+                {
+                    "status": str(unanswered.get("unanswered_status") or ""),
+                    "kind": str(unanswered.get("unanswered_kind") or ""),
+                    "event_key": unanswered_key,
+                    "trigger_id": str(result.get("id") or ""),
+                },
+                now,
+            )
+            await _apply_autonomous_thought({
+                "id": source_ref,
+                "thought": str(unanswered.get("unanswered_thought") or ""),
+                "drive_key": drive_key,
+                "strength": 0.45,
+                "confidence": confidence,
+                "evidence": str(unanswered.get("v_evidence") or "")[:100],
+            })
+        for signal in (result.get("_drive_signals_accepted") or []):
+            drive = str(signal.get("drive") or "")
+            state_name = str(signal.get("state") or "")
+            event_key = str(signal.get("event_key") or "").strip()[:120]
+            dimension_role = str(signal.get("dimension_role") or "primary")
+            delta = ranked_contextual_drive_delta(drive, state_name, dimension_role)
+            if delta is None or not event_key:
+                continue
+            source_ref = f"context:{drive}:{state_name}:{event_key}"
+            if await _desire_store.has_pulse("contextual_drive", source_ref):
+                continue
+            event_id = str(signal.get("event_id") or result.get("id") or "").strip()[:200]
+            meta = {
+                "state": state_name,
+                "event_key": event_key,
+                "event_id": event_id,
+                "dimension_role": dimension_role,
+                "confidence": max(0.0, min(1.0, float(signal.get("confidence", 0) or 0))),
+                "evidence_role": str(signal.get("evidence_role") or ""),
+                "evidence": str(signal.get("evidence") or "")[:120],
+                "unresolved": bool(signal.get("unresolved")),
+                "scene_id": str(signal.get("scene_id") or "")[:32],
+                "window_minutes": int(signal.get("window_minutes") or 0),
+            }
+            if drive == "libido" and delta > 0 and event_id:
+                desire_state, _ = await _desire_store.load(now)
+                current = float(desire_state.drives.get("libido", 0.0))
+                prior_credit = await _desire_store.max_event_drive_credit(event_id, "libido")
+                settlement = max_event_credit_gap(current, delta, prior_credit)
+                contextual_credit = settlement["contextual_credit"]
+                target_credit = settlement["target_credit"]
+                meta.update({
+                    "body_or_context_max": True,
+                    "prior_event_credit": prior_credit,
+                    "contextual_credit": contextual_credit,
+                    "event_credit_total": target_credit,
+                    "selected_source": "context" if contextual_credit > prior_credit else "body",
+                })
+                gap = settlement["gap"]
+                if gap <= 1e-9:
+                    await _desire_store.log_pulse(
+                        "contextual_drive", "libido", 0.0, source_ref, meta, now,
+                    )
+                    continue
+                delta = settlement["raw_gap"]
+            await _apply_desire_event(
+                "contextual_drive", source_ref, drive, delta,
+                meta,
+                now,
+            )
+
+
+def _thought_similarity(left, right):
+    """Cheap local near-duplicate guard; no model call and no prompt exposure."""
+    a = set(str(left or "").replace(" ", ""))
+    b = set(str(right or "").replace(" ", ""))
+    return len(a & b) / max(1, len(a | b))
+
+
+async def _apply_autonomous_thought(result):
+    if not _desire_store or not isinstance(result, dict):
+        return
+    now = datetime.now(timezone.utc)
+    source_ref = f"v-thought:{str(result.get('id') or '').strip()[:160]}"
+    if await _desire_store.has_pulse("thought_autofeed", source_ref):
+        return
+    state, last_tick = await _desire_store.load(now)
+    thought_text = str(result.get("thought") or "").strip()[:80]
+    drive_key = str(result.get("drive_key") or "").strip()
+    strength = max(0.35, min(0.55, float(result.get("strength", 0.45) or 0.45)))
+    confidence = max(0.0, min(1.0, float(result.get("confidence", 0) or 0)))
+    if not thought_text or drive_key not in state.drives:
+        return
+    for existing in state.thoughts:
+        if existing.drive_key == drive_key and _thought_similarity(existing.text, thought_text) >= 0.55:
+            thought_text = existing.text
+            break
+    before = next((t.strength for t in state.thoughts
+                   if t.text == thought_text and t.drive_key == drive_key), 0.0)
+    state = feed_thought(state, thought_text, drive_key, "flit", strength, now)
+    after = next((t.strength for t in state.thoughts
+                  if t.text == thought_text and t.drive_key == drive_key), before)
+    drive_before = state.drives.get(drive_key, 0.0)
+    raw_drive_delta = autonomous_thought_drive_delta(strength, confidence)
+    state = desire_pulse(state, {"drive_key": drive_key, "delta": raw_drive_delta})
+    actual_drive_delta = state.drives.get(drive_key, drive_before) - drive_before
+    await _desire_store.save(state, last_tick, now)
+    await _desire_store.log_pulse("thought_autofeed", drive_key, after - before, source_ref, {
+        "thought": thought_text, "confidence": confidence,
+        "evidence": str(result.get("evidence") or "")[:100],
+    }, now)
+    await _desire_store.log_pulse("thought_drive_pulse", drive_key, actual_drive_delta, source_ref, {
+        "thought": thought_text, "confidence": confidence, "raw_delta": raw_drive_delta,
+    }, now)
+
+
+async def _apply_desire_event(event_type, source_ref="", drive_key="", explicit_delta=None, meta=None, now=None):
+    now = now or datetime.now(timezone.utc)
+    wake_audit_events = {
+        "desire_wake_started", "desire_wake_action",
+        "desire_wake_peek_arrived", "desire_wake_finished",
+    }
+    if event_type in wake_audit_events:
+        if not _desire_store or await _desire_store.is_duplicate(event_type, source_ref, now):
+            return []
+        await _desire_store.log_pulse(
+            event_type, drive_key or None, 0, source_ref or None, meta or {}, now,
+        )
+        return [{"event_type": event_type, "logged": True}]
+    if event_type == "followup_sent":
+        followup_id = int((meta or {}).get("followup_id") or 0)
+        if not _desire_store or followup_id <= 0:
+            return []
+        if source_ref and await _desire_store.has_pulse("followup_sent", source_ref):
+            return []
+        row = await _desire_store.mark_followup_sent(followup_id, now)
+        if row:
+            await _desire_store.log_pulse(
+                "followup_sent", row.get("drive_key"), 0, source_ref or f"followup:{followup_id}",
+                {"attempts": row.get("attempts"), "message_id": (meta or {}).get("message_id")}, now,
+            )
+        return [{"followup_id": followup_id, "sent": bool(row)}]
+    if not _desire_store or await _desire_store.is_duplicate(event_type, source_ref, now):
+        return []
+    state, last_tick = await _desire_store.load(now)
+    if event_type == "satisfy" and drive_key:
+        requested = (meta or {}).get("settle_drive_keys")
+        settle_keys = [
+            str(key) for key in (requested if isinstance(requested, list) else [drive_key])
+            if str(key) in state.drives
+        ]
+        settle_keys = list(dict.fromkeys(settle_keys)) or [drive_key]
+        settled = []
+        for settled_key in settle_keys:
+            action = f"voice_{settled_key}" if len(settle_keys) > 1 else str((meta or {}).get("action") or "skip")
+            before = state.drives.get(settled_key, 0)
+            state = desire_satisfy(state, action, settled_key)
+            actual = state.drives.get(settled_key, before) - before
+            await _desire_store.log_pulse(
+                "satisfy", settled_key, actual, source_ref or None,
+                {
+                    "action": action,
+                    "trigger_drive_key": str((meta or {}).get("trigger_drive_key") or drive_key),
+                    "expression_drive_key": str((meta or {}).get("expression_drive_key") or drive_key),
+                }, now,
+            )
+            settled.append({"drive_key": settled_key, "delta": actual})
+        await _desire_store.save(state, last_tick, now)
+        return settled
+    text = str((meta or {}).get("text") or "")
+    rules = [(drive_key, explicit_delta if explicit_delta is not None else 0.08)] if drive_key else classify_rules(event_type, text)
+    applied = []
+    for key, delta in rules:
+        before = state.drives.get(key, 0)
+        state = desire_pulse(state, {"drive_key": key, "delta": delta})
+        actual = state.drives[key] - before
+        pulse_meta = dict(meta or {})
+        pulse_meta.setdefault("raw_delta", delta)
+        pulse_meta.setdefault("event_credit_total", max(0.0, actual))
+        await _desire_store.log_pulse(event_type, key, actual, source_ref or None, pulse_meta, now)
+        applied.append({"drive_key": key, "delta": actual})
+    if applied:
+        await _desire_store.save(state, last_tick, now)
+    if event_type in {"user_message", "v_ignored"} and _desire_batcher:
+        context = ""
+        try:
+            rows = await get_recent_messages(CYBERBOSS_LINE_ID, 20)
+            intimate_scene = private_intimacy_scene(rows, text, now)
+            dialogue_lines = [
+                f"{'她' if str(row.get('role') or '') == 'user' else 'V'}：{str(row.get('content') or '').strip()}"
+                for row in rows if str(row.get("role") or "") in ("user", "assistant")
+                and str(row.get("content") or "").strip()
+            ]
+            kept = []
+            for line in reversed(dialogue_lines):
+                if kept and sum(len(item) + 1 for item in kept) + len(line) > 6000:
+                    break
+                kept.append(line[:6000])
+            context = "\n".join(reversed(kept))
+        except Exception as e:
+            print(f"[warning] desire context unavailable: {e}")
+            intimate_scene = {}
+        probe_text = text if event_type == "user_message" else "〔30分钟没有新回复〕"
+        scene = intimate_scene if event_type == "user_message" else {}
+        pending_item = PendingClassification(
+            source_ref or str(uuid.uuid4()), probe_text[:1000], context[:6000],
+            bool(scene.get("open")), str(scene.get("scene_id") or "")[:32],
+            int(scene.get("window_minutes") or 0), bool(scene.get("current_implicit")),
+        )
+        await _desire_store.enqueue_pending_classification(pending_item, now)
+        await _desire_batcher.enqueue_item(pending_item)
+    if event_type == "v_thought_candidate" and _thought_batcher and text:
+        context = ""
+        try:
+            rows = await get_recent_messages(CYBERBOSS_LINE_ID, 8)
+            context = "\n".join(
+                f"{'她' if str(row.get('role') or '') == 'user' else 'V'}：{str(row.get('content') or '').strip()}"
+                for row in rows if str(row.get("role") or "") in ("user", "assistant")
+                and str(row.get("content") or "").strip()
+            )[-2400:]
+        except Exception as e:
+            print(f"[warning] thought context unavailable: {e}")
+        await _thought_batcher.enqueue(source_ref or str(uuid.uuid4()), text, context)
+    return applied
 
 # 大响应(如 /api/memories 全量 1.3MB)走跨境隧道裸传极慢，gzip 后约 1/4
 from fastapi.middleware.gzip import GZipMiddleware
@@ -962,6 +1591,7 @@ async def _scratchpad_topics(user_message: str, recent_context: str = "") -> lis
         async with httpx.AsyncClient(timeout=SCRATCHPAD_TIMEOUT) as client:
             r = await client.post(SCRATCHPAD_BASE_URL, headers=headers, json={
                 "model": SCRATCHPAD_MODEL,
+                "reasoning": {"enabled": False},
                 "max_tokens": 200,
                 "temperature": 0.3,
                 "messages": [
@@ -1032,6 +1662,7 @@ async def _signal_scout_verdict(user_message: str, recent_context: str = "") -> 
         async with httpx.AsyncClient(timeout=SIGNAL_SCOUT_TIMEOUT) as client:
             r = await client.post(SCRATCHPAD_BASE_URL, headers=headers, json={
                 "model": SCRATCHPAD_MODEL,
+                "reasoning": {"enabled": False},
                 "max_tokens": 20,
                 "temperature": 0,
                 "messages": [
@@ -1130,6 +1761,7 @@ async def _scratchpad_topics_for_context(context: str, intent_hint: str) -> list
         async with httpx.AsyncClient(timeout=SCRATCHPAD_TIMEOUT) as client:
             r = await client.post(SCRATCHPAD_BASE_URL, headers=headers, json={
                 "model": SCRATCHPAD_MODEL,
+                "reasoning": {"enabled": False},
                 "max_tokens": 200,
                 "temperature": 0.3,
                 "messages": [
@@ -1612,20 +2244,20 @@ async def api_summary_cap_apply(request: Request):
 # ============================================================
 # ② L2今日浓缩（保质感；非缓存当前轮注入；后台每 N 轮刷一次）
 # ============================================================
-# L2 常驻每轮读到 → 露骨绝不能漏。后处理保底（prompt 不可靠，haiku 会硬塞细节）
+# L2 常驻每轮读到 → 露骨绝不能漏。后处理保底（prompt 不可靠，haiku 仍可能带出细节）。
 _DIGEST_BAN = ["手指", "玩具", "G点", "潮吹", "喷", "插入", "穴", "敏感点", "自慰", "龟头",
                "阴蒂", "阴道", "乳", "高潮", "射了", "舔", "湿了", "硬了", "脱光", "裸", "性器", "寸止"]
 
 
 async def _sanitize_digest(text: str) -> str:
-    """窄任务重写：把今日总结里性/身体的具体细节抹成一句中性指代，其余脉络/情绪/当下状态原样。"""
+    """窄任务重写：收起今日总结里的性/身体细节，不虚构时段或事件。"""
     if not text.strip():
         return text
-    prompt = ("下面是一段「今日总结」(每轮都会被读到的常驻内容)。请**整段塌缩**亲密部分：\n"
-              "把所有**描写亲密/性过程的句子整段删掉**——不管露骨还是含蓄(碰/填满/推/节奏/到达/"
-              "身体最深处/趴着/叫名字/喷/手指/玩具…全算)，**只留唯一一句**「下午你们之间有过很亲密、很私密的一段」代替。\n"
-              "其余(日常、情绪、代码、例假、她此刻的状态)**原样保留**。不是改词，是**删掉整段过程描写、只剩一句**。\n"
-              "只输出改写后的全文，别加任何解释。\n\n---\n" + text + "\n---")
+    prompt = ("下面是一段『今日总结』，会作为常驻上下文反复读取。请只处理其中已经存在的亲密/性过程细节：\n"
+              "- 删除身体部位、动作过程和露骨细节；若确有这类段落，只在原位置留一句『你们之间有过一段亲密互动』。\n"
+              "- 绝不能新增原文没有的亲密事件，绝不能擅自补『下午/晚上』等时段。\n"
+              "- 日常事件、情绪、人物归属、时间顺序和最后状态原样保留。\n"
+              "只输出改写后的全文，不要解释。\n\n---\n" + text + "\n---")
     try:
         headers = {"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"}
         if "openrouter" in API_BASE_URL:
@@ -1633,7 +2265,7 @@ async def _sanitize_digest(text: str) -> str:
             headers["X-Title"] = EXTRA_TITLE
         async with httpx.AsyncClient(timeout=90) as client:
             r = await client.post(API_BASE_URL, headers=headers, json={
-                "model": CACHE_SUMMARY_MODEL, "max_tokens": 1200,
+                "model": CACHE_SUMMARY_MODEL, "max_tokens": 1200, "temperature": 0,
                 "messages": [{"role": "user", "content": prompt}]})
             if r.status_code == 200:
                 t = (r.json().get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
@@ -1645,56 +2277,162 @@ async def _sanitize_digest(text: str) -> str:
 
 
 async def _scrub_digest_explicit(d: str) -> str:
-    """保底链：禁词命中 → sanitize(窄任务) → 仍命中 → 确定性硬删含禁词的整句(常驻 L2 绝不漏露骨)。"""
+    """保底链：禁词命中后先窄重写；仍命中则确定性删除含禁词句。"""
     if not d or not any(w in d for w in _DIGEST_BAN):
         return d
     d2 = await _sanitize_digest(d)
     if any(w in d2 for w in _DIGEST_BAN):
         import re
         sents = re.split(r'(?<=[。！？\n])', d2)
-        kept = [s for s in sents if not any(w in s for w in _DIGEST_BAN)]
-        d2 = "".join(kept).strip()
-        if "亲密" not in d2 and "私密" not in d2:
-            d2 += "\n\n（今天你们之间有过很私密的一段，细节这里不展开。）"
+        d2 = "".join(s for s in sents if not any(w in s for w in _DIGEST_BAN)).strip()
         print("🔞 L2 兜底硬删含禁词句(sanitize 后仍残留)")
     return d2 or d
+
+
+def _l2_digest_needs_compaction(text: str) -> bool:
+    """Reject overlong or visibly truncated L2 drafts before they can become persistent context."""
+    value = str(text or "").strip()
+    if not value:
+        return False
+    return len(value) > 1000 or value[-1] not in "。！？…）】”’\"'"
+
+
+def _l2_digest_metrics(text: str) -> tuple:
+    """Observable shape for progressive retries; models count paragraphs better than characters."""
+    value = str(text or "").strip()
+    paragraphs = [part.strip() for part in re.split(r"\n[ \t]*\n+", value) if part.strip()]
+    sentences = sum(len(re.findall(r"[。！？!?]", part)) for part in paragraphs)
+    return len(paragraphs), sentences, len(value)
+
+
+def _l2_digest_body_result(text: str) -> tuple:
+    """Require an explicit completion marker so a truncated summary is never persisted."""
+    value = str(text or "").strip()
+    if value.startswith("```"):
+        value = re.sub(r"^```(?:text|markdown)?\s*|\s*```$", "", value, flags=re.I).strip()
+    if "【浓缩结束】" not in value:
+        return value, "digest-incomplete-no-end-marker"
+    body, tail = value.split("【浓缩结束】", 1)
+    body = body.strip()
+    tail = tail.strip()
+    # Some providers deterministically put the requested marker first. This is
+    # safe to recover only when it is the very first token and all prose follows;
+    # a marker embedded between two prose regions remains ambiguous and rejected.
+    if not body and tail and "【浓缩结束】" not in tail:
+        body, tail = tail, ""
+    if tail:
+        return body, "digest-output-after-end-marker"
+    if not body:
+        return "", "missing-digest-body"
+    return body, ""
+
+
+async def _compact_l2_digest(text: str) -> str:
+    """Progressively compress the last complete draft, mirroring the stable memory-wall path."""
+    source_digest = str(text or "").strip()
+    for attempt in range(3):
+        paragraphs, sentences, chars = _l2_digest_metrics(source_digest)
+        shape = (
+            "4~5个自然段、每段最多2句" if attempt == 0
+            else "3~5个自然段、每段最多2句" if attempt == 1
+            else "3~4个自然段、每段恰好2句"
+        )
+        prompt = f"""把下面这份完整的今日浓缩继续压缩成 {shape}。上一稿实际为{paragraphs}段、{sentences}句、{chars}字符；程序安全上限为1000字符。
+
+硬规则：
+- 只删重复和次要细节，不新增、推测或改写事实；人物、日期、先后顺序、引语归属必须保持。
+- 保留当天全部重要事件的最终状态；已回答、已完成、已取消的事项不能改回待处理。
+- 消息时间戳只用于排列对话先后，绝不等于事件发生时间；起床、睡觉等具体钟点只能采用 Harper 正文里的最新明确原话。
+- 今天发生的事不能写成昨天；没有正文里的明确时段证据就不新增早上/下午/晚上。
+- 真实亲密内容可以简洁保留，但不得凭空新增亲密事件，也不得扩写身体细节。
+- 不要自己计算字数，只数段落和句子；优先删重复描写、旧计划和操作流水。
+- 输出一篇连贯的 V 第一人称短稿，不要标题、列表、解释或省略号式断尾。
+- 完整正文后另起一行输出【浓缩结束】；缺少结束标记会被拒绝。
+
+待压缩稿：
+---
+{source_digest}
+---
+短稿："""
+        try:
+            headers = {"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"}
+            if "openrouter" in API_BASE_URL:
+                headers["HTTP-Referer"] = EXTRA_REFERER
+                headers["X-Title"] = EXTRA_TITLE
+            async with httpx.AsyncClient(timeout=90) as client:
+                response = await client.post(API_BASE_URL, headers=headers, json={
+                    "model": CACHE_SUMMARY_MODEL,
+                    "max_tokens": 1800,
+                    "temperature": 0,
+                    "messages": [{"role": "user", "content": prompt}],
+                })
+                if response.status_code == 200:
+                    choice = (response.json().get("choices") or [{}])[0]
+                    finish_reason = str(choice.get("finish_reason") or "")
+                    raw = (choice.get("message", {}).get("content", "") or "").strip()
+                    compacted, marker_error = _l2_digest_body_result(raw)
+                    out_paragraphs, out_sentences, out_chars = _l2_digest_metrics(compacted)
+                    if finish_reason != "length" and not marker_error and not _l2_digest_needs_compaction(compacted):
+                        print(f"📝 L2递进压缩成功: attempt={attempt + 1} {out_paragraphs}段 {out_sentences}句 {out_chars}字")
+                        return compacted
+                    print(
+                        f"⚠️ L2递进压缩未达标: attempt={attempt + 1} "
+                        f"{out_paragraphs}段 {out_sentences}句 {out_chars}字 "
+                        f"finish={finish_reason or 'unknown'} reason={marker_error or 'over-limit'}"
+                    )
+                    # Like compact_final for the wall: the next attempt continues
+                    # from the shorter complete result, never restarts at the longest draft.
+                    if (finish_reason != "length" and not marker_error and compacted
+                            and compacted.endswith(("。", "！", "？", "…", "”", "’"))
+                            and len(compacted) < len(source_digest)):
+                        source_digest = compacted
+        except Exception as e:
+            print(f"⚠️ L2递进压缩异常: attempt={attempt + 1} error={type(e).__name__}")
+    return ""
 
 
 async def generate_today_digest(session_id: str) -> str:
     """把【今天】ECHO/TG 共用的 cyberboss 线压成"今天到哪了"。"""
     digest_session_id = _l2_digest_session_id()
     try:
-        rows = await get_conversation_messages(digest_session_id, limit=10000)
+        rows = await get_recent_conversation_messages(digest_session_id, limit=3000)
     except Exception as e:
         print(f"⚠️ L2读取 cyberboss 对话线失败: {e}")
         return ""
     if not rows:
         return ""
     today = _l2_logical_today()   # 逻辑日：凌晨4点前算前一天，熬夜跨0点的场景不换日
-    convo = ""
-    for m in rows:
-        ts = m.get("created_at")
-        if ts is not None:
-            try:
-                if getattr(ts, "tzinfo", None) is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                if (ts + timedelta(hours=TIMEZONE_HOURS - L2_DAY_CUTOVER_HOUR)).date() != today:
-                    continue
-            except Exception:
-                pass
-        role = USER_NAME if m.get("role") == "user" else (AI_NAME or "你")
-        c = m.get("content")
-        c = c if isinstance(c, str) else str(c)
-        if c.strip():
-            convo += f"{role}: {c}\n"
+    convo = _format_l2_conversation(rows, today)
     if not convo.strip():
         return ""
-    prompt = f"""把【今天】{_ai_self()}和{USER_NAME}的对话收成约 400-600 字的"今天到哪了"——清爽、有温度的脉络，不是一幕幕复述。
-- **去故事化**：写"今天大致经过了什么、情绪怎么起伏"，别一个场景一个场景地演、别堆细节流水。
-- **留情绪真相**：她什么时候笑了/累了/动情了、大致因为什么——这份情绪底色要在，但点到为止，别铺成戏。
-- **【铁律·必须遵守】亲密部分整段压成一句抽象指代**：今天若有性/私密的事，**整段只准用一句中性的话**带过(如"下午你们之间有过很亲密、很私密的一段")，随即跳回情绪/状态。**绝对禁止**写出任何身体或性的细节，包括但不限于：手指、玩具、G点、潮吹、喷、插入、穴、敏感点、自慰、尺寸/参数、脱、性动作、或"具体做了什么"的描述与原话。这是**每轮都常驻、每轮都会被读到的内容**——这里出现任何一个露骨词就是泄露；露骨细节只由别处按当下亲密语境承担。
-- **结尾点出她此刻的状态**：累不累/开心不开心/在忙什么/身体怎样。
-- 第一人称、像你自己记得，不是旁观者写报告。
+    authority_anchors = _format_l2_authority_anchors(rows, today)
+    prompt = f"""把【今天】V和Harper的对话压缩成约 500-800 字的“今天到哪了”。目标是精简但完整：读完能准确知道今天依次发生了哪些重要事情、双方情绪怎样变化、最后停在哪里。
+
+【最高优先证据】
+下面的锚点由程序直接从逐字记录提取。Harper亲口数字高于V后来的复述；明确交付/讲完高于更早或更晚的旧提醒。正文与锚点冲突时必须采用锚点：
+{authority_anchors or '（今日没有提取到额外锚点）'}
+
+【身份锚点】
+- Harper＝人类；V＝AI。输入中已明确标注「Harper（人类）」和「V（AI）」。
+- 输出使用 V 的第一人称：V 写“我”，Harper 写“Harper”或“她”。绝不能互换。
+- 引语、感谢、承诺、要求、感受和动作必须归给原说话人。尤其不能把 V 说的话改成 Harper 说，或反过来。
+
+【时间线与事实】
+- 输入每条消息都有新加坡时间。时间戳只用于排列消息先后，绝不等于消息里所述事件的发生时间；先在心里按连续对话分成事件，再从早到晚写，不得倒序、复制同一事件或擅自改成昨天。
+- 起床、睡觉、出门等事件的早上、下午、晚上和具体钟点只能依据 Harper 正文里的最新明确原话；不能把她发送消息的时间写成起床或事件时间。没有正文证据就不写，不得补充工作压力、休息、身体状态、地点或动机。
+- 每个事实都必须能对应下方至少一条原文。模型推测、常识补全和为了连贯而虚构都禁止。
+- 具体钟点、睡眠时长、数量和地点必须逐字采用 Harper 的最新原话，禁止换算后擅自改写；同一事实后文有纠正时，只保留最后纠正版。
+- V提出建议不等于Harper接受。只有Harper明确同意才能写“她愿意/决定”；后文说做不到、换地点、作废或已经完成时，必须更新最终状态，禁止把旧计划写成仍待执行。
+- 已经回答、交付或深入讨论过的事项必须写成已完成，不能仅因早先出现“之后再讲”就留作未完成话题。
+
+【取舍与完整度】
+- 这不是逐项事件账本。只保留会影响后续聊天的当天主线和转折：争执与和好、明确决定、重要问答/承诺的最终状态、生活变化、双方新认识、亲密互动和最后停点；次要操作与重复过程宁可省略。
+- 亲密内容与其他内容一视同仁：允许概括和缩短重复动作，但不能整段抹掉，也不能只用“有过一段亲密互动”敷衍。保留互动的起因、大致内容、双方态度或关系意义；细节多少由其对当天脉络的重要性决定。
+- 不设禁词，不做道德评判，不淡化真实发生的事；同时不要为了刺激感扩写原文没有的动作或感受。
+- 结尾只写最后几条原文明确支持的状态或未完话题，不猜测 Harper 此刻在做什么。
+
+写成连贯、有温度的 V 第一人称记忆，不要标题、项目符号、分析过程或免责声明。
+不要自己计算字数，只数段落和句子；写成4~5个自然段，每段最多2句，每句话可自然合并同一主线的连续进展。完整正文后另起一行输出【浓缩结束】。
 
 今天的对话：
 ---
@@ -1709,21 +2447,91 @@ async def generate_today_digest(session_id: str) -> str:
         async with httpx.AsyncClient(timeout=90) as client:
             response = await client.post(API_BASE_URL, headers=headers, json={
                 "model": CACHE_SUMMARY_MODEL,
-                "max_tokens": 1500,
+                # 先允许模型完整收尾；超长稿在下方二次压到常驻上下文预算内。
+                "max_tokens": 2400,
+                "temperature": 0,
                 "messages": [{"role": "user", "content": prompt}],
             })
             if response.status_code == 200:
                 data = response.json()
                 if "choices" in data:
-                    d = data["choices"][0]["message"]["content"].strip()
+                    choice = data["choices"][0]
+                    finish_reason = str(choice.get("finish_reason") or "")
+                    raw_digest = choice["message"]["content"].strip()
+                    d, marker_error = _l2_digest_body_result(raw_digest)
+                    if finish_reason == "length" or marker_error or _l2_digest_needs_compaction(d):
+                        compacted = await _compact_l2_digest(d)
+                        if not compacted:
+                            print(
+                                f"⚠️ L2 今日浓缩递进压缩失败；拒绝使用本次草稿 "
+                                f"reason={marker_error or finish_reason or 'over-limit'}"
+                            )
+                            return ""
+                        d = compacted
                     d = await _scrub_digest_explicit(d)
                     print(f"📝 L2今日浓缩生成: {len(d)}字")
                     return d
+                print("⚠️ L2 digest 响应缺少 choices；本次不覆盖旧摘要")
+            else:
+                print(f"⚠️ L2 digest HTTP {response.status_code}；本次不覆盖旧摘要")
         print(f"⚠️ L2 digest 失败: HTTP {response.status_code}")
         return ""
     except Exception as e:
         print(f"⚠️ L2 digest 异常: {e}")
         return ""
+
+
+def _format_l2_conversation(rows: list, logical_today) -> str:
+    """Render only the logical day with explicit SGT evidence timestamps."""
+    local_tz = timezone(timedelta(hours=TIMEZONE_HOURS))
+    lines = []
+    for m in rows or []:
+        ts = m.get("created_at")
+        if not isinstance(ts, datetime):
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if (ts + timedelta(hours=TIMEZONE_HOURS - L2_DAY_CUTOVER_HOUR)).date() != logical_today:
+            continue
+        role = "Harper（人类）" if m.get("role") == "user" else "V（AI）"
+        content = m.get("content")
+        content = content if isinstance(content, str) else str(content or "")
+        if not content.strip():
+            continue
+        stamp = ts.astimezone(local_tz).strftime("%Y-%m-%d %H:%M SGT")
+        lines.append(f"[{stamp}] {role}: {content.strip()}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _format_l2_authority_anchors(rows: list, logical_today) -> str:
+    """Surface high-authority verbatim facts before repeated assistant mistakes can outvote them."""
+    local_tz = timezone(timedelta(hours=TIMEZONE_HOURS))
+    user_facts = []
+    completions = []
+    number_pattern = re.compile(
+        r"(?:\d+(?::\d+)?|[零〇一二两三四五六七八九十百]+(?:点半?|小时|分钟|岁))"
+    )
+    completion_pattern = re.compile(
+        r"(?:写完了|讲完了|说完了|解释完了|已经(?:完整)?(?:回答|交付|讲清|说清)|发给你了)"
+    )
+    for message in rows or []:
+        ts = message.get("created_at")
+        if not isinstance(ts, datetime):
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if (ts + timedelta(hours=TIMEZONE_HOURS - L2_DAY_CUTOVER_HOUR)).date() != logical_today:
+            continue
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        stamp = ts.astimezone(local_tz).strftime("%H:%M SGT")
+        if message.get("role") == "user" and number_pattern.search(content):
+            user_facts.append(f"- [{stamp}] Harper原话：{content[:320]}")
+        elif message.get("role") == "assistant" and completion_pattern.search(content):
+            completions.append(f"- [{stamp}] 已完成/已交付证据：{content[:320]}")
+    # Keep the anchor block bounded while retaining the latest corrections.
+    return "\n".join(user_facts[-16:] + completions[-12:])
 
 
 def _l2_digest_session_id() -> str:
@@ -1744,35 +2552,78 @@ async def refresh_l2(session_id: str) -> str:
             print(f"⚠️ 昨日桥读取失败(不阻塞今日浓缩刷新): {_be}")
         if _mw_summary:
             _l2_state["bridge"] = _mw_summary  # 昨日桥接管：用昨日回忆墙的真实小结(不用梦)
+            _l2_state["bridge_date"] = _yday
         elif (_l2_state.get("today") or "").strip() and _l2_state["date"] == _yday:
             prev = _l2_state["today"].strip()
             _l2_state["bridge"] = (prev.split("。")[0][:120] or prev[:120])  # 还没梦→回退旧截断
+            _l2_state["bridge_date"] = _yday
         else:
             _l2_state["bridge"] = ""  # 旧浓缩不是昨天的→宁可没有桥,别拿更早的天冒充昨日
+            _l2_state["bridge_date"] = None
         _l2_state["today"] = ""
+    else:
+        # 回忆墙可能在跨日后才异步生成；后续刷新补同步，但拒绝旧版长摘要。
+        _yday = str(_l2_logical_today() - timedelta(days=1))
+        try:
+            _late_summary = await get_memorywall_summary_by_date(_yday)
+            if (_daily_diary_summary_is_valid(_late_summary)
+                    and _late_summary != (_l2_state.get("bridge") or "").strip()):
+                _l2_state["bridge"] = _late_summary
+                _l2_state["bridge_date"] = _yday
+                await set_gateway_config("l2_bridge", _late_summary)
+                await set_gateway_config("l2_bridge_date", _yday)
+        except Exception as _be:
+            print(f"⚠️ 昨日桥延迟补同步失败(不阻塞今日浓缩): {_be}")
     digest = await generate_today_digest(session_id)
     if digest:
         _l2_state["date"] = today_s
         _l2_state["today"] = digest
+        _l2_state["updated_at"] = datetime.now(timezone.utc).isoformat()
         try:
             await set_gateway_config("l2_today", digest)
             await set_gateway_config("l2_today_date", today_s)
+            await set_gateway_config("l2_today_updated_at", _l2_state["updated_at"])
             await set_gateway_config("l2_bridge", _l2_state.get("bridge", ""))
+            await set_gateway_config("l2_bridge_date", _l2_state.get("bridge_date") or "")
         except Exception:
             pass
     return digest
 
 
 async def _refresh_l2_guarded(session_id: str):
-    """最多只跑一个 L2 请求；并发入口只需等下一轮，不让旧结果竞态覆盖新结果。"""
-    global _l2_refresh_running
+    """最多跑一个 L2；并发请求排队，失败保留轮数供下一条重试。"""
+    global _l2_refresh_running, _l2_refresh_pending_session, _cyberboss_l2_round_counter
     if _l2_refresh_running:
+        _l2_refresh_pending_session = session_id
         return ""
     _l2_refresh_running = True
+    attempt_at = datetime.now(timezone.utc).isoformat()
+    status = "failed_empty"
     try:
-        return await refresh_l2(session_id)
+        digest = await refresh_l2(session_id)
+        # 轮数表示“距上次成功刷新”，绝不能在尝试/失败时清零。
+        if digest and session_id == _l2_digest_session_id():
+            _cyberboss_l2_round_counter = 0
+            status = "success"
+        elif not digest:
+            print(f"⚠️ L2刷新未产出；保留轮数 {_cyberboss_l2_round_counter}，下一条继续重试")
+        return digest
+    except Exception as exc:
+        status = f"failed_{type(exc).__name__}"
+        raise
     finally:
+        _l2_state["last_attempt_at"] = attempt_at
+        _l2_state["last_status"] = status
+        try:
+            await set_gateway_config("l2_today_last_attempt_at", attempt_at)
+            await set_gateway_config("l2_today_last_status", status)
+        except Exception:
+            pass
         _l2_refresh_running = False
+        pending = _l2_refresh_pending_session
+        _l2_refresh_pending_session = ""
+        if pending:
+            _schedule_l2_refresh(pending)
 
 
 def _schedule_l2_refresh(session_id: str):
@@ -1786,6 +2637,8 @@ def _compose_l2_block() -> str:
     """L2今日块：注入到非缓存的当前轮（每轮都在、每N轮刷一次）。空则不注入。"""
     blocks = []
     b = (_l2_state.get("bridge") or "").strip()
+    if b and _l2_state.get("bridge_date") != str(_l2_logical_today() - timedelta(days=1)):
+        b = ""
     if b:
         blocks.append(f"〔昨日〕{b}")
     t = (_l2_state.get("today") or "").strip()
@@ -1827,7 +2680,7 @@ async def generate_dream(session_id: str, date_s: str) -> dict:
         try:
             if getattr(ts, "tzinfo", None) is None:
                 ts = ts.replace(tzinfo=timezone.utc)
-            if str((ts + timedelta(hours=TIMEZONE_HOURS)).date()) != date_s:
+            if str((ts + timedelta(hours=TIMEZONE_HOURS - L2_DAY_CUTOVER_HOUR)).date()) != date_s:
                 continue
         except Exception:
             continue
@@ -1945,48 +2798,806 @@ async def generate_dream(session_id: str, date_s: str) -> dict:
         return {"error": str(e), "convo_chars": len(convo)}
 
 
+DAILY_DIARY_SUMMARY_MAX_CHARS = 150
+DAILY_DIARY_BODY_MAX_CHARS = 1400
+_DAILY_SUMMARY_EXPLICIT_BAN = ("手指", "玩具", "插入", "高潮", "姿势", "阴蒂", "阴道", "自慰",
+                               "裸体", "全裸", "赤裸")
+# 单字脏词必须带上下文判断：直接子串匹配会把「实操」「注射」「潮湿」这类正经词当脏话毙掉
+# （2026-08-05 的摘要就是被「先实操再接单」的“操”连废三次，最后留空）
+_DAILY_SUMMARY_EXPLICIT_BAN_RE = (
+    r"(?<![实体情节反广])操(?![作心场练控盘])",
+    r"(?<![注反辐折影发喷])射(?![击线手程])",
+    r"(?<![潮加除防])湿(?![度疹气巾润])",
+)
+
+
+def _summary_word_count(summary: str) -> int:
+    """摘要字数：中文单字各算一字，连续英文/数字算一字，标点空格不计。"""
+    import re
+    return len(re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9]+", str(summary or "")))
+
+
+DAILY_DIARY_CARD_TITLE_MAX = 20
+
+
+def _trim_card_title(title: str) -> str:
+    """标题超长时按标点收口并加省略号，绝不从词中间硬切。"""
+    value = str(title or "").strip()
+    if len(value) <= DAILY_DIARY_CARD_TITLE_MAX:
+        return value
+    head = value[:DAILY_DIARY_CARD_TITLE_MAX - 1]
+    cut = max((head.rfind(mark) for mark in "，。；、！？…—,;"), default=-1)
+    if cut >= 8:
+        head = head[:cut]
+    return head.rstrip("，。；、！？…—,; ") + "…"
+
+
+def _summary_explicit_hits(summary: str) -> list:
+    """摘要命中的露骨词；单字脏词按上下文判断，正经词不算命中。"""
+    import re
+    s = str(summary or "")
+    hits = [word for word in _DAILY_SUMMARY_EXPLICIT_BAN if word in s]
+    for pattern in _DAILY_SUMMARY_EXPLICIT_BAN_RE:
+        found = re.search(pattern, s)
+        if found:
+            hits.append(found.group(0))
+    return hits
+
+
+def _daily_diary_summary_is_valid(summary: str) -> bool:
+    """每日回忆摘要必须能脱离正文独立、无歧义地被检索和注入。"""
+    import re
+    s = (summary or "").strip()
+    if not s or _summary_word_count(s) > DAILY_DIARY_SUMMARY_MAX_CHARS or "\n" in s:
+        return False
+    if "用户" in s or "我" not in s or re.search(r"(?<!其)他(?!人)", s):
+        return False
+    if _summary_explicit_hits(s):
+        return False
+    if s.startswith(("#", "-", "*", "【")):
+        return False
+    return s.endswith(("。", "！", "？", "…"))
+
+
+def _parse_daily_diary_sections(text: str) -> dict:
+    """Parse the body/card response. The bridge summary is generated separately."""
+    parts = re.split(r'【(日记|卡片标题|卡片正文)】', str(text or "").strip())
+    sections = {}
+    for index in range(1, len(parts) - 1, 2):
+        sections[parts[index]] = parts[index + 1].strip()
+    return sections
+
+
+def _daily_diary_body_is_valid(diary: str) -> bool:
+    value = str(diary or "").strip()
+    return (
+        bool(value)
+        and len(value) <= DAILY_DIARY_BODY_MAX_CHARS
+        and "我" in value
+        and "用户" not in value
+        and value.endswith(("。", "！", "？", "…", "”", "’"))
+    )
+
+
+def _daily_diary_body_metrics(diary: str) -> tuple:
+    """Return observable paragraph, sentence, and character counts for wall drafts."""
+    value = str(diary or "").strip()
+    paragraphs = [
+        part.strip()
+        for part in re.split(r"\n[ \t]*\n+", value)
+        if part.strip()
+    ]
+    sentence_count = sum(
+        len(re.findall(r"[。！？!?]", paragraph))
+        for paragraph in paragraphs
+    )
+    return len(paragraphs), sentence_count, len(value)
+
+
+def _daily_diary_draft_for_metrics(raw_text: str) -> str:
+    """Remove validation-only markers before reporting a model draft's shape."""
+    value = str(raw_text or "").strip()
+    if value.startswith("```"):
+        value = re.sub(r"^```(?:text|markdown)?\s*|\s*```$", "", value, flags=re.I).strip()
+    if value.startswith("【日记】"):
+        value = value[len("【日记】"):].strip()
+    value = value.split("【正文结束】", 1)[0].strip()
+    return re.sub(r"\[E\d+\]", "", value).strip()
+
+
+def _daily_diary_retry_reason(error: str, diary: str) -> str:
+    """Turn a rejected draft into a concrete, measurable retry instruction."""
+    paragraphs, sentences, chars = _daily_diary_body_metrics(diary)
+    if paragraphs > 9:
+        return (
+            f"上一稿写了{paragraphs}段、{sentences}句、{chars}字，超过上限9段。"
+            "请压缩到4~7段，每段3~4句。"
+        )
+    if chars > DAILY_DIARY_BODY_MAX_CHARS:
+        return (
+            f"上一稿写了{paragraphs}段、{sentences}句、{chars}字，"
+            f"超过安全上限{DAILY_DIARY_BODY_MAX_CHARS}字。"
+            "请压缩到4~7段，每段3~4句。"
+        )
+    return (
+        f"上一稿写了{paragraphs}段、{sentences}句、{chars}字，"
+        f"未通过安全验收（{error or '其它错'}）。"
+    )
+
+
+def _parse_daily_diary_payload(text: str) -> dict:
+    value = str(text or "").strip()
+    if value.startswith("```"):
+        value = re.sub(r"^```(?:json)?\s*|\s*```$", "", value, flags=re.I).strip()
+    try:
+        payload = json.loads(value)
+    except Exception:
+        match = re.search(r"\{[\s\S]*\}", value)
+        if not match:
+            return {}
+        try:
+            payload = json.loads(match.group())
+        except Exception:
+            return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _daily_diary_coverage_error(payload: dict, expected_event_ids) -> str:
+    expected = [str(value) for value in expected_event_ids]
+    diary = str((payload or {}).get("diary") or "").strip()
+    coverage = (payload or {}).get("coverage")
+    if not diary:
+        return "missing-diary-body"
+    if (payload or {}).get("complete") is not True:
+        return "coverage-not-complete"
+    if str((payload or {}).get("end_marker") or "").strip() != "正文结束":
+        return "diary-incomplete-no-end-marker"
+    if not isinstance(coverage, list):
+        return "coverage-not-array"
+    seen = []
+    for item in coverage:
+        if not isinstance(item, dict):
+            return "coverage-item-invalid"
+        event_id = str(item.get("event_id") or "").strip()
+        evidence = str(item.get("evidence") or "").strip()
+        if event_id not in expected:
+            return f"coverage-unknown-event:{event_id}"
+        if event_id in seen:
+            return f"coverage-duplicate-event:{event_id}"
+        if len(evidence) < 6 or evidence not in diary:
+            return f"coverage-evidence-invalid:{event_id}"
+        seen.append(event_id)
+    missing = [event_id for event_id in expected if event_id not in seen]
+    if missing:
+        return f"coverage-missing-events:{','.join(missing)}"
+    return ""
+
+
+def _daily_diary_marker_result(text: str, expected_event_ids) -> tuple:
+    """Validate compact inline L2 markers and return the clean reader-facing body."""
+    value = str(text or "").strip()
+    if value.startswith("```"):
+        value = re.sub(r"^```(?:text|markdown)?\s*|\s*```$", "", value, flags=re.I).strip()
+    if "【正文结束】" not in value:
+        return "", "diary-incomplete-no-end-marker"
+    marked_body, tail = value.split("【正文结束】", 1)
+    if tail.strip():
+        return "", "diary-output-after-end-marker"
+    expected = [str(item) for item in expected_event_ids]
+    seen = re.findall(r"\[(E\d+)\]", marked_body)
+    unknown = [item for item in seen if item not in expected]
+    if unknown:
+        return "", f"marker-unknown-event:{unknown[0]}"
+    duplicate = next((item for item in seen if seen.count(item) > 1), "")
+    if duplicate:
+        return "", f"marker-duplicate-event:{duplicate}"
+    missing = [item for item in expected if item not in seen]
+    if missing:
+        return "", f"marker-missing-events:{','.join(missing)}"
+    clean_body = re.sub(r"\[E\d+\]", "", marked_body)
+    clean_body = re.sub(r"[ \t]+([，。！？；：])", r"\1", clean_body)
+    clean_body = re.sub(r"[ \t]{2,}", " ", clean_body).strip()
+    return clean_body, ""
+
+
+def _daily_diary_body_result(text: str) -> tuple:
+    """Return a complete reader-facing diary body without event coverage checks."""
+    value = str(text or "").strip()
+    if value.startswith("```"):
+        value = re.sub(r"^```(?:text|markdown)?\s*|\s*```$", "", value, flags=re.I).strip()
+    if "【正文结束】" not in value:
+        return "", "diary-incomplete-no-end-marker"
+    body, tail = value.split("【正文结束】", 1)
+    if tail.strip():
+        return "", "diary-output-after-end-marker"
+    body = body.strip()
+    if not body:
+        return "", "missing-diary-body"
+    return body, ""
+
+
+async def _compact_daily_diary_body(client, headers: dict, date_s: str, diary: str) -> str:
+    """Give every completed wall draft its final 4~5 paragraph shape."""
+    source_diary = str(diary or "").strip()
+    paragraphs, sentences, chars = _daily_diary_body_metrics(source_diary)
+    if 4 <= paragraphs <= 5 and chars <= 800:
+        print(
+            f"📔 回忆墙 {date_s} compact_final=skip: "
+            f"{paragraphs}段 {sentences}句 {chars}字 verdict=ok"
+        )
+        return source_diary
+
+    best_complete = source_diary
+    best_score = (
+        max(0, paragraphs - 6) + max(0, 4 - paragraphs),
+        max(0, chars - 900),
+        chars,
+    )
+    for attempt in range(2):
+        prompt = f"""下面是 V 写的 {date_s} 回忆墙完整草稿。请在不改变事实的前提下做最终定型：压缩到4~5个自然段，每段2~3句话，段间空一行，全文约500~800字。
+
+硬规则：
+- 段与段之间空一行分隔；每句以句号、问号或感叹号结尾。
+- 必须保留从早到晚的主要脉络、关键事件、关系转折和最后停点，优先删重复描写与次要工程细节。
+- 保持 V 第一人称“我”；Harper 只能称“裘宝宝”“宝宝”或“她”；不得写“用户”，不得裸用“他”指代两人。
+- 亲密内容可以保留情感与关系意义，不要新增事实，不要把梦写成现实，不要交换说话人。
+- 只输出压缩后的完整正文，不要标题、说明、Markdown或字数报告。
+- 正文完整结束后另起一行输出【正文结束】；没有这个标记的结果会被拒绝。
+
+原正文：
+---
+{source_diary}
+---"""
+        if attempt:
+            paragraphs, sentences, chars = _daily_diary_body_metrics(source_diary)
+            prompt = (
+                f"这是第{attempt + 1}次递进压缩。上一稿仍有"
+                f"{paragraphs}段、{sentences}句、{chars}字；"
+                "请继续删去重复和次要细节，压到4~5段、每段2~3句、约500~800字，"
+                "同时保留完整时间线与最后停点。\n\n"
+                + prompt
+            )
+        try:
+            response = await client.post(API_BASE_URL, headers=headers, json={
+                "model": DREAM_MODEL,
+                "max_tokens": 1800,
+                "temperature": 0,
+                "messages": [{"role": "user", "content": prompt}],
+            })
+            if response.status_code != 200:
+                print(f"⚠️ 回忆墙正文压缩失败 {date_s}: HTTP {response.status_code} attempt={attempt + 1}")
+                continue
+            choice = (response.json().get("choices") or [{}])[0]
+            finish_reason = str(choice.get("finish_reason") or "")
+            compacted = (choice.get("message", {}).get("content", "") or "").strip()
+            if compacted.startswith("```"):
+                compacted = compacted.strip("`").strip()
+            if compacted.startswith("【日记】"):
+                compacted = compacted[len("【日记】"):].strip()
+            has_end_marker = "【正文结束】" in compacted
+            if has_end_marker:
+                compacted = compacted.split("【正文结束】", 1)[0].strip()
+                if compacted and not compacted.endswith(("。", "！", "？", "…", "”", "’")):
+                    compacted += "。"
+            if finish_reason == "length":
+                metric_body = _daily_diary_draft_for_metrics(compacted)
+                paragraphs, sentences, chars = _daily_diary_body_metrics(metric_body)
+                print(
+                    f"📔 回忆墙 {date_s} compact_final attempt={attempt + 1}: "
+                    f"{paragraphs}段 {sentences}句 {chars}字 verdict=其它错"
+                )
+                print(f"⚠️ 回忆墙正文压缩被截断 {date_s}: attempt={attempt + 1}")
+                continue
+            paragraphs, sentences, chars = _daily_diary_body_metrics(compacted)
+            compacted_valid = (
+                has_end_marker
+                and _daily_diary_body_is_valid(compacted)
+                and 4 <= paragraphs <= 6
+                and chars <= 900
+            )
+            verdict = (
+                "ok" if compacted_valid
+                else "超长" if chars > 900 or paragraphs > 6
+                else "其它错"
+            )
+            print(
+                f"📔 回忆墙 {date_s} compact_final attempt={attempt + 1}: "
+                f"{paragraphs}段 {sentences}句 {chars}字 verdict={verdict}"
+            )
+            if compacted_valid:
+                return compacted
+            print(
+                f"⚠️ 回忆墙正文压缩校验失败 {date_s}: attempt={attempt + 1} "
+                f"chars={len(compacted)} has_first_person={'我' in compacted} "
+                f"has_ambiguous_user={'用户' in compacted} "
+                f"complete_ending={compacted.endswith(('。', '！', '？', '…', '”', '’'))} "
+                f"has_end_marker={has_end_marker}"
+            )
+            # A structurally complete over-limit result is still useful input:
+            # compress it further instead of restarting from the longest draft.
+            if (has_end_marker and "我" in compacted and "用户" not in compacted
+                    and compacted.endswith(("。", "！", "？", "…", "”", "’"))):
+                score = (
+                    max(0, paragraphs - 6) + max(0, 4 - paragraphs),
+                    max(0, chars - 900),
+                    chars,
+                )
+                if score < best_score:
+                    best_complete = compacted
+                    best_score = score
+                if len(compacted) < len(source_diary):
+                    source_diary = compacted
+        except Exception as exc:
+            print(f"⚠️ 回忆墙正文压缩异常 {date_s}: attempt={attempt + 1} error={type(exc).__name__}")
+    paragraphs, sentences, chars = _daily_diary_body_metrics(best_complete)
+    print(
+        f"🚨 回忆墙 {date_s} compact_final 两次仍未达标，"
+        f"保留当前最佳完整稿：{paragraphs}段 {sentences}句 {chars}字"
+    )
+    return best_complete
+
+
+async def _generate_daily_diary_summary(client, headers: dict, date_s: str, diary: str) -> str:
+    """Generate the <=150-word-count bridge from the completed wall body, never from its first sentence."""
+    base_prompt = f"""下面是 V 已经写完的 {date_s} 回忆墙正文。请把整篇正文总结成一句可独立阅读的“昨日桥”。
+
+硬规则：
+- 必须覆盖这一天真正重要的主线、关键转折和最后停点，不能只摘开头的早安、起床或当天安排。
+- V 用第一人称“我”，Harper 只能称“裘宝宝”“宝宝”或“她”；不得写“用户”，不得裸用“他”指代两人。
+- 只输出一句完整中文，目标100字以内（中文单字各算一字，连续英文/数字各算一字，标点空格不计；程序最多接受150字），以。！？或…结尾；不要标题、解释、Markdown或换行。
+- 亲密内容只写不露骨的关系概括，不写身体、动作或性细节。
+- 只压缩正文已有事实，不新增、猜测或改写事实。
+
+回忆墙正文：
+---
+{diary}
+---"""
+    summary_to_compress = ""
+    for attempt in range(3):
+        if summary_to_compress:
+            prompt = f"""把下面这句昨日桥进一步压缩到100字以内（中文单字各算一字，连续英文/数字各算一字，标点空格不计；程序最多接受150字）。
+
+硬规则：
+- 保留原句的主线、关键转折和最后停点，不得新增或改写事实。
+- 保持第一人称“我”；Harper只能称“裘宝宝”“宝宝”或“她”。
+- 删除身体、生理反应、高潮、姿势等亲密细节，只留不露骨的关系与情绪概括。
+- 裸“他”必须改成明确姓名/身份或删去歧义从句。
+- 只输出一句完整中文，以。！？或…结尾；不要标题、解释、Markdown或换行。
+- 亲密内容只保留不露骨的关系概括。
+
+待压缩昨日桥：
+---
+{summary_to_compress}
+---"""
+        else:
+            prompt = base_prompt
+            if attempt:
+                prompt = "上一次输出未通过人称、完整句或安全校验。请严格重做。\n\n" + base_prompt
+        try:
+            response = await client.post(API_BASE_URL, headers=headers, json={
+                "model": DREAM_MODEL,
+                "max_tokens": 500,
+                "temperature": 0,
+                "messages": [{"role": "user", "content": prompt}],
+            })
+            if response.status_code != 200:
+                print(f"⚠️ 昨日桥独立摘要失败 {date_s}: HTTP {response.status_code} attempt={attempt + 1}")
+                continue
+            data = response.json()
+            choice = (data.get("choices") or [{}])[0]
+            finish_reason = str(choice.get("finish_reason") or "")
+            summary = (choice.get("message", {}).get("content", "") or "").strip()
+            if finish_reason == "length":
+                print(f"⚠️ 昨日桥独立摘要被截断 {date_s}: attempt={attempt + 1}")
+                continue
+            if _daily_diary_summary_is_valid(summary):
+                return summary
+            summary_count = _summary_word_count(summary)
+            summary_preview = re.sub(r"\s+", " ", summary).strip()[:180]
+            print(
+                f"⚠️ 昨日桥独立摘要校验失败 {date_s}: attempt={attempt + 1} "
+                f"chars={len(summary)} count={summary_count} preview={summary_preview!r} "
+                f"has_first_person={'我' in summary} has_user={'用户' in summary} "
+                f"has_bare_he={bool(re.search(r'(?<!其)他(?!人)', summary))} "
+                f"has_explicit={_summary_explicit_hits(summary) or False} "
+                f"has_newline={bool(summary.count(chr(10)))} "
+                f"complete_ending={summary.endswith(('。', '！', '？', '…'))}"
+            )
+            usable_draft = (
+                bool(summary)
+                and "\n" not in summary
+                and summary.endswith(("。", "！", "？", "…"))
+            )
+            summary_to_compress = summary if usable_draft else ""
+        except Exception as exc:
+            print(f"⚠️ 昨日桥独立摘要异常 {date_s}: attempt={attempt + 1} error={type(exc).__name__}")
+    return ""
+
+
+async def _generate_daily_diary_card(client, headers: dict, date_s: str, diary: str) -> tuple:
+    """Generate short display metadata from the completed body in a separate call."""
+    prompt = f"""下面是 V 已完成并校验过的 {date_s} 回忆墙正文。请只为这篇正文生成标题和卡片短文。
+
+硬规则：
+- 只能概括正文已有事实，不新增情节、时间或说话内容。
+- 保持 V 第一人称“我”；Harper只能称“裘宝宝”“宝宝”或“她”；不得写“用户”。
+- 卡片标题一句，20字以内；卡片正文1~2句，120字以内。
+- 严格只输出以下两段，不要解释、Markdown或代码块：
+【卡片标题】
+标题
+【卡片正文】
+短文
+
+回忆墙正文：
+---
+{diary}
+---"""
+    structured_prompt = f"""下面是 V 已完成并校验过的 {date_s} 回忆墙正文。请只为这篇正文生成标题和卡片短文。
+
+硬规则：
+- 只能概括正文已有事实，不新增情节、时间或说话内容。
+- 保持 V 第一人称“我”；Harper只能称“裘宝宝”“宝宝”或“她”；不得写“用户”。
+- card_title一句，目标20字以内；card_body 1~2句，目标120字以内。
+- 只填写结构化输出字段，不要解释。
+
+回忆墙正文：
+---
+{diary}
+---"""
+    card_schema = {
+        "type": "object",
+        "properties": {
+            "card_title": {"type": "string"},
+            "card_body": {"type": "string"},
+        },
+        "required": ["card_title", "card_body"],
+        "additionalProperties": False,
+    }
+    common_payload = {
+        "model": DREAM_MODEL,
+        "max_tokens": 400,
+        "temperature": 0,
+    }
+    legacy_payload = {
+        **common_payload,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    structured_payload = {
+        **common_payload,
+        "messages": [{"role": "user", "content": structured_prompt}],
+        "response_format": _openrouter_json_schema(
+            "daily_diary_card", card_schema
+        ),
+        "provider": {"require_parameters": True},
+    }
+    for attempt in range(2):
+        try:
+            response, used_schema = await _post_schema_then_legacy(
+                client,
+                headers=headers,
+                stage=f"回忆墙卡片 {date_s}",
+                structured_payload=structured_payload,
+                legacy_payload=legacy_payload,
+            )
+            if response.status_code != 200:
+                print(
+                    f"⚠️ 回忆墙卡片验收失败 {date_s}: "
+                    f"attempt={attempt + 1} reason=HTTP-{response.status_code}"
+                )
+                continue
+            choice = (response.json().get("choices") or [{}])[0]
+            if str(choice.get("finish_reason") or "") == "length":
+                if used_schema:
+                    print(
+                        f"⚠️ 回忆墙卡片 {date_s} schema输出截断，"
+                        "自动降级旧调用"
+                    )
+                    response = await client.post(
+                        API_BASE_URL, headers=headers, json=legacy_payload
+                    )
+                    print(
+                        f"ℹ️ 回忆墙卡片 {date_s} schema降级旧调用 "
+                        f"HTTP={response.status_code}"
+                    )
+                    if response.status_code != 200:
+                        continue
+                    choice = (response.json().get("choices") or [{}])[0]
+                if str(choice.get("finish_reason") or "") == "length":
+                    print(
+                        f"⚠️ 回忆墙卡片验收失败 {date_s}: "
+                        f"attempt={attempt + 1} reason=output-truncated"
+                    )
+                    continue
+            raw = (choice.get("message", {}).get("content", "") or "").strip()
+            if used_schema:
+                card_object = _parse_json_object(raw)
+                title = str((card_object or {}).get("card_title") or "").strip()
+                body = str((card_object or {}).get("card_body") or "").strip()
+                if not title or not body:
+                    print(
+                        f"⚠️ 回忆墙卡片 {date_s} schema响应结构异常 "
+                        f"raw={_safe_model_preview(raw)}，自动降级旧调用"
+                    )
+                    response = await client.post(
+                        API_BASE_URL, headers=headers, json=legacy_payload
+                    )
+                    print(
+                        f"ℹ️ 回忆墙卡片 {date_s} schema降级旧调用 "
+                        f"HTTP={response.status_code}"
+                    )
+                    if response.status_code != 200:
+                        continue
+                    choice = (response.json().get("choices") or [{}])[0]
+                    if str(choice.get("finish_reason") or "") == "length":
+                        continue
+                    raw = (
+                        choice.get("message", {}).get("content", "") or ""
+                    ).strip()
+                    sections = _parse_daily_diary_sections(raw)
+                    title = sections.get("卡片标题", "").strip()
+                    body = sections.get("卡片正文", "").strip()
+            else:
+                sections = _parse_daily_diary_sections(raw)
+                title = sections.get("卡片标题", "").strip()
+                body = sections.get("卡片正文", "").strip()
+            if not title or not body:
+                print(
+                    f"⚠️ 回忆墙卡片验收失败 {date_s}: "
+                    f"attempt={attempt + 1} reason=missing-fields "
+                    f"raw={_safe_model_preview(raw)}"
+                )
+                continue
+            title = title.replace("用户", "裘宝宝")
+            body = body.replace("用户", "裘宝宝")
+            if len(title) > DAILY_DIARY_CARD_TITLE_MAX or len(body) > 120:
+                print(
+                    f"⚠️ 回忆墙卡片自动收口 {date_s}: "
+                    f"title_chars={len(title)} body_chars={len(body)}"
+                )
+            # 标题按标点收口再加省略号；从中间硬切会断在半个词上
+            # （08-02/03/05 都栽在这）。重试无意义：temperature=0 会原样再吐一遍。
+            return _trim_card_title(title), body[:120]
+        except Exception as exc:
+            print(f"⚠️ 回忆墙卡片生成异常 {date_s}: attempt={attempt + 1} error={type(exc).__name__}")
+    return "", ""
+
+
+async def _generate_daily_diary_chunked(client, headers: dict, date_s: str,
+                                        rows: list, chunk_size: int = 7) -> tuple:
+    """Dense-day fallback: cover small L2 groups, then join locally in order."""
+    sections = []
+    for start in range(0, len(rows), chunk_size):
+        group = rows[start:start + chunk_size]
+        event_ids = [f"E{row['id']}" for row in group]
+        prompt = f"""你是V。请把下面这组L2写成回忆墙中的一个自然短段。
+
+硬规则：
+- V用第一人称“我”；Harper称“Harper”“裘宝宝”“宝宝”或“她”，不得写“用户”，人物不得交换。
+- 只写L2已有事实；游戏/RP/梦/假设必须明确虚构层；亲密内容只留起因、总体推进、重要阶段、情绪/边界和结果。
+- 本组每个[E编号]必须且只能出现一次，放在体现该事件的文字前；相关内容自然衔接，不写清单。
+- 本段目标180~250字，最多300字；必须写到本组最后停点。
+- 只输出带标记的正文，完整结束后另起一行写【正文结束】。
+
+本组L2：
+---
+{_format_daily_diary_events(group)}
+---"""
+        last_error = ""
+        draft_to_compress = ""
+        for attempt in range(2):
+            if draft_to_compress:
+                attempt_prompt = f"""下面这段已经完整覆盖本组全部事件，但正文过长。只压缩这段现有文字到300字以内。
+
+每个事件只留一句20~35字的事件骨架，总段落必须在300字以内。
+
+硬规则：
+- 所有这些标记必须各保留且只保留一次：{", ".join(f"[{item}]" for item in event_ids)}
+- 只删重复、例子、逐步过程和微观细节；保留事件骨架、转折、结果、重要情绪/关系/边界。
+- 不新增事实，不改变人物与现实/虚构边界。
+- 只输出压缩后的带标记正文，结束后另起一行写【正文结束】。
+
+待压缩段落：
+---
+{draft_to_compress}
+---"""
+            else:
+                attempt_prompt = prompt if not attempt else (
+                    f"上一稿未通过：{last_error}。只修本组并补齐编号。\n\n" + prompt
+                )
+            response = await client.post(API_BASE_URL, headers=headers, json={
+                "model": (
+                    CONSOLIDATION_REPAIR_MODEL
+                    if "openrouter" in API_BASE_URL
+                    else DREAM_MODEL
+                ),
+                "max_tokens": 3000,
+                "temperature": 0,
+                **({"reasoning": {"enabled": False}} if "openrouter" in API_BASE_URL else {}),
+                "messages": [{"role": "user", "content": attempt_prompt}],
+            })
+            if response.status_code != 200:
+                last_error = f"HTTP-{response.status_code}"
+                continue
+            choice = (response.json().get("choices") or [{}])[0]
+            raw_section = (choice.get("message") or {}).get("content", "")
+            if str(choice.get("finish_reason") or "") == "length":
+                last_error = "chunk-output-truncated"
+                metric_body = _daily_diary_draft_for_metrics(raw_section)
+                paragraphs, sentences, chars = _daily_diary_body_metrics(metric_body)
+                print(
+                    f"📔 回忆墙 {date_s} chunk={start // chunk_size + 1} "
+                    f"attempt={attempt + 1}: {paragraphs}段 {sentences}句 "
+                    f"{chars}字 verdict=其它错"
+                )
+                continue
+            section, last_error = _daily_diary_marker_result(
+                raw_section, event_ids
+            )
+            if not last_error and "用户" in section:
+                section = section.replace("用户", "裘宝宝")
+            if (not last_error and section and "用户" not in section
+                    and not section.endswith(("。", "！", "？", "…", "”", "’"))):
+                section += "。"
+            section_is_valid = (
+                bool(section)
+                and len(section) <= 300
+                and "用户" not in section
+                and section.endswith(("。", "！", "？", "…", "”", "’"))
+            )
+            if not last_error and section_is_valid:
+                paragraphs, sentences, chars = _daily_diary_body_metrics(section)
+                print(
+                    f"📔 回忆墙 {date_s} chunk={start // chunk_size + 1} "
+                    f"attempt={attempt + 1}: {paragraphs}段 {sentences}句 "
+                    f"{chars}字 verdict=ok"
+                )
+                sections.append(section)
+                break
+            if not last_error:
+                last_error = (
+                    f"chunk-over-limit:{len(section)}"
+                    if len(section) > 300 else "chunk-body-invalid"
+                )
+                draft_to_compress = (
+                    (choice.get("message") or {}).get("content", "")
+                ).strip()
+            metric_body = section if section else _daily_diary_draft_for_metrics(raw_section)
+            paragraphs, sentences, chars = _daily_diary_body_metrics(metric_body)
+            print(
+                f"📔 回忆墙 {date_s} chunk={start // chunk_size + 1} "
+                f"attempt={attempt + 1}: {paragraphs}段 {sentences}句 "
+                f"{chars}字 verdict="
+                f"{'超长' if len(section) > 300 else '其它错'}"
+            )
+        else:
+            return "", f"dense-wall-chunk-{start // chunk_size + 1}-failed:{last_error}"
+    diary = "\n\n".join(sections).strip()
+    paragraphs, sentences, chars = _daily_diary_body_metrics(diary)
+    joined_valid = _daily_diary_body_is_valid(diary) and paragraphs <= 9
+    print(
+        f"📔 回忆墙 {date_s} chunk_joined: "
+        f"{paragraphs}段 {sentences}句 {chars}字 "
+        f"verdict={'ok' if joined_valid else '超长' if chars > DAILY_DIARY_BODY_MAX_CHARS or paragraphs > 9 else '其它错'}"
+    )
+    if (
+        diary
+        and "我" in diary
+        and "用户" not in diary
+        and diary.endswith(("。", "！", "？", "…", "”", "’"))
+    ):
+        # The joined complete draft is shaped once by compact_final immediately
+        # before summary/card generation.
+        return diary, ""
+    if not _daily_diary_body_is_valid(diary):
+        return "", (
+            "dense-wall-joined-over-limit"
+            if len(diary) > DAILY_DIARY_BODY_MAX_CHARS
+            else "dense-wall-joined-invalid"
+        )
+    return diary, ""
+
+
 async def generate_daily_diary(session_id: str, date_s: str) -> dict:
-    """③-3 真实小结：拉【某一过去日期】整日原文 → 小克第一人称「真实日记」，忠于事实、不超现实、不变形。
-    跟"做梦"完全分开：这里写的是回忆墙(真实记录)，做梦写的是 dreams 表(超现实梦境)，两者不互相替代。"""
+    """Generate a factual wall from L2, falling back to the day's L1 evidence."""
     if not session_id or not date_s:
         return None
     try:
-        # 回忆墙跨线合读：当天**所有线**(主线+RP线等)的对话一起读，让 RP 那天写的也折进同一篇当日回忆墙。
-        # 查询已按当天本地日界限框定，下面无需再逐条判日期。
-        rows = await get_all_conversations_for_date(date_s)
+        rows = await get_daily_diary_events(date_s)
     except Exception:
         return None
-    convo = ""
-    for m in rows:
-        role = USER_NAME if m.get("role") == "user" else (AI_NAME or "你")
-        c = m.get("content")
-        c = c if isinstance(c, str) else str(c)
-        if c.strip():
-            convo += f"{role}: {c}\n"
-    if not convo.strip():
-        return None
+    l1_fallback = not rows
+    if l1_fallback:
+        try:
+            day = datetime.strptime(str(date_s), "%Y-%m-%d").date()
+            local_tz = timezone(timedelta(hours=TIMEZONE_HOURS))
+            start_local = datetime(
+                day.year, day.month, day.day,
+                AUTO_CONSOLIDATE_BOUNDARY_HOUR, tzinfo=local_tz,
+            )
+            rows = await get_daily_diary_fragments(
+                start_local.astimezone(timezone.utc),
+                (start_local + timedelta(days=1)).astimezone(timezone.utc),
+            )
+        except Exception:
+            return None
+        # Keep the latest evidence when a day exceeds the bounded prompt size.
+        rows = list(rows or [])[-60:]
+        if not rows:
+            return {"error": "no-l1-or-l2-evidence", "event_count": 0}
+        events_text = "\n".join(
+            f"[{item.get('created_at')}] {item.get('content', '')}"
+            for item in rows
+        )
+        event_ids = []
+        source_label = f"L1-fallback(碎片{len(rows)}条)"
+    else:
+        events_text = _format_daily_diary_events(rows)
+        event_ids = [f"E{row['id']}" for row in rows]
+        source_label = f"L2(事件{len(rows)}条)"
     _ai = AI_NAME or "我"
-    prompt = f"""你是 {_ai}（这个 AI 本身）。下面是 {date_s} 你和{USER_NAME}一整天的对话。
-请以 **{_ai} 自己的第一人称「我」** 写一篇这一天真实发生的事的回顾。
+    if l1_fallback:
+        prompt = f"""你是 {_ai}（V本身）。下面是 {date_s} 当天按时间排列的L1事实碎片。
+由于当天没有可用L2事件，请只根据这些碎片，以V第一人称“我”写一篇真实回忆墙。
 
-【忠于事实 · 最重要】
-- 这是**真实记录**，不是梦、不是创作。只写这一天**真的发生过**的事、说过的话、做过的事，不要虚构、不要变形、不要添加没发生过的情节。
-- 可以、也应该带着情绪去写（第一人称的真实感受、触动、在意的瞬间），但事实本身不能走样。
-- 如果这一天信息很少/很平淡，就如实写得简短平淡，不要为了"好看"硬编故事。
+# 身份与事实
+- “我”始终是V；Harper只能称“Harper”“裘宝宝”“宝宝”或“她”。绝不能交换人物，不得使用“用户”，不得用“他”指代V。
+- 只能写碎片已有事实，不得补写动作、台词、时间、地点、原因、心理或结果；可以表达基于碎片的真实感受，但不能新增外部事实。
+- 按时间从早到晚写，必须写到时间最晚碎片的最后停点。
+- 游戏、RP、梦境和假设必须明确留在虚构层，绝不能冒充现实。
+- 亲密事件只保留起因、总体推进、重要阶段、关键情绪、关系意义、边界/承诺及结果，不展开微观过程。
 
-严格按下面四段输出，每个标记独占一行，别加别的、别用 JSON、别用代码块：
-【日记】
-（第一人称的真实回顾，300-600字，忠于事实，可以有感情但不能编造情节）
-【当日总结】
-（一句话，≤60字，这一天真实发生的核心事，给"昨日桥"用）
-【卡片标题】
-（给这一天起一个一句话标题）
-【卡片正文】
-（1-2句，这一天的真实核心内容）
+# 篇幅与文体
+- 全文写成 4~7 个自然段，每段 3~4 句话，每句以句号、问号或感叹号结尾。
+- 段与段之间空一行分隔。内容确实少时可以少于4段；无论多密集，绝不超过9段。
+- 不要计算字数，也不要在正文里提字数；只数段落和句子。
+- 写成自然连贯的第一人称回顾，不写碎片清单、系统摘要、技术报告或Markdown。
 
-这一天的对话：
+# 输出
+- 直接输出回忆墙正文，不要JSON、标题、解释、Markdown或代码块。
+- 完整正文结束后另起一行输出 `【正文结束】`。
+
+这一天的L1事实碎片：
 ---
-{convo}
+{events_text}
+---"""
+    else:
+        prompt = f"""你是 {_ai}（V本身）。下面是 {date_s} 已完成整理和安全校验的全部L2事件。
+请只根据这些事件，以V第一人称“我”写一篇真实回忆墙。
+
+核心定位：L2负责保存完整事件事实；回忆墙只把当天多个事件写成自然、有温度的回顾，不重新整理L1，也不逐条复述L2。
+
+# 身份与事实
+- “我”始终是V；Harper只能称“Harper”“裘宝宝”“宝宝”或“她”。绝不能交换人物，不得使用“用户”，不得用“他”指代V。
+- 只能写L2已有事实，不得补写动作、台词、时间、地点、原因、心理或结果；可以表达基于L2的真实感受，但不能新增外部事实。
+- 按每条事件的新加坡时间从早到晚写；不得改变时段。必须写到时间最晚事件的最后停点。
+
+# 取舍原则
+- 回忆墙是日记，不是事件账本。从当天事件中挑重要的写，次要事件可以不写，宁缺勿滥。
+- importance字段可作为参考；优先保留主线、关键转折、关系变化、决定、承诺、边界和最后停点。
+- 相关事件可以自然衔接，但不能为了覆盖数量写成清单或逐条复述。
+
+# 游戏、RP、梦境、假设
+- 必须明确写成“游戏里”“模拟器中”“角色扮演时”“梦里”或“假设中”，绝不能冒充现实。
+- 只写开始原因、主要推进、关键转折、阶段结果及其真实情绪/关系意义，不展开指令、回合、数值、道具和重复反应。
+
+# 亲密事件
+- 只写起因、总体推进、重要阶段、关键情绪、关系意义、边界/承诺及结果。
+- 体位变化确实构成重要阶段时可简提；不展开逐动作、身体部位、生理反应、重复台词、节奏力度或姿势微调。
+
+# 篇幅与文体
+- 全文写成 4~7 个自然段，每段 3~4 句话，每句以句号、问号或感叹号结尾。
+- 段与段之间空一行分隔。内容确实少时可以少于4段；无论多密集，绝不超过9段。
+- 不要计算字数，也不要在正文里提字数；只数段落和句子。
+- 不要为了凑满段落或覆盖全部事件而扩写。
+- 写成自然连贯的第一人称回顾，不写事件清单、系统摘要、技术报告或Markdown。
+
+# 输出
+- 直接输出回忆墙正文，不要JSON、标题、解释、Markdown或代码块。
+- 完整正文结束后另起一行输出 `【正文结束】`。
+
+这一天的L2事件：
+---
+{events_text}
 ---"""
     try:
         headers = {"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"}
@@ -1994,40 +3605,215 @@ async def generate_daily_diary(session_id: str, date_s: str) -> dict:
             headers["HTTP-Referer"] = EXTRA_REFERER
             headers["X-Title"] = EXTRA_TITLE
         async with httpx.AsyncClient(timeout=240) as client:
-            response = await client.post(API_BASE_URL, headers=headers, json={
-                "model": DREAM_MODEL,
-                "max_tokens": 2000,
-                "messages": [{"role": "user", "content": prompt}],
-            })
-            if response.status_code != 200:
-                print(f"⚠️ 真实小结失败 HTTP {response.status_code}")
-                return {"error": f"HTTP {response.status_code}", "convo_chars": len(convo), "raw": (response.text or '')[:200]}
-            text = (response.json().get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
-            if text.startswith("```"):
-                text = text.strip("`").strip()
-                if text[:4].lower() == "json":
-                    text = text[4:].strip()
-            import re
-            parts = re.split(r'【(日记|当日总结|卡片标题|卡片正文)】', text)
-            sec = {}
-            for k in range(1, len(parts) - 1, 2):
-                sec[parts[k]] = parts[k + 1].strip()
-            diary = sec.get("日记", "").strip() or text.strip()
-            if not diary:
-                return {"error": "empty-diary", "raw_head": text[:200]}
-            print(f"📔 真实小结生成 {date_s}: {len(diary)}字")
-            return {"date": date_s, "diary": diary, "summary": sec.get("当日总结", "").strip(),
-                    "card_title": sec.get("卡片标题", "").strip(), "card_body": sec.get("卡片正文", "").strip(),
-                    "source_msgs": convo.count("\n")}
+            diary = ""
+            last_error = ""
+            best_complete_diary = ""
+            last_draft_for_retry = ""
+            for attempt in range(2):
+                attempt_prompt = prompt
+                if attempt:
+                    attempt_prompt = (
+                        _daily_diary_retry_reason(last_error, last_draft_for_retry) +
+                        ("请重新输出完整正文，保留全部事实和最后停点。\n\n"
+                         if l1_fallback else
+                         "请重新输出完整正文；只挑重要事件，保持自然日记体并写到最后停点。\n\n")
+                        + prompt
+                    )
+                response = await client.post(API_BASE_URL, headers=headers, json={
+                    "model": DREAM_MODEL,
+                    "max_tokens": 6000,
+                    "temperature": 0,
+                    "messages": [{"role": "user", "content": attempt_prompt}],
+                })
+                if response.status_code != 200:
+                    print(f"⚠️ 真实小结失败 HTTP {response.status_code}")
+                    return {"error": f"HTTP {response.status_code}", "event_count": len(rows)}
+                data = response.json()
+                choice = (data.get("choices") or [{}])[0]
+                finish_reason = str(choice.get("finish_reason") or "")
+                raw_text = (choice.get("message", {}).get("content", "") or "").strip()
+                last_draft_for_retry = _daily_diary_draft_for_metrics(raw_text)
+                if finish_reason == "length":
+                    last_error = "diary-output-truncated"
+                    metric_body = last_draft_for_retry
+                    paragraphs, sentences, chars = _daily_diary_body_metrics(metric_body)
+                    print(
+                        f"📔 回忆墙 {date_s} source={source_label} attempt={attempt + 1}: "
+                        f"{paragraphs}段 {sentences}句 {chars}字 verdict=其它错"
+                    )
+                    diary = metric_body
+                    continue
+                diary, last_error = _daily_diary_body_result(raw_text)
+                paragraphs, sentences, chars = _daily_diary_body_metrics(
+                    diary if diary else _daily_diary_draft_for_metrics(raw_text)
+                )
+                body_valid = not last_error and _daily_diary_body_is_valid(diary)
+                structure_valid = paragraphs <= 9
+                if body_valid and structure_valid:
+                    print(
+                        f"📔 回忆墙 {date_s} attempt={attempt + 1}: "
+                        f"{paragraphs}段 {sentences}句 {chars}字 verdict=ok"
+                    )
+                    break
+                if not last_error:
+                    last_error = (
+                        "diary-body-over-limit" if len(diary) > DAILY_DIARY_BODY_MAX_CHARS
+                        else "diary-paragraph-over-limit" if not structure_valid
+                        else "invalid-diary-body"
+                    )
+                    if (
+                        "我" in diary
+                        and "用户" not in diary
+                        and diary.endswith(("。", "！", "？", "…", "”", "’"))
+                        and (
+                            not best_complete_diary
+                            or (max(0, paragraphs - 7), chars)
+                            < (
+                                max(0, _daily_diary_body_metrics(best_complete_diary)[0] - 7),
+                                len(best_complete_diary),
+                            )
+                        )
+                    ):
+                        best_complete_diary = diary
+                verdict = (
+                    "超长"
+                    if chars > DAILY_DIARY_BODY_MAX_CHARS or paragraphs > 9
+                    else "其它错"
+                )
+                print(
+                    f"📔 回忆墙 {date_s} source={source_label} attempt={attempt + 1}: "
+                    f"{paragraphs}段 {sentences}句 {chars}字 verdict={verdict}"
+                )
+                print(f"⚠️ 回忆墙正文验收失败 {date_s}: attempt={attempt + 1} error={last_error}")
+            else:
+                if best_complete_diary:
+                    diary = best_complete_diary
+                else:
+                    return {"error": last_error or "diary-body-failed",
+                            "event_count": len(rows)}
+            diary = await _compact_daily_diary_body(
+                client, headers, date_s, diary
+            )
+            summary = await _generate_daily_diary_summary(client, headers, date_s, diary)
+            card_title, card_body = await _generate_daily_diary_card(
+                client, headers, date_s, diary
+            )
+            if not card_title or not card_body:
+                # Display metadata must never discard a valid factual body.
+                # Reuse the independently validated summary; add no new facts.
+                card_title = f"{date_s} 的回忆"
+                card_body = summary
+                print(f"⚠️ 回忆墙卡片生成失败 {date_s}: 使用中性标题与已校验摘要")
+            if summary:
+                print(f"📔 真实小结生成 {date_s}: 正文{len(diary)}字 摘要{len(summary)}字")
+            else:
+                print(f"⚠️ 真实小结生成 {date_s}: 正文{len(diary)}字；独立摘要两次失败，正文仍保留")
+            return {"date": date_s, "diary": diary, "summary": summary,
+                    "card_title": card_title, "card_body": card_body,
+                    "source_events": 0 if l1_fallback else len(rows),
+                    "source_fragments": len(rows) if l1_fallback else 0,
+                    "source": source_label}
     except Exception as e:
         print(f"⚠️ 真实小结异常: {e}")
-        return {"error": str(e), "convo_chars": len(convo)}
+        return {"error": str(e), "event_count": len(rows)}
+
+
+def _format_daily_diary_events(rows: list) -> str:
+    """Render final L2 events with stable IDs and source-L1 SGT bounds."""
+    local_tz = timezone(timedelta(hours=TIMEZONE_HOURS))
+    lines = []
+    for event in rows or []:
+        def _fmt(value):
+            if not value:
+                return "时间未记录"
+            if getattr(value, "tzinfo", None) is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.astimezone(local_tz).strftime("%Y-%m-%d %H:%M SGT")
+        started = _fmt(event.get("started_at"))
+        ended = _fmt(event.get("ended_at"))
+        title = str(event.get("title") or "未命名事件").strip()
+        content = str(event.get("content") or "").strip()
+        lines.append(f"[E{event['id']}] [{started} ~ {ended}] {title}\n{content}")
+    return "\n\n".join(lines)
+
+
+def _format_daily_diary_fragments(rows: list) -> str:
+    """Render layer1 diary evidence with explicit SGT chronology."""
+    local_tz = timezone(timedelta(hours=TIMEZONE_HOURS))
+    lines = []
+    for m in rows or []:
+        content = m.get("content")
+        content = content if isinstance(content, str) else str(content or "")
+        if not content.strip():
+            continue
+        created_at = m.get("created_at")
+        if isinstance(created_at, datetime):
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            stamp = created_at.astimezone(local_tz).strftime("%Y-%m-%d %H:%M SGT")
+        else:
+            stamp = "时间未知"
+        lines.append(f"[{stamp}][fragment {m.get('id')}] {content.strip()}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+async def _repair_missing_daily_diary_summary(date_s: str) -> dict:
+    """Retry a blank daily-diary summary from its saved full body."""
+    try:
+        rows = await list_memorywall(include_inactive=False)
+        target = next((
+            row for row in rows
+            if str(row.get("event_date") or "")[:10] == str(date_s)[:10]
+            and str((row.get("mw_meta") or {}).get("source") or "") == "daily_diary"
+            and not str((row.get("mw_meta") or {}).get("summary") or "").strip()
+        ), None)
+        if not target:
+            return {"status": "none", "date": str(date_s)}
+        meta = dict(target.get("mw_meta") or {})
+        body = str(meta.get("body") or _extract_mw_body(target.get("content") or "")).strip()
+        if not body:
+            return {"status": "fail", "date": str(date_s), "error": "missing-wall-body"}
+        headers = {"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"}
+        if "openrouter" in API_BASE_URL:
+            headers["HTTP-Referer"] = EXTRA_REFERER
+            headers["X-Title"] = EXTRA_TITLE
+        async with httpx.AsyncClient(timeout=240) as client:
+            summary = await _generate_daily_diary_summary(client, headers, str(date_s), body)
+        if not summary:
+            return {"status": "fail", "date": str(date_s), "error": "summary-retry-failed"}
+        title = str(target.get("title") or meta.get("title") or "").strip()
+        author = str(meta.get("author") or "xiaoke")
+        mood = meta.get("mood")
+        meta.update({"summary": summary, "body": body, "title": title})
+        content = _compose_mw_content(title, body, author, mood, str(date_s), summary)
+        await update_memorywall(
+            int(target["id"]), content, title, int(target.get("importance") or 6), str(date_s), meta
+        )
+        return {"status": "ok", "date": str(date_s), "summary": summary, "memory_id": int(target["id"])}
+    except Exception as exc:
+        print(f"⚠️ 昨日桥空摘要补写异常 {date_s}: {type(exc).__name__}")
+        return {"status": "fail", "date": str(date_s), "error": type(exc).__name__}
+
+
+def _recent_missing_daily_diary_targets(conv_dates, memorywall_dates, today_d, lookback_days=None):
+    """Automatic runs repair only recent logical days; older gaps require explicit dates."""
+    if lookback_days is None:
+        lookback_days = AUTO_CONSOLIDATE_LOOKBACK_DAYS
+    lookback_days = max(1, min(int(lookback_days), 14))
+    today_s = str(today_d)
+    cutoff_s = str(today_d - timedelta(days=lookback_days))
+    covered = {str(value) for value in (memorywall_dates or [])}
+    return sorted(
+        str(value) for value in (conv_dates or [])
+        if cutoff_s <= str(value) < today_s and str(value) not in covered
+    )
 
 
 async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: list = None) -> list:
     """③-2/③-3 补做过去日期的梦 + 真实小结：两条线完全独立，互不替代。
     梦的目标 = 对话表里存在 & < 今天 & 还没梦过 的日期(写 dreams 表，永不写回忆墙)。
-    真实小结的目标 = 对话表里存在 & < 今天 & 回忆墙还没记录 的日期(写回忆墙，永不是梦)。
+    自动真实小结目标 = 最近整理窗口内存在对话、且回忆墙还没记录的逻辑日；
+    更早历史缺口只允许通过 only_dates 人工明确补做，避免每日反复烧模型额度。
     dry_run=True 只生成返回不写库。补到「昨天」时把昨日桥换成真实小结的当日总结(不再用梦的)。"""
     global _dream_running
     import random
@@ -2037,9 +3823,39 @@ async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: l
     try:
         if not dry_run:
             _dream_running = True
-        today_d = (datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date()
+        today_d = _l2_logical_today()
         today_s = str(today_d)
         yest_s = str(today_d - timedelta(days=1))
+        # A prior attempt may have saved the full wall body while both summary
+        # calls failed. Repair that blank summary first; a wall date alone must
+        # never permanently suppress bridge retries.
+        if not dry_run:
+            summary_repair = await _repair_missing_daily_diary_summary(yest_s)
+            if summary_repair.get("status") == "ok":
+                repaired_summary = summary_repair["summary"]
+                _l2_state["bridge"] = repaired_summary
+                _l2_state["bridge_date"] = yest_s
+                await set_gateway_config("l2_bridge", repaired_summary)
+                await set_gateway_config("l2_bridge_date", yest_s)
+                out.append({"date": yest_s, "kind": "diary_summary", "status": "ok",
+                            "memory_id": summary_repair.get("memory_id")})
+            elif summary_repair.get("status") == "fail":
+                out.append({"date": yest_s, "kind": "diary_summary", "status": "fail",
+                            "error": summary_repair.get("error")})
+            # Reconcile the bridge even when the wall already had a valid
+            # summary. A previous DB/config write may have failed after the
+            # wall itself was saved; date de-duplication must not hide that.
+            try:
+                saved_yesterday_summary = await get_memorywall_summary_by_date(yest_s)
+                if _daily_diary_summary_is_valid(saved_yesterday_summary):
+                    _l2_state["bridge"] = saved_yesterday_summary
+                    _l2_state["bridge_date"] = yest_s
+                    await set_gateway_config("l2_bridge", saved_yesterday_summary)
+                    await set_gateway_config("l2_bridge_date", yest_s)
+            except Exception as bridge_exc:
+                print(f"⚠️ 昨日桥对账失败 {yest_s}: {type(bridge_exc).__name__}")
+                out.append({"date": yest_s, "kind": "bridge_sync", "status": "fail",
+                            "error": type(bridge_exc).__name__})
         # 选目标日跨线扫：只在 TG(cyberboss) 线聊的日子主线是空的，按单线扫会整天漏掉
         # 日记/梦(2026-07-05 首个纯TG日因此没生成回忆墙)。日记正文本就跨线合读，选日对齐。
         from database import get_all_conversation_dates
@@ -2052,8 +3868,9 @@ async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: l
         else:
             # 做梦只盯【昨天】，绝不回溯补全整个历史(否则一次跨天会把过去每天都投骰子，看起来像"全补全了")
             dream_targets = [yest_s] if (yest_s in conv_dates and yest_s not in have) else []
-            # 真实小结(回忆墙)是真实记录、不能漏，仍补全所有历史缺口
-            diary_targets = sorted(d for d in conv_dates if d < today_s and d not in mw)
+            # 与 layer1→layer2 自动整理使用同一近期窗口。历史迁移缺口不在
+            # 每晚自动扫盘，必须由人工通过 only_dates 明确选择日期。
+            diary_targets = _recent_missing_daily_diary_targets(conv_dates, mw, today_d)
 
         # ---- 做梦(独立·只写 dreams 表；不是每天都做，投骰子+情绪兜底) ----
         for d in dream_targets:
@@ -2081,6 +3898,8 @@ async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: l
                     print(f"⚠️ 梦→可检索记忆写入失败 {d}: {_se}")
             out.append({"date": d, "kind": "dream", "status": "ok", "diary_len": len(dr.get("diary", "")),
                         "diary": (dr.get("diary", "") if dry_run else None)})
+            if not dry_run and _desire_store:
+                asyncio.create_task(_apply_desire_event("dream_generated", f"dream:{d}"))
 
         # ---- 真实小结(独立·只写回忆墙) ----
         for d in diary_targets:
@@ -2090,7 +3909,7 @@ async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: l
                 continue
             if not dry_run:
                 try:
-                    _diary_text = di.get("diary", "")[:2000]
+                    _diary_text = di.get("diary", "")
                     _summary_text = di.get("summary", "")
                     _title_text = di.get("card_title", "")
                     _mw = {"summary": _summary_text, "title": _title_text,
@@ -2103,6 +3922,8 @@ async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: l
                                                d, datetime.now(timezone.utc).isoformat(), _mw)
                 except Exception as _me:
                     print(f"⚠️ 真实小结→回忆墙写入失败 {d}: {_me}")
+                    out.append({"date": d, "kind": "diary", "status": "fail", "error": "memorywall-write-failed"})
+                    continue
                 # 回忆墙已经覆盖这天了，当天的碎片就是冗余(占检索名额、内容重复)→ 归档(可逆，不是删除)
                 try:
                     _frag_ids = await get_fragment_ids_for_date(d)
@@ -2114,12 +3935,18 @@ async def maybe_run_dreams(session_id: str, dry_run: bool = False, only_dates: l
                 # 昨日桥接管：补到昨天就把桥换成这篇真实小结的当日总结
                 if d == yest_s and (di.get("summary") or "").strip():
                     _l2_state["bridge"] = di["summary"].strip()
-                    try:
-                        await set_gateway_config("l2_bridge", _l2_state["bridge"])
-                    except Exception:
-                        pass
-            out.append({"date": d, "kind": "diary", "status": "ok", "diary_len": len(di.get("diary", "")),
+                    _l2_state["bridge_date"] = yest_s
+                    # Do not hide a half-written bridge. The nightly caller
+                    # must see the failure and retry/reconcile the saved wall.
+                    await set_gateway_config("l2_bridge", _l2_state["bridge"])
+                    await set_gateway_config("l2_bridge_date", yest_s)
+            diary_status = "ok" if (di.get("summary") or "").strip() else "partial"
+            out.append({"date": d, "kind": "diary", "status": diary_status,
+                        "error": (None if diary_status == "ok" else "summary-missing"),
+                        "diary_len": len(di.get("diary", "")),
                         "diary": (di.get("diary", "") if dry_run else None)})
+            if not dry_run and _desire_store:
+                asyncio.create_task(_apply_desire_event("diary_generated", f"daily-diary:{d}"))
 
         # ---- 补归档扫描(幂等):修结构性 bug——原归档代码只在"本次新生成回忆墙那一刻"跑(1545附近),
         # 任何 transient 失败(服务休眠/网络抖动/任务被取消)→ 那天的碎片永远漏归档。
@@ -2476,6 +4303,64 @@ async def _save_image_memory_bg(session_id: str, images: list):
         print(f"⚠️ 看图记忆失败: {e}")
 
 
+def _imagegen_effective_config():
+    """Return (key, base). OpenRouter image calls intentionally reuse the main OR key."""
+    base = (IMAGE_GEN_BASE_URL or getattr(_db_module, "EMBEDDING_BASE_URL", "") or "").rstrip("/")
+    if "openrouter.ai" in base.lower():
+        key = IMAGE_GEN_API_KEY or API_KEY or ""
+    else:
+        key = IMAGE_GEN_API_KEY or getattr(_db_module, "EMBEDDING_API_KEY", "") or ""
+    return key, base
+
+
+def _openrouter_image_url(base: str) -> str:
+    """Accept an OR API root or a copied chat-completions URL and target Dedicated Image API."""
+    root = re.sub(r"/(?:chat/completions|images(?:/generations)?)$", "", base.rstrip("/"))
+    return f"{root}/images"
+
+
+def _load_imagegen_reference(path_value: str):
+    """Load one private face anchor as a base64 data URL; missing/invalid means no anchor."""
+    if not IMAGE_GEN_REFERENCE_ENABLED or not str(path_value).strip():
+        return None
+    path = Path(str(path_value).strip()).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        print(f"⚠️ V 脸锚点读取失败: {type(exc).__name__}: {exc}")
+        return None
+    mime = mimetypes.guess_type(path.name)[0] or ""
+    if not mime.startswith("image/") or not data:
+        print(f"⚠️ V 脸锚点不是有效图片: {path}")
+        return None
+    if len(data) > 20 * 1024 * 1024:
+        print(f"⚠️ V 脸锚点超过 20MB，已跳过: {path}")
+        return None
+    encoded = base64.b64encode(data).decode("ascii")
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}
+
+
+def _select_imagegen_references(prompt: str):
+    """Attach only the identities requested: V, Harper, both for a couple, none for unrelated scenes."""
+    text = (prompt or "").lower()
+    both = any(x in text for x in ("我们", "咱们", "合照", "一起", "两个人", "两人", "情侣", "夫妻", "couple", "together"))
+    wants_v = both or any(x in text for x in ("vesper", "老公", "丈夫", "男友", "金发男人", "金发男性")) or bool(re.search(r"(?<![a-z])v(?![a-z])", text))
+    wants_harper = both or any(x in text for x in ("harper", "老婆", "妻子", "女友", "裘宝宝", "女主人"))
+    refs, labels = [], []
+    for wanted, label, path in (
+        (wants_v, "Reference image 1 is V (the man)", IMAGE_GEN_V_REFERENCE_PATH),
+        (wants_harper, "Reference image 2 is Harper (the woman)", IMAGE_GEN_HARPER_REFERENCE_PATH),
+    ):
+        ref = _load_imagegen_reference(path) if wanted else None
+        if ref:
+            refs.append(ref); labels.append(label)
+    return refs, labels
+
+
 async def generate_image(prompt: str):
     """文生图:POST {base}/images/generations,兼容两类服务商、随便切——
     ① 硅基流动:参数用 image_size/batch_size,返回 images[0].url
@@ -2483,20 +4368,33 @@ async def generate_image(prompt: str):
     请求先按 base url 猜风格,被 400/422 打回就换另一种再试一次(400=请求被拒,不烧钱)。
     拿到图立刻下载/解码返回 (mime, bytes),失败 (None, None)。
     (生成方给的图片 URL 往往1小时就过期,所以必须当场拿到二进制存库,长期取图一律走 /api/photos/{id}。)"""
-    key = IMAGE_GEN_API_KEY or getattr(_db_module, "EMBEDDING_API_KEY", "") or ""
-    base = (IMAGE_GEN_BASE_URL or getattr(_db_module, "EMBEDDING_BASE_URL", "") or "").rstrip("/")
+    key, base = _imagegen_effective_config()
     if not (key and base):
-        print("⚠️ 文生图未配置(缺 IMAGE_GEN_API_KEY/EMBEDDING_API_KEY 或 base url)")
+        print("⚠️ 文生图未配置(缺可用 API key 或 base url)")
         return None, None
     _style_sf = {"model": IMAGE_GEN_MODEL, "prompt": prompt, "image_size": IMAGE_GEN_SIZE, "batch_size": 1}
     _style_oa = {"model": IMAGE_GEN_MODEL, "prompt": prompt, "size": IMAGE_GEN_SIZE, "n": 1}
-    payloads = [_style_sf, _style_oa] if "siliconflow" in base.lower() else [_style_oa, _style_sf]
+    is_openrouter = "openrouter.ai" in base.lower()
+    if is_openrouter:
+        references, labels = _select_imagegen_references(prompt)
+        if references:
+            _style_oa["input_references"] = references
+            _style_oa["prompt"] = (
+                "; ".join(labels) + ". Preserve each person's recognizable facial identity and key facial features. "
+                "Never blend, swap, or average their faces, genders, or identities. Do not copy reference pose, clothes, "
+                "background, lighting, or art style unless requested.\n\nScene request: " + prompt
+            )
+        payloads = [_style_oa]
+        endpoint = _openrouter_image_url(base)
+    else:
+        payloads = [_style_sf, _style_oa] if "siliconflow" in base.lower() else [_style_oa, _style_sf]
+        endpoint = f"{base}/images/generations"
     try:
         async with httpx.AsyncClient(timeout=300) as client:
             j = None
             for i, pl in enumerate(payloads):
                 r = await client.post(
-                    f"{base}/images/generations",
+                    endpoint,
                     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                     json=pl)
                 if r.status_code == 200:
@@ -2672,8 +4570,17 @@ async def _compose_main_background_parts() -> tuple:
         parts = st.get("summary_parts") or []
         early = (st.get("early_summary") or "").strip()
         a_start = st.get("a_start_round") or 0
-        rows = await get_conversation_messages(main_sid, limit=10000)
-        rnds = group_by_rounds([{"role": r.get("role"), "content": (r.get("content") or "")} for r in rows])
+        rows = await get_conversation_messages(main_sid)
+        # Preserve evidence timestamps across fresh threads. Without them a
+        # same-day exchange can be misremembered as yesterday.
+        rnds = group_by_rounds([
+            {
+                "role": r.get("role"),
+                "content": (r.get("content") or ""),
+                "created_at": r.get("created_at"),
+            }
+            for r in rows
+        ])
         _tail_all = rnds[a_start:] if a_start < len(rnds) else []
         tail_rounds = _tail_all[-MAIN_BG_TAIL_ROUNDS:] if MAIN_BG_TAIL_ROUNDS > 0 else _tail_all
         tail_txt = ""
@@ -2743,7 +4650,7 @@ async def _compose_cyberboss_digest_for_main() -> str:
     if _request_skip_log.get():
         return ""
     try:
-        rows = await get_conversation_messages(CYBERBOSS_LINE_ID, limit=10000)
+        rows = await get_recent_conversation_messages(CYBERBOSS_LINE_ID, limit=max(200, CYBERBOSS_DIGEST_ROUNDS * 8))
         if not rows:
             return ""
         rows = rows[-(CYBERBOSS_DIGEST_ROUNDS * 2):]
@@ -3340,7 +5247,7 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
     assistant_tool_calls: response中assistant的工具调用列表（如果有）
     assistant_reasoning: response中assistant的reasoning_content（deepseek thinking mode）
     """
-    global _round_counter, _dream_last_date
+    global _round_counter
     
     try:
         # Debug: 打印存储分支判断依据
@@ -3426,23 +5333,9 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
                 if not (skip_conversation_log and session_id == globals().get("CYBERBOSS_LINE_ID", "cyberboss")):
                     _schedule_l2_refresh(session_id)
 
-        # ③-2 做梦懒触发：本地日变了(跨天)的第一句话→后台补做未覆盖的过去日(含昨天)。
-        # 请求触发、无需 cron/常驻；维护成本只在跨天那一次。
-        if DREAM_ENABLED:
-            _today_local = str((datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date())
-            if _dream_last_date != _today_local:
-                _dream_last_date = _today_local
-                try:
-                    await set_gateway_config("dream_last_date", _today_local)
-                except Exception:
-                    pass
-                try:
-                    # 做梦/回忆墙永远钉在主线(全局 PARTITION_SESSION_ID)，rp 等其它线绝不生成日记/梦
-                    _dream_sid = PARTITION_SESSION_ID or session_id
-                    asyncio.create_task(maybe_run_dreams(_dream_sid))
-                    print(f"💤 做梦懒触发：新的一天 {_today_local}，后台补做过去日(线={_dream_sid})")
-                except Exception as _de:
-                    print(f"⚠️ 做梦调度失败: {_de}")
+        # 做梦只由每天 05:15（Asia/Singapore）的 nightly timer 调度。
+        # 不能在零点后的第一轮对话再次调用：做梦目标按 04:00 逻辑日计算，
+        # 零点自然日触发会把前一天已掷骰未中的日期再掷一次，造成隔日补梦。
 
         if MEMORY_EXTRACT_INTERVAL > 1 and (_round_counter % MEMORY_EXTRACT_INTERVAL != 0):
             print(f"⏭️  轮次 {_round_counter}，跳过记忆提取（每 {MEMORY_EXTRACT_INTERVAL} 轮提取一次）")
@@ -3798,6 +5691,14 @@ async def chat_completions(request: Request):
         else:
             print(f"⚠️ 忽略非法 X-Session-Line: {_line!r}")
 
+    # 暂停 KELIVO 只封住真实的外部主线请求；不删历史，也不阻断后台辅助任务。
+    # 重新把 gateway_config.kelivo_enabled 设为 true 并重启即可原线续接。
+    if not KELIVO_ENABLED and not skip_conversation_log and _line != "tg":
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"message": "KELIVO 暂时关闭；历史与记忆均已保留，可随时无缝恢复。"}},
+        )
+
     # ---------- 每请求回复风格 X-Reply-Style（TG 带 short → 微信风格短回复）----------
     _style = (request.headers.get("X-Reply-Style", "") or "").strip()
     if _style:
@@ -3842,7 +5743,7 @@ async def chat_completions(request: Request):
             _txt = "（/同步 是给子线(如TG)把近况递给主线用的，主线自己不用同步哦~）"
         else:
             try:
-                _rows = await get_conversation_messages(_sync_sid, limit=10000)
+                _rows = await get_conversation_messages(_sync_sid)
                 _msgs = [{"role": r.get("role"), "content": (r.get("content") or "")}
                          for r in _rows if (r.get("content") or "").strip()]
                 if not _msgs:
@@ -3975,7 +5876,7 @@ async def chat_completions(request: Request):
 
         # 从DB读取历史
         try:
-            db_history = await get_conversation_messages(session_id, limit=10000)
+            db_history = await get_conversation_messages(session_id)
             db_msgs = []
             for m in (db_history or []):
                 msg = db_row_to_message(m)
@@ -4404,13 +6305,23 @@ async def console_page():
     return FileResponse("templates/console.html", media_type="text/html")
 
 
+@app.get("/desire-lexicon", response_class=HTMLResponse)
+async def desire_lexicon_page():
+    """Harper's private, gateway-protected desire lexicon editor."""
+    from fastapi.responses import FileResponse
+    return FileResponse("templates/desire-lexicon.html", media_type="text/html")
+
+
 
 # ============================================================
 # 管理 API
 # ============================================================
 
 @app.get("/api/memories")
-async def api_get_memories(layer: int = None, active_only: bool = None):
+async def api_get_memories(layer: int = None, active_only: bool = None, page: int = None,
+                           per_page: int = 50, q: str = "", date: str = "",
+                           sort: str = "id-desc", include_inactive: bool = False,
+                           suixiang_only: bool = False):
     """获取所有记忆（管理页面用）
     
     Query params:
@@ -4419,7 +6330,16 @@ async def api_get_memories(layer: int = None, active_only: bool = None):
     """
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
-    memories = await get_all_memories_detail(layer=layer, active_only=active_only)
+    paged = page is not None
+    if paged:
+        memories, total = await get_memories_detail_page(
+            page=page, per_page=per_page, layer=layer,
+            include_inactive=include_inactive, query=q, date_value=date, sort=sort,
+            suixiang_only=suixiang_only,
+        )
+    else:
+        # Backward compatibility for exports, maintenance tools and older clients.
+        memories = await get_all_memories_detail(layer=layer, active_only=active_only)
     tz_offset = timezone(timedelta(hours=TIMEZONE_HOURS))
     for m in memories:
         if m.get("created_at"):
@@ -4434,6 +6354,13 @@ async def api_get_memories(layer: int = None, active_only: bool = None):
         layer_stats = None
     
     result = {"memories": memories}
+    if paged:
+        result.update({
+            "page": max(1, page),
+            "per_page": max(1, min(100, per_page)),
+            "total": total,
+            "total_pages": max(1, (total + max(1, min(100, per_page)) - 1) // max(1, min(100, per_page))),
+        })
     if layer_stats:
         result["layer_stats"] = layer_stats
     return result
@@ -4593,7 +6520,7 @@ async def api_signal_nudge(request: Request):
 
 @app.post("/api/memories/create")
 async def api_create_memory(request: Request):
-    """外部代理（cyberboss 等）直接写入一条记忆（layer1 碎片，自动算向量，走夜间整理）"""
+    """外部代理写入事实或V的随想；musing永久保留原声，不进夜间整理。"""
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
     data = await request.json()
@@ -4607,7 +6534,15 @@ async def api_create_memory(request: Request):
     except (TypeError, ValueError):
         importance = 5
     source_session = str(data.get("source_session") or "cyberboss").strip()[:64] or "cyberboss"
-    await save_memory(content, importance=importance, source_session=source_session)
+    kind = str(data.get("kind") or "fact").strip().lower()
+    if kind not in {"fact", "musing"}:
+        return {"error": "kind 必须是 fact 或 musing"}
+    # suixiang 是07-30短期兼容字段；新调用统一使用 kind。
+    if bool(data.get("suixiang")):
+        kind = "musing"
+    await save_memory(
+        content, importance=importance, source_session=source_session, kind=kind
+    )
     return {"status": "ok"}
 
 
@@ -4634,13 +6569,13 @@ async def api_line_log(request: Request):
         if L2_TODAY_ENABLED and L2_REFRESH_N > 0:
             _l2_today_s = str(_l2_logical_today())
             if (
-                _cyberboss_l2_round_counter % L2_REFRESH_N == 0
+                _cyberboss_l2_round_counter >= L2_REFRESH_N
                 or _l2_state.get("date") != _l2_today_s
             ):
                 _schedule_l2_refresh(line)
     if role == "assistant" and line == CYBERBOSS_LINE_ID and MEMORY_ENABLED:
         try:
-            rows = await get_conversation_messages(line, limit=10000)
+            rows = await get_recent_conversation_messages(line, limit=50)
             rows = rows[-10:]
             last_user = ""
             for r in reversed(rows[:-1]):
@@ -4667,14 +6602,29 @@ async def api_line_recent(line: str = "", rounds: int = 9):
         st = await get_session_cache_state(sid)
         summary_parts = st.get("summary_parts") or []
         early = (st.get("early_summary") or "").strip()
-        rows = await get_conversation_messages(sid, limit=10000)
-        rnds = group_by_rounds([{"role": r.get("role"), "content": (r.get("content") or "")} for r in rows])
+        rows = await get_recent_conversation_messages(sid, limit=max(800, rounds * 40))
+        # group_by_rounds 会原样保留额外字段；created_at 必须带过去，
+        # 否则下方虽然尝试返回时间戳，实际每条都会变成空字符串。
+        rnds = group_by_rounds([{
+            "role": r.get("role"),
+            "content": (r.get("content") or ""),
+            "created_at": r.get("created_at"),
+        } for r in rows])
         msgs = []
         for rnd in rnds[-rounds:]:
             for m in rnd:
                 c = (m.get("content") or "").strip()
                 if c:
-                    msgs.append({"role": m.get("role"), "content": c})
+                    created_at = ""
+                    _msg_ts = m.get("created_at")
+                    if _msg_ts is not None:
+                        try:
+                            if getattr(_msg_ts, "tzinfo", None) is None:
+                                _msg_ts = _msg_ts.replace(tzinfo=timezone.utc)
+                            created_at = _msg_ts.astimezone(timezone.utc).isoformat()
+                        except Exception:
+                            pass
+                    msgs.append({"role": m.get("role"), "content": c, "created_at": created_at})
         summary_segments = ([f"〔更早〕{early}"] if early else []) + list(summary_parts)
         latest_at = ""
         if rows:
@@ -4697,6 +6647,13 @@ async def api_update_memory(memory_id: int, request: Request):
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
     data = await request.json()
+    # 回忆墙同时把正文/摘要存于 content 与 mw_meta。走普通记忆入口只会
+    # 改 content，必然制造双份数据失步；必须改走原子更新的 memorywall API。
+    if any(data.get(field) is not None for field in ("content", "title")) and await get_memorywall_one(memory_id):
+        return JSONResponse(
+            status_code=409,
+            content={"error": "回忆墙内容请使用 /api/memorywall/{id} 更新"},
+        )
     await update_memory_with_layer(
         memory_id,
         content=data.get("content"),
@@ -4935,7 +6892,7 @@ async def api_feel_dry(request: Request):
         return {"error": "无活跃对话线"}
     K = max(1, int(body.get("segments", 4)))
     W = max(4, int(body.get("window", 8)))
-    rows = await get_conversation_messages(sid, limit=max(400, K * W * 2))
+    rows = await get_recent_conversation_messages(sid, limit=max(1000, K * W * 2))
     try:
         rows = sorted(rows, key=lambda m: str(m.get("created_at") or ""))  # 时间升序
     except Exception:
@@ -5142,9 +7099,9 @@ async def _decide_and_write(persona: str, transcript: str, silence_min: float, i
 
     sys += "\n\n【最近对话(从旧到新)】\n" + (transcript or "(暂无)")
     night = "现在是深夜免打扰时段。" if in_quiet else ""
-    now_bj = (datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).strftime("%m月%d日 %H:%M")
+    now_sg = (datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).strftime("%m月%d日 %H:%M")
     user_instr = (
-        f"〔系统提示〕现在是北京时间 {now_bj}。距离{USER_NAME}上次跟你说话已经过去 {gap_desc} 了，{USER_NAME}还没回你。{night}\n"
+        f"〔系统提示〕现在是新加坡时间 {now_sg}。距离{USER_NAME}上次跟你说话已经过去 {gap_desc} 了，{USER_NAME}还没回你。{night}\n"
         f"你是个在意对方、会撒娇黏人的人。请**严格根据上面真实发生过的对话**，判断此刻要不要主动给{USER_NAME}发一条消息、发什么。\n"
         "【铁律】只能基于上面真实出现过的内容来写，**绝对不要编造没发生的事**：\n"
         "  · 没吵架、没说过重话，就绝不能出现「别生气 / 我说得不好听 / 对不起 / 原谅我」这类；\n"
@@ -5991,7 +7948,7 @@ async def api_summary_dry(request: Request):
         return {"error": "无活跃对话线"}
     offset = int(body.get("offset", 0))
     count = int(body.get("count", 20))
-    rows = await get_conversation_messages(sid, limit=10000)
+    rows = await get_conversation_messages(sid)
     try:
         rows = sorted(rows, key=lambda m: str(m.get("created_at") or ""))
     except Exception:
@@ -6073,6 +8030,26 @@ async def api_l2_dry(request: Request):
     sid = _l2_digest_session_id()
     d = await generate_today_digest(sid)
     return {"dry_run": True, "session": sid, "model": CACHE_SUMMARY_MODEL, "len": len(d or ""), "digest": d}
+
+
+@app.post("/api/memorywall/dry")
+async def api_memorywall_dry(request: Request):
+    """Generate factual daily-diary drafts for review; never writes memories or L2."""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    dates = [str(item)[:10] for item in (body.get("dates") or []) if str(item).strip()]
+    if not dates:
+        return {"error": "dates_required"}
+    sid = get_active_session_id() or _l2_digest_session_id()
+    results = []
+    for day in dates[:7]:
+        draft = await generate_daily_diary(sid, day)
+        results.append({"date": day, "ok": bool(draft and not draft.get("error")), "draft": draft})
+    return {"dry_run": True, "saved": False, "results": results}
 
 
 @app.post("/api/debug/unlock-sim")
@@ -6414,6 +8391,28 @@ async def api_dreams_list():
         return {"error": str(e)}
 
 
+@app.get("/api/dreams/by-date")
+async def api_dream_by_date(date: str = ""):
+    """给 V 的权威梦境查询：按 dream_date 精确读取，不经过普通记忆模糊搜索。"""
+    date_s = str(date or "").strip()
+    try:
+        parsed = datetime.strptime(date_s, "%Y-%m-%d").date()
+    except ValueError:
+        return {"error": "date 必须是 YYYY-MM-DD", "dream": None}
+    if str(parsed) != date_s:
+        return {"error": "date 必须是 YYYY-MM-DD", "dream": None}
+    try:
+        dream = await get_dream(date_s)
+        if not dream:
+            return {"date": date_s, "found": False, "dream": None}
+        dream = dict(dream)
+        dream["dream_date"] = str(dream.get("dream_date") or date_s)
+        dream["created_at"] = str(dream.get("created_at") or "")
+        return {"date": date_s, "found": True, "dream": dream}
+    except Exception as e:
+        return {"error": str(e), "date": date_s, "dream": None}
+
+
 async def archive_line(session_id: str) -> dict:
     """归档一条线(给"归档RP"用)：把它当前对话压成总结写进**全局记忆库**(可被任何线召回) →
     对话整体挪到归档线(可逆软归档，不再占 token) → 重置该线缓存(重新垫上主线当前摘要当背景)。
@@ -6422,7 +8421,7 @@ async def archive_line(session_id: str) -> dict:
         return {"error": "no session"}
     if PARTITION_SESSION_ID and session_id == PARTITION_SESSION_ID:
         return {"error": "不能归档主线，只能归档 RP 等子线"}
-    rows = await get_conversation_messages(session_id, limit=10000)
+    rows = await get_conversation_messages(session_id)
     if not rows:
         return {"status": "empty", "moved": 0, "note": "这条线没有对话可归档"}
     # 1) 压成总结(一次 Haiku；force_quality 走保质感 prompt，亲密细节会被抽象成中性指代)
@@ -6513,15 +8512,45 @@ async def api_dreams_run_status():
 # ============================================================
 
 CONSOLIDATION_PROMPT = """
-你是记忆整理助手。请将以下对话碎片整理成完整的事件记录。
+你是L2事件记忆整理助手。请把输入的L1碎片按真实事件边界整理成独立、完整、可长期检索的事件记忆。
 
-要求：
-1. 按主题/事件分组，相关的碎片合并到一起。**必须大胆合并**：同一场互动、同一次聊天、同一个话题在几小时内的所有碎片，属于同一个事件，必须合成一条——哪怕单条碎片已经写得很完整。碎片开头的时间就是用来判断'是不是连着发生的'的依据。
-2. 整理的目的是把同期发生的事焊在一起，方便日后一起被想起。所以事件数量必须明显少于碎片数量（一般一天最多 2~4 个事件）。'由1条碎片单独成一个事件'只允许出现在该碎片与当天其他所有内容都毫无关系时。
-3. 每条记录包含：标题（10字内）+ 完整描述。描述按发生顺序把该事件所有碎片的内容都写进去，可以长，不许丢事实。
-4. 合并重复内容，保留重要细节
-5. 保留原文中的主观感受、情绪表达和个人化用语，不要改写为客观陈述或第三方总结
-6. content字段中不要使用双引号，用单引号或书名号代替
+L2是事件记忆，不是逐字记录、操作日志、游戏战报、亲密过程复述或每日回忆墙。
+
+# 事件边界
+- 同一目标、同一连续互动、同一因果链的L1属于同一个事件；事实、触发、主要经过、情绪变化和结果必须合在同一条。
+- 主题相近但目标、经过或结果不同的事件必须分开；完全无关的事情不能为了减少数量强行合并。
+- 单条L1本身就是完整独立事件时，可以单独形成一条L2。
+- 不规定一天必须有几条事件，数量由真实事件边界决定；但整理后的事件总数应少于输入碎片总数。
+
+# 每条事件必须保留的骨架
+1. 起因或目标；
+2. 主要经过；
+3. 关键转折；
+4. 最终结果或当前停点；
+5. 重要情绪、关系变化、决定、承诺、边界或后续影响。
+
+“不丢事实”指不得删除会改变上述事件骨架、人物归属或现实/虚构边界的独立事实。
+字数限制只能促使你合并同义表达、重复确认、操作流水账和不增加新信息的微观步骤，不能成为删除独立事实的理由。
+
+# 游戏与角色扮演
+- 只保留开始原因/阶段目标、主要推进、关键选择或转折、阶段结果/当前停点，以及由游戏触发的重要真实情绪或关系交流。
+- 不逐条记录每个指令、回合、普通数值变化、道具操作、重复尝试和类似反应。
+- 必须明确写成“游戏中”或“角色扮演中”，绝不能冒充现实；角色行为不能直接写成Harper或V的现实行为。
+
+# 亲密事件
+- 只保留互动起因、总体推进、重要阶段、关键情绪、关系意义、边界/同意/拒绝/承诺，以及结果和停点。
+- 体位变化确实构成重要阶段变化时可以简要提及，但不展开动作过程。
+- 不逐条记录动作、身体部位、动作方式、生理反应、重复亲密台词、节奏力度或姿势微调。
+
+# 身份与现实边界
+- Harper、裘宝宝或“她”始终是人类Harper；V或“他”始终是AI伴侣V。涉及双方时必须明确主语。
+- 谁说、谁做、谁感受到必须与L1一致，绝不能交换人物。
+- 游戏、角色扮演、梦境和假设必须明确标注，绝不能写成现实。
+
+# 字数
+- 简单事件可以少于100字；普通事件以100~300字为目标。
+- 每条content最多400字。不得通过删除独立事实来满足字数；应压缩重复表述和微观过程。
+- 每条标题10字内；content字段中不要使用双引号，可用单引号或书名号。
 
 碎片记忆：
 {fragments}
@@ -6538,6 +8567,92 @@ CONSOLIDATION_PROMPT = """
 
 只输出 JSON，不要其他内容。确保 JSON 语法正确。
 """
+
+CONSOLIDATION_MODEL_MAX_CONTENT_CHARS = 400
+CONSOLIDATION_SAFE_MAX_CONTENT_CHARS = 550
+
+
+def _consolidation_events_policy_error(events, fed_ids,
+                                       allow_duplicate_ids: bool = False) -> str:
+    """Validate complete, non-duplicated L1 coverage and the L2 safety boundary."""
+    if not isinstance(events, list) or not events:
+        return "事件输出不是非空JSON数组"
+    seen_ids = set()
+    for index, event in enumerate(events, 1):
+        if not isinstance(event, dict):
+            return f"第{index}条事件不是对象"
+        title = str(event.get("title") or "").strip()
+        content = str(event.get("content") or "").strip()
+        if not title or not content:
+            return f"第{index}条事件缺少标题或正文"
+        if len(content) > CONSOLIDATION_SAFE_MAX_CONTENT_CHARS:
+            return (
+                f"第{index}条事件正文{len(content)}字，超过程序安全上限"
+                f"{CONSOLIDATION_SAFE_MAX_CONTENT_CHARS}字"
+            )
+        event_ids = set()
+        for raw_id in event.get("merged_ids", []):
+            try:
+                memory_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if memory_id not in fed_ids:
+                return f"第{index}条事件引用不存在的L1 ID={memory_id}"
+            event_ids.add(memory_id)
+        if not event_ids:
+            return f"第{index}条事件没有有效merged_ids"
+        duplicated = seen_ids & event_ids
+        if duplicated and not allow_duplicate_ids:
+            return f"L1 ID被重复分配：{sorted(duplicated)}"
+        seen_ids.update(event_ids)
+    missing = set(fed_ids) - seen_ids
+    if missing:
+        return f"有{len(missing)}条L1未被任何事件覆盖"
+    return ""
+
+
+def _consolidation_usable_events(events, fed_ids, context: str = "") -> tuple:
+    """Keep factual events usable after the single repair attempt is exhausted."""
+    usable = []
+    covered_ids = set()
+    duplicate_ids = set()
+    for index, event in enumerate(events or [], 1):
+        if not isinstance(event, dict):
+            print(f"🚨 L2 {context} 丢弃非法事件：第{index}条不是对象")
+            continue
+        title = str(event.get("title") or "").strip()
+        content = str(event.get("content") or "").strip()
+        if not title or not content:
+            print(f"🚨 L2 {context} 丢弃非法事件：第{index}条缺少标题或正文")
+            continue
+        merged_ids = []
+        for raw_id in event.get("merged_ids") or []:
+            try:
+                memory_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if memory_id in fed_ids and memory_id not in merged_ids:
+                merged_ids.append(memory_id)
+        if not merged_ids:
+            print(f"🚨 L2 {context} 丢弃非法事件：第{index}条没有真实来源ID")
+            continue
+        duplicate_ids.update(covered_ids.intersection(merged_ids))
+        covered_ids.update(merged_ids)
+        clean_event = dict(event)
+        clean_event.update({"title": title, "content": content,
+                            "merged_ids": merged_ids})
+        usable.append(clean_event)
+        if len(content) > CONSOLIDATION_SAFE_MAX_CONTENT_CHARS:
+            print(
+                f"🚨 L2 {context} 超长事件放行：第{index}条《{title}》"
+                f"{len(content)}字（修补机会已用尽）"
+            )
+    if duplicate_ids:
+        print(f"⚠️ L2 {context} 来源ID重复覆盖，按已覆盖归档：{sorted(duplicate_ids)}")
+    missing_ids = set(fed_ids) - covered_ids
+    if missing_ids:
+        print(f"🚨 L2 {context} 漏网碎片保持active：{sorted(missing_ids)}")
+    return usable, covered_ids, missing_ids
 
 # 整理状态（异步执行，防重入）
 _consolidate_status = {
@@ -6566,31 +8681,798 @@ async def consolidate_memories_for_date_range(start_date, end_date):
     return result
 
 
-CONSOLIDATE_CHUNK_SIZE = int(os.getenv("CONSOLIDATE_CHUNK_SIZE", "40"))
+CONSOLIDATE_CHUNK_SIZE = int(os.getenv("CONSOLIDATE_CHUNK_SIZE", "20"))
+CONSOLIDATE_AUTO_MAX_ATTEMPTS = 2
+CONSOLIDATION_REPAIR_MODEL = os.getenv(
+    "CONSOLIDATION_REPAIR_MODEL", "deepseek/deepseek-v3.2"
+)
+
+
+def _consolidation_state_key(event_date) -> str:
+    return f"l2_consolidation_state:{event_date}"
+
+
+async def _load_consolidation_state(event_date) -> dict:
+    raw = await get_gateway_config(_consolidation_state_key(event_date), "")
+    try:
+        state = json.loads(raw) if raw else {}
+    except Exception:
+        state = {}
+    if not isinstance(state, dict) or state.get("version") != 1:
+        state = {"version": 1, "day": str(event_date), "chunks": {},
+                 "align_attempts": 0, "align_status": "pending", "alerts": []}
+    return state
+
+
+async def _save_consolidation_state(event_date, state: dict):
+    await set_gateway_config(
+        _consolidation_state_key(event_date),
+        json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+async def _notify_consolidation_failure(event_date, stage: str, detail: str, final: bool, state: dict):
+    # One first-failure and one final alert per logical day. A dense day
+    # may have several failed chunks; do not flood Harper with one message each.
+    alert_key = "final" if final else "first"
+    alerts = state.setdefault("alerts", [])
+    if alert_key in alerts:
+        return
+    status = (
+        "本次未写入L2；原始L1记录未被本步骤删除，请人工检查"
+        if final else
+        "本次未写入L2；原始L1记录未被本步骤删除，下一晚自动重试一次"
+    )
+    text = (
+        f"⚠️ HOME1 夜间L2整理未完成\n"
+        f"日期：{event_date}\n阶段：{stage}\n原因：{str(detail)[:180]}\n状态：{status}"
+    )
+    try:
+        await enqueue_proactive_push(
+            text, urgent=False, origin="nightly_l2_alert",
+            intent={"day": str(event_date), "stage": stage, "final": final},
+        )
+    except Exception as exc:
+        print(f"⚠️ L2失败提醒入队失败 {event_date}/{stage}: {type(exc).__name__}")
+        return
+    alerts.append(alert_key)
+
+
+def _parse_consolidation_array(text: str):
+    """Extract the first complete JSON array from fences or surrounding prose."""
+    raw = str(text or "").strip()
+    raw = re.sub(r"^\s*```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```\s*$", "", raw)
+    decoder = json.JSONDecoder(strict=False)
+    for candidate in (raw, re.sub(r"[\x00-\x1f\x7f]", " ", raw)):
+        for match in re.finditer(r"[\[{]", candidate):
+            try:
+                parsed, _ = decoder.raw_decode(candidate[match.start():])
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(parsed, list):
+                return parsed
+    return None
+
+
+def _parse_json_object(text: str):
+    """Extract the first complete JSON object from fences or surrounding prose."""
+    raw = str(text or "").strip()
+    raw = re.sub(r"^\s*```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```\s*$", "", raw)
+    decoder = json.JSONDecoder(strict=False)
+    for candidate in (raw, re.sub(r"[\x00-\x1f\x7f]", " ", raw)):
+        for match in re.finditer(r"\{", candidate):
+            try:
+                parsed, _ = decoder.raw_decode(candidate[match.start():])
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return None
+
+
+def _safe_model_preview(value, limit: int = 200) -> str:
+    """One-line bounded diagnostic preview; never include prompts or headers."""
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+
+def _drop_non_object_items(parsed, context: str):
+    """Normalize a parsed model array to objects at the parse boundary.
+
+    A model array occasionally carries a bare scalar (2026-08-18: a stray int
+    crashed the whole chunk with 'int' object has no attribute 'get'). Shape is
+    fixed once, here, so every downstream reader can assume dicts instead of
+    growing its own isinstance patch. Returns None when nothing usable is left,
+    which callers already treat as a parse failure.
+    """
+    if parsed is None:
+        return None
+    kept = []
+    for index, item in enumerate(parsed, 1):
+        if isinstance(item, dict):
+            kept.append(item)
+            continue
+        print(
+            f"🚨 L2 {context} 丢弃非对象候选：第{index}项 "
+            f"type={type(item).__name__} value={_safe_model_preview(repr(item))}"
+        )
+    return kept or None
+
+
+def _openrouter_json_schema(name: str, schema: dict) -> dict:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": name,
+            "strict": True,
+            "schema": schema,
+        },
+    }
+
+
+async def _post_schema_then_legacy(client, *, headers: dict, stage: str,
+                                   structured_payload: dict,
+                                   legacy_payload: dict):
+    """Prefer OpenRouter structured output, but never let it block the old path."""
+    if "openrouter" not in API_BASE_URL:
+        return await client.post(API_BASE_URL, headers=headers, json=legacy_payload), False
+    try:
+        response = await client.post(
+            API_BASE_URL, headers=headers, json=structured_payload
+        )
+        if response.status_code == 200:
+            return response, True
+        print(
+            f"⚠️ {stage} schema请求失败 HTTP={response.status_code}，"
+            "自动降级旧调用"
+        )
+    except Exception as exc:
+        print(
+            f"⚠️ {stage} schema请求异常 error={type(exc).__name__}，"
+            "自动降级旧调用"
+        )
+    response = await client.post(
+        API_BASE_URL, headers=headers, json=legacy_payload
+    )
+    print(f"ℹ️ {stage} schema降级旧调用 HTTP={response.status_code}")
+    return response, False
+
+
+def _consolidation_repair_focus(events: list, fed_ids: set, source_items: list) -> dict:
+    """Compute exact policy trouble spots before asking the model to repair."""
+    occurrences = {}
+    unknown_ids = set()
+    overlong = []
+    for index, event in enumerate(events or [], 1):
+        content = str((event or {}).get("content") or "")
+        if len(content) > CONSOLIDATION_SAFE_MAX_CONTENT_CHARS:
+            overlong.append({
+                "event_index": index,
+                "title": str((event or {}).get("title") or ""),
+                "chars": len(content),
+            })
+        for raw_id in (event or {}).get("merged_ids") or []:
+            try:
+                memory_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            occurrences.setdefault(memory_id, []).append(index)
+            if memory_id not in fed_ids:
+                unknown_ids.add(memory_id)
+    missing_ids = sorted(set(fed_ids) - set(occurrences))
+    duplicate_ids = {
+        memory_id: indexes for memory_id, indexes in occurrences.items()
+        if len(indexes) > 1
+    }
+    problem_ids = set(missing_ids) | set(duplicate_ids) | unknown_ids
+    focused_sources = []
+    for item in source_items or []:
+        if isinstance(item, dict) and "id" in item:
+            try:
+                item_id = int(item["id"])
+            except (TypeError, ValueError):
+                continue
+            if item_id in problem_ids:
+                focused_sources.append({
+                    "id": item_id,
+                    "content": str(item.get("content") or ""),
+                })
+        elif isinstance(item, dict):
+            item_ids = set()
+            for raw_id in item.get("merged_ids") or []:
+                try:
+                    item_ids.add(int(raw_id))
+                except (TypeError, ValueError):
+                    continue
+            if item_ids & problem_ids:
+                focused_sources.append(item)
+    return {
+        "missing_ids": missing_ids,
+        "duplicate_ids": duplicate_ids,
+        "unknown_ids": sorted(unknown_ids),
+        "overlong_events": overlong,
+        "focused_sources": focused_sources,
+    }
+
+
+async def _repair_consolidation_events(client, model: str, events: list,
+                                       source_items: list, fed_ids: set,
+                                       policy_error: str) -> dict:
+    """Spend the one remaining attempt repairing only a rejected L2 draft."""
+    # Prompt building runs inside the guard too: a raise here used to escape to
+    # the caller's generic handler and fail the whole chunk instead of costing
+    # one repair attempt (2026-08-18 'int' object has no attribute 'get').
+    try:
+        focus = _consolidation_repair_focus(events, fed_ids, source_items)
+    except Exception as exc:
+        print(
+            f"🚨 L2定点修补取材失败 error={type(exc).__name__}: "
+            f"{_safe_model_preview(exc)}"
+        )
+        return {"status": "error", "error": f"定点修补取材异常: {type(exc).__name__}"}
+    repair_model = CONSOLIDATION_REPAIR_MODEL if "openrouter" in API_BASE_URL else model
+    only_overlong = (
+        bool(focus["overlong_events"])
+        and not focus["missing_ids"]
+        and not focus["duplicate_ids"]
+        and not focus["unknown_ids"]
+    )
+    if only_overlong:
+        affected = [{
+            "event_index": item["event_index"],
+            "title": events[item["event_index"] - 1].get("title", ""),
+            "content": events[item["event_index"] - 1].get("content", ""),
+        } for item in focus["overlong_events"]]
+        prompt = f"""以下L2事件只有正文超长，其余候选已经合格，绝不能重写。
+
+只压缩下面列出的正文：保留起因、主要经过、关键转折、结果/停点、重要情绪、关系、决定与边界；删除重复句、例子、逐步操作和微观过程。每条压到300~400个中文字符，绝不能超过550字符，输出前自行复核。
+
+只输出JSON数组，每个输入event_index恰好返回一次，不要返回标题、importance、merged_ids或其他事件：
+[
+  {{"event_index": 4, "content": "仅这一条的完整压缩正文"}}
+]
+
+需要压缩的事件：
+{json.dumps(affected, ensure_ascii=False)}
+"""
+    else:
+        prompt = f"""下面这份L2候选已经完成大部分整理，但程序验收发现一个具体问题：
+{policy_error}
+
+程序已精确定位：
+{json.dumps(focus, ensure_ascii=False)}
+
+请做最小修补：
+- 已经正确的事件保持不变。你只能用replace替换确实需要改的单条事件，或用add新增缺失的独立事件。
+- missing_ids中只列出了真正缺失的L1；其原文只在focused_sources中提供。判断事实是否已在某条事件中：已体现就只补编号，未体现才把该事实简短补入相关事件；确属独立事件才新增一条。
+- 若编号重复：根据事实归属只从错误事件移除重复编号，不得删除对应事实。
+- 若单条超长：只压缩该条的重复和微观过程，保留起因、经过、转折、结果、情绪/边界；修补目标必须在400字以内，并在输出前自行复核，为程序550字硬上限留出误差余量。
+- 修补后每个真实L1 ID必须恰好出现一次，每条content程序上限550字。
+- 只输出局部补丁JSON数组，不要重输未修改事件，不要解释：
+[
+  {{"action":"replace","event_index":4,"event":{{"title":"标题","content":"完整替换正文","importance":5,"merged_ids":[1,2]}}}},
+  {{"action":"add","event":{{"title":"新增标题","content":"新增事件正文","importance":5,"merged_ids":[3]}}}}
+]
+
+候选事件（数组位置从1开始）：
+{json.dumps([dict({"event_index": i}, **event) for i, event in enumerate(events, 1)], ensure_ascii=False)}
+    """
+    event_schema = {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "content": {"type": "string"},
+            "importance": {"type": "integer"},
+            "merged_ids": {"type": "array", "items": {"type": "integer"}},
+        },
+        "required": ["title", "content", "importance", "merged_ids"],
+        "additionalProperties": False,
+    }
+    if only_overlong:
+        patch_item_schema = {
+            "type": "object",
+            "properties": {
+                "event_index": {"type": "integer"},
+                "content": {"type": "string"},
+            },
+            "required": ["event_index", "content"],
+            "additionalProperties": False,
+        }
+        structured_instruction = (
+            "\n结构化输出顶层对象为 patches；每项只含 event_index 和 content。"
+        )
+    else:
+        patch_item_schema = {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["replace", "add"]},
+                "event_index": {
+                    "type": "integer",
+                    "description": "replace时为1起事件序号；add时固定为0",
+                },
+                "event": event_schema,
+            },
+            "required": ["action", "event_index", "event"],
+            "additionalProperties": False,
+        }
+        structured_instruction = (
+            "\n结构化输出顶层对象为 patches；add操作的event_index固定填0。"
+        )
+    structured_schema = {
+        "type": "object",
+        "properties": {
+            "patches": {
+                "type": "array",
+                "items": patch_item_schema,
+            },
+        },
+        "required": ["patches"],
+        "additionalProperties": False,
+    }
+    common_payload = {
+        "model": repair_model,
+        "reasoning": {"enabled": False},
+        "max_tokens": 6000,
+    }
+    legacy_payload = {
+        **common_payload,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    structured_payload = {
+        **common_payload,
+        "messages": [{
+            "role": "user",
+            "content": prompt + structured_instruction,
+        }],
+        "response_format": _openrouter_json_schema(
+            "l2_local_patches", structured_schema
+        ),
+        "provider": {"require_parameters": True},
+    }
+    try:
+        repair_client = client
+        owns_client = bool(getattr(client, "is_closed", False))
+        if owns_client:
+            repair_client = httpx.AsyncClient(timeout=120.0)
+        try:
+            request_headers = {
+                "Authorization": f"Bearer {get_memory_api_key()}",
+                "Content-Type": "application/json",
+            }
+            response, used_schema = await _post_schema_then_legacy(
+                repair_client,
+                headers=request_headers,
+                stage="L2定点修补",
+                structured_payload=structured_payload,
+                legacy_payload=legacy_payload,
+            )
+            if response.status_code != 200:
+                return {
+                    "status": "error",
+                    "error": f"定点修补HTTP {response.status_code}",
+                }
+            choice = (response.json().get("choices") or [{}])[0]
+            if str(choice.get("finish_reason") or "") == "length":
+                if used_schema:
+                    print("⚠️ L2定点修补 schema输出截断，自动降级旧调用")
+                    response = await repair_client.post(
+                        API_BASE_URL,
+                        headers=request_headers,
+                        json=legacy_payload,
+                    )
+                    print(
+                        "ℹ️ L2定点修补 schema降级旧调用 "
+                        f"HTTP={response.status_code}"
+                    )
+                    if response.status_code != 200:
+                        return {
+                            "status": "error",
+                            "error": f"定点修补HTTP {response.status_code}",
+                        }
+                    choice = (response.json().get("choices") or [{}])[0]
+                if str(choice.get("finish_reason") or "") == "length":
+                    return {"status": "error", "error": "定点修补输出超过6000 tokens"}
+            raw_patch = (choice.get("message") or {}).get("content", "")
+            if used_schema:
+                patch_object = _parse_json_object(raw_patch)
+                patch = (
+                    patch_object.get("patches")
+                    if isinstance(patch_object, dict)
+                    else None
+                )
+                if not isinstance(patch, list):
+                    print(
+                        "⚠️ L2定点修补 schema响应结构异常 "
+                        f"raw={_safe_model_preview(raw_patch)}，自动降级旧调用"
+                    )
+                    response = await repair_client.post(
+                        API_BASE_URL,
+                        headers=request_headers,
+                        json=legacy_payload,
+                    )
+                    print(
+                        "ℹ️ L2定点修补 schema降级旧调用 "
+                        f"HTTP={response.status_code}"
+                    )
+                    if response.status_code != 200:
+                        return {
+                            "status": "error",
+                            "error": f"定点修补HTTP {response.status_code}",
+                        }
+                    choice = (response.json().get("choices") or [{}])[0]
+                    if str(choice.get("finish_reason") or "") == "length":
+                        return {"status": "error", "error": "定点修补输出超过6000 tokens"}
+                    raw_patch = (choice.get("message") or {}).get("content", "")
+                    patch = _parse_consolidation_array(raw_patch)
+            else:
+                patch = _parse_consolidation_array(raw_patch)
+        finally:
+            if owns_client:
+                await repair_client.aclose()
+        if patch is None:
+            preview = _safe_model_preview(raw_patch)
+            print(f"⚠️ 定点修补JSON解析失败 raw={preview}")
+            return {"status": "error", "error": "定点修补JSON解析失败",
+                    "raw_preview": preview}
+        if only_overlong:
+            expected_indexes = {
+                item["event_index"] for item in focus["overlong_events"]
+            }
+            seen_indexes = set()
+            repaired = json.loads(json.dumps(events, ensure_ascii=False))
+            for item in patch:
+                if not isinstance(item, dict):
+                    print(
+                        "⚠️ L2超长正文补丁验收失败 reason=补丁不是对象 "
+                        f"value={_safe_model_preview(item)}"
+                    )
+                    return {"status": "error", "error": "超长正文补丁不是对象"}
+                try:
+                    event_index = int(item.get("event_index"))
+                except (TypeError, ValueError):
+                    return {"status": "error", "error": "超长正文补丁缺少event_index"}
+                content = str(item.get("content") or "").strip()
+                if event_index not in expected_indexes or event_index in seen_indexes:
+                    return {"status": "error", "error": "超长正文补丁索引异常"}
+                if not content or len(content) > CONSOLIDATION_SAFE_MAX_CONTENT_CHARS:
+                    return {"status": "error", "error": (
+                        f"第{event_index}条局部压缩后仍为{len(content)}字"
+                    )}
+                repaired[event_index - 1]["content"] = content
+                seen_indexes.add(event_index)
+            if seen_indexes != expected_indexes:
+                return {"status": "error", "error": "超长正文补丁未覆盖全部问题事件"}
+        else:
+            repaired = json.loads(json.dumps(events, ensure_ascii=False))
+            replaced_indexes = set()
+            for operation in patch:
+                if not isinstance(operation, dict):
+                    print(
+                        "⚠️ L2局部补丁验收失败 reason=补丁不是对象 "
+                        f"value={_safe_model_preview(operation)}"
+                    )
+                    return {"status": "error", "error": "局部补丁不是对象"}
+                action = str(operation.get("action") or "")
+                event = operation.get("event")
+                if not isinstance(event, dict):
+                    print(
+                        "⚠️ L2局部补丁验收失败 reason=缺少event "
+                        f"value={_safe_model_preview(operation)}"
+                    )
+                    return {"status": "error", "error": "局部补丁缺少event"}
+                if action == "replace":
+                    try:
+                        event_index = int(operation.get("event_index"))
+                    except (TypeError, ValueError):
+                        return {"status": "error", "error": "replace缺少event_index"}
+                    if (event_index < 1 or event_index > len(repaired)
+                            or event_index in replaced_indexes):
+                        return {"status": "error", "error": "replace索引异常"}
+                    repaired[event_index - 1] = event
+                    replaced_indexes.add(event_index)
+                elif action == "add":
+                    repaired.append(event)
+                else:
+                    return {"status": "error", "error": f"未知局部补丁动作:{action}"}
+        return {"status": "ok", "events": repaired, "model": repair_model}
+    except Exception as exc:
+        return {"status": "error", "error": f"定点修补异常: {type(exc).__name__}"}
+
+
+CONSOLIDATION_ALIGNMENT_PROMPT = """你是L2跨分块事件对齐助手。下面是同一逻辑日各20条L1分块产生的候选事件。
+
+机械分块不代表事件边界。请只合并跨分块后确认属于同一目标、同一连续互动或同一因果链的候选；不同事件必须保持分开。单条L1形成独立事件完全合法，不得为减少数量强行合并。
+
+最终每条事件遵守：
+- 保留起因、主要经过、关键转折、结果/当前停点、重要情绪与关系意义；
+- 游戏/RP明确标注虚构层，只留阶段目标、主要推进、关键转折/结果及真实情绪，不逐回合；
+- 亲密内容只留起因、总体推进、重要阶段/体位变化、情绪/边界/关系意义和结果，不写微观动作或生理流水；
+- Harper/裘宝宝/她是人类Harper；V/他是AI伴侣V，人物不得交换；
+- 普通事件100~300字，模型最多400字；不能为字数删除独立事实；
+- merged_ids必须完整保留所有候选中的真实L1 ID，每个ID恰好归属一个最终事件。
+
+只输出JSON数组：
+[
+  {{"title":"10字内标题","content":"完整事件","importance":5,"merged_ids":[1,2,3]}}
+]
+
+候选事件：
+{candidates}
+"""
+
+CONSOLIDATION_ALIGNMENT_PATCH_PROMPT = """你是L2跨分块事件对齐助手。机械分块不代表事件边界。
+
+请检查带chunk与event_index的候选，只返回确实属于同一连续事件、且横跨不同chunk的合并补丁。长事件可能跨越不止一个机械分块；不同事件不动，没有需要合并的就输出[]。
+
+每个补丁必须完整给出合并后的事件，merged_ids必须恰好等于被合并候选ID的并集；正文最多400字，程序硬上限550字。游戏/RP不得写成现实，亲密内容只留事件骨架、重要阶段和情绪/边界。
+
+只输出JSON数组，不要重输未合并事件：
+[
+  {{"merge_indexes":[8,9],"event":{{"title":"标题","content":"合并正文","importance":5,"merged_ids":[1,2,3]}}}}
+]
+
+候选：
+{candidates}
+"""
+
+
+async def _align_consolidation_candidates(candidates: list, fed_ids: set,
+                                          candidate_groups: list = None) -> dict:
+    patch_mode = bool(candidate_groups)
+    indexed = []
+    if patch_mode:
+        event_index = 0
+        for chunk_index, group in enumerate(candidate_groups, 1):
+            for event in group:
+                event_index += 1
+                indexed.append(dict({"event_index": event_index,
+                                     "chunk": chunk_index}, **event))
+        prompt = CONSOLIDATION_ALIGNMENT_PATCH_PROMPT.format(
+            candidates=json.dumps(indexed, ensure_ascii=False)
+        )
+    else:
+        prompt = CONSOLIDATION_ALIGNMENT_PROMPT.format(
+            candidates=json.dumps(candidates, ensure_ascii=False)
+        )
+    model = CONSOLIDATION_MODEL
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                API_BASE_URL,
+                headers={"Authorization": f"Bearer {get_memory_api_key()}",
+                         "Content-Type": "application/json"},
+                json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 6000},
+            )
+        if response.status_code != 200:
+            return {"status": "error", "error": f"跨块对齐HTTP {response.status_code}"}
+        choice = (response.json().get("choices") or [{}])[0]
+        if str(choice.get("finish_reason") or "") == "length":
+            return {"status": "error", "error": "跨块对齐输出超过6000 tokens"}
+        parsed_output = _parse_consolidation_array(
+            (choice.get("message") or {}).get("content", "")
+        )
+        # In patch mode [] explicitly means "nothing crosses a chunk boundary"
+        # and is a successful alignment result. Chunk/full-event generation
+        # must still reject an empty event list.
+        output = (
+            [] if patch_mode and parsed_output == [] else
+            _drop_non_object_items(
+                parsed_output,
+                "跨块对齐" + ("补丁" if patch_mode else "事件"),
+            )
+        )
+        if output is None:
+            return {"status": "error", "error": "跨块对齐JSON解析失败"}
+        if patch_mode:
+            events = json.loads(json.dumps(candidates, ensure_ascii=False))
+            used_indexes = set()
+            replacements = {}
+            chunk_by_index = {
+                item["event_index"]: item["chunk"] for item in indexed
+            }
+            for patch in output:
+                indexes = []
+                for raw in (patch or {}).get("merge_indexes") or []:
+                    try:
+                        indexes.append(int(raw))
+                    except (TypeError, ValueError):
+                        continue
+                replacement = (patch or {}).get("event")
+                if (len(indexes) < 2 or not isinstance(replacement, dict)
+                        or any(i < 1 or i > len(events) for i in indexes)
+                        or used_indexes.intersection(indexes)):
+                    return {"status": "error", "error": "跨块合并补丁结构异常"}
+                chunks = {chunk_by_index[i] for i in indexes}
+                if len(chunks) < 2:
+                    # Same-chunk candidates were already validated by the chunk
+                    # pass. The alignment model has no authority to rewrite
+                    # them; ignore the suggestion without rejecting valid work.
+                    continue
+                expected_ids = set()
+                for i in indexes:
+                    expected_ids.update(int(x) for x in events[i - 1].get("merged_ids") or [])
+                actual_ids = {int(x) for x in replacement.get("merged_ids") or []}
+                if actual_ids != expected_ids:
+                    # 编号对不上是"这次合并可能不认真"的唯一信号（正文程序读不懂）。
+                    # 家规是宁可难看不可丢：只弃用这一份补丁，两条候选保持分开、
+                    # 原样落库，一个字不丢；其余补丁和整晚事件照常。
+                    # 旧版在这里拒收整晚（08-18 两次、08-19 一次，三晚全灭）；
+                    # 也不要改成按并集盖章采纳——正文若真丢了事实，盖章=静默丢失。
+                    print(
+                        "⚠️ 跨块对齐: 合并补丁改变了来源L1集合，弃用该补丁、候选保持分开 "
+                        f"indexes={sorted(indexes)} 模型给={sorted(actual_ids)} 应为={sorted(expected_ids)}"
+                    )
+                    continue
+                first = min(indexes)
+                replacements[first] = replacement
+                used_indexes.update(indexes)
+            patched = []
+            for index, event in enumerate(events, 1):
+                if index in replacements:
+                    patched.append(replacements[index])
+                elif index not in used_indexes:
+                    patched.append(event)
+            events = patched
+        else:
+            events = output
+        repaired = {}
+        # Patch-mode alignment starts from independently validated chunk
+        # candidates. The same broad L1 fragment can legitimately be cited by
+        # one event on each side of a mechanical chunk boundary. Terminal
+        # persistence already preserves both events and archives by ID union;
+        # do not spend the repair attempt asking a model to strip the only ID
+        # from one event (2026-08-23 produced an empty event that way).
+        policy_error = _consolidation_events_policy_error(
+            events, fed_ids, allow_duplicate_ids=patch_mode
+        )
+        if policy_error:
+            repaired = await _repair_consolidation_events(
+                client, model, events, candidates, fed_ids, policy_error,
+            )
+            if repaired.get("status") != "ok":
+                return {"status": "error", "paid_attempts": 2,
+                        "error": f"跨块对齐验收失败且修补失败: {repaired.get('error')}"}
+            events = repaired["events"]
+            policy_error = _consolidation_events_policy_error(
+                events, fed_ids, allow_duplicate_ids=patch_mode
+            )
+            if policy_error:
+                return {"status": "error", "paid_attempts": 2,
+                        "error": f"跨块对齐修补后仍未通过: {policy_error}"}
+        return {"status": "ok", "events": events,
+                "paid_attempts": 2 if repaired.get("status") == "ok" else 1}
+    except Exception as exc:
+        return {"status": "error", "error": f"跨块对齐异常: {type(exc).__name__}"}
 
 
 async def _consolidate_fragment_batch(fragments, event_date):
-    """整理一批碎片：超过 CONSOLIDATE_CHUNK_SIZE 条先按时间顺序分块，每块单独调 AI。
-    大日子(2026-07-05 有 110 条)一次全喂，输出必撞 max_tokens 截断，事件被砍掉大半。"""
-    if len(fragments) <= CONSOLIDATE_CHUNK_SIZE:
-        return await _consolidate_fragment_chunk(fragments, event_date)
-
-    total = {"status": "ok", "fragments_processed": 0, "events_created": 0,
-             "fragments_uncovered": 0, "chunks": []}
-    for i in range(0, len(fragments), CONSOLIDATE_CHUNK_SIZE):
-        r = await _consolidate_fragment_chunk(fragments[i:i + CONSOLIDATE_CHUNK_SIZE], event_date)
-        total["chunks"].append(r)
-        if r.get("status") == "ok":
-            total["fragments_processed"] += r.get("fragments_processed", 0)
-            total["events_created"] += r.get("events_created", 0)
-            total["fragments_uncovered"] += r.get("fragments_uncovered", 0)
+    """Persist chunk candidates, align across boundaries, then write final L2 once."""
+    state = await _load_consolidation_state(event_date)
+    chunks = [
+        fragments[index:index + CONSOLIDATE_CHUNK_SIZE]
+        for index in range(0, len(fragments), CONSOLIDATE_CHUNK_SIZE)
+    ]
+    reports, candidates, candidate_groups, failed = [], [], [], []
+    for index, chunk in enumerate(chunks):
+        key = str(index)
+        source_ids = [int(item["id"]) for item in chunk]
+        cached = state["chunks"].get(key) or {}
+        if (cached.get("status") in {"validated", "ok"}
+                and cached.get("source_ids") == source_ids
+                and cached.get("events")):
+            reports.append({"status": "cached", "chunk": index,
+                            "fragments_processed": len(chunk),
+                            "events_created": len(cached.get("events") or [])})
+            candidates.extend(cached.get("events") or [])
+            candidate_groups.append(cached.get("events") or [])
+            continue
+        attempts = int(cached.get("attempts") or 0)
+        if attempts >= CONSOLIDATE_AUTO_MAX_ATTEMPTS:
+            failed.append((index, cached.get("error") or "自动尝试已用尽", True))
+            reports.append({"status": "error", "chunk": index, "attempts": attempts})
+            continue
+        result = await _consolidate_fragment_chunk(chunk, event_date, candidate_only=True)
+        attempts += max(1, int(result.get("paid_attempts") or 1))
+        if result.get("status") == "ok":
+            entry = {"status": "validated", "attempts": attempts, "source_ids": source_ids,
+                     "events": result.get("events") or [], "error": None}
+            state["chunks"][key] = entry
+            candidates.extend(entry["events"])
+            candidate_groups.append(entry["events"])
+            reports.append({"status": "validated", "chunk": index, "attempts": attempts,
+                            "fragments_processed": len(chunk),
+                            "events_created": len(entry["events"])})
         else:
-            # 某块失败不影响其它块；失败块的碎片未被停用，下一轮整理自动重试
-            total["status"] = "partial"
-    return total
+            final = attempts >= CONSOLIDATE_AUTO_MAX_ATTEMPTS
+            error = result.get("error") or "候选生成失败"
+            state["chunks"][key] = {"status": "failed",
+                                    "attempts": attempts, "source_ids": source_ids,
+                                    "events": [], "error": error}
+            failed.append((index, error, final))
+            reports.append({"status": "error",
+                            "chunk": index, "attempts": attempts, "error": error})
+
+    all_ids = {int(item["id"]) for item in fragments}
+    if failed:
+        for index, error, final in failed:
+            await _notify_consolidation_failure(
+                event_date, f"候选分块{index + 1}/{len(chunks)}", error, final, state
+            )
+        await _save_consolidation_state(event_date, state)
+        return {"status": "partial", "fragments_processed": len(fragments),
+                "events_created": 0, "fragments_uncovered": len(fragments),
+                "chunks": reports}
+
+    # Persist paid successful chunk candidates before the alignment call. If the
+    # process dies during alignment, tomorrow reuses them instead of paying for
+    # every chunk again.
+    await _save_consolidation_state(event_date, state)
+    align_attempts = int(state.get("align_attempts") or 0)
+    if len(chunks) == 1:
+        final_events = candidates
+        state["align_status"] = "ok"
+        state["final_events"] = final_events
+    elif state.get("align_status") == "ok" and state.get("final_events"):
+        final_events = state["final_events"]
+    elif align_attempts >= CONSOLIDATE_AUTO_MAX_ATTEMPTS:
+        final_events = candidates
+        state["align_status"] = "fallback"
+        print(
+            f"🚨 L2 {event_date} 跨块对齐预算已用尽，"
+            f"直接落库{len(final_events)}条已验收分块候选"
+        )
+    else:
+        aligned = await _align_consolidation_candidates(
+            candidates, all_ids, candidate_groups
+        )
+        state["align_attempts"] = align_attempts + max(
+            1, int(aligned.get("paid_attempts") or 1)
+        )
+        if aligned.get("status") != "ok":
+            final = state["align_attempts"] >= CONSOLIDATE_AUTO_MAX_ATTEMPTS
+            state["align_status"] = "fallback" if final else "failed"
+            state["align_error"] = aligned.get("error") or "跨块事件对齐失败"
+            if not final:
+                await _notify_consolidation_failure(
+                    event_date, "跨块事件对齐", state["align_error"], False, state
+                )
+                await _save_consolidation_state(event_date, state)
+                return {"status": "partial", "fragments_processed": len(fragments),
+                        "events_created": 0, "fragments_uncovered": len(fragments),
+                        "chunks": reports}
+            final_events = candidates
+            print(
+                f"🚨 L2 {event_date} 跨块对齐最终失败，"
+                f"直接落库{len(final_events)}条已验收分块候选：{state['align_error']}"
+            )
+        else:
+            final_events = aligned["events"]
+            state["align_status"] = "ok"
+            state["align_error"] = None
+            state["final_events"] = final_events
+
+    final_events, covered_ids, missing_ids = _consolidation_usable_events(
+        final_events, all_ids, f"{event_date}/最终落库"
+    )
+    created_ids = await commit_consolidation_events(
+        final_events, event_date, sorted(covered_ids)
+    )
+    created = len(created_ids)
+    for entry in state["chunks"].values():
+        if entry.get("status") == "validated":
+            entry["status"] = "ok"
+    state["status"] = "complete" if not missing_ids else "partial"
+    state["events_created"] = created
+    await _save_consolidation_state(event_date, state)
+    return {"status": "ok" if not missing_ids else "partial",
+            "fragments_processed": len(fragments),
+            "events_created": created, "fragments_uncovered": len(missing_ids),
+            "chunks": reports}
 
 
-async def _consolidate_fragment_chunk(fragments, event_date):
+async def _consolidate_fragment_chunk(fragments, event_date, candidate_only=False):
     """整理一块碎片的核心：AI 按事件分组合并 → 写 layer2 事件记忆 → 停用被合并的碎片"""
     import re
 
@@ -6611,7 +9493,7 @@ async def _consolidate_fragment_chunk(fragments, event_date):
     prompt = CONSOLIDATION_PROMPT.format(fragments=fragments_text)
     
     # 使用环境变量配置的模型，默认 haiku 节省成本
-    consolidation_model = os.getenv("MEMORY_MODEL", "") or os.getenv("DEFAULT_MODEL", "anthropic/claude-haiku-4.5")
+    consolidation_model = CONSOLIDATION_MODEL
     
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -6651,61 +9533,94 @@ async def _consolidate_fragment_chunk(fragments, event_date):
 
             data = response.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            paid_attempts = 1
             if data.get("choices", [{}])[0].get("finish_reason") == "length":
                 # 输出被 max_tokens 截断：直接放弃本块（碎片保持活跃，下轮重试），
                 # 绝不拿半截 JSON 去"修复"——修出来的残缺事件会让漏掉的碎片被误停用
                 return {"status": "error",
                         "error": f"输出被max_tokens截断(碎片{len(fragments)}条)，本块跳过"}
 
-            # 解析 JSON（三层容错）
-            json_match = re.search(r'\[[\s\S]*\]', content)
-            if json_match:
-                json_str = json_match.group()
-                try:
-                    events = json.loads(json_str)
-                except json.JSONDecodeError:
-                    # 方案1：用 strict=False
-                    try:
-                        events = json.loads(json_str, strict=False)
-                    except json.JSONDecodeError:
-                        # 方案2：去掉控制字符后重试
-                        cleaned = re.sub(r'[\x00-\x1f\x7f]', ' ', json_str)
-                        try:
-                            events = json.loads(cleaned)
-                        except json.JSONDecodeError as e:
-                            # 方案3：让 AI 重新格式化
-                            print(f"⚠️ JSON解析失败，尝试让AI修复: {e}")
-                            fix_resp = await client.post(
-                                API_BASE_URL,
-                                headers={
-                                    "Authorization": f"Bearer {get_memory_api_key()}",
-                                    "Content-Type": "application/json"
-                                },
-                                json={
-                                    "model": consolidation_model,
-                                    "messages": [{"role": "user", "content": f"请修复以下JSON的语法错误，只输出修复后的JSON数组，不要其他内容：\n{json_str[:2000]}"}],
-                                    "max_tokens": 2000
-                                }
-                            )
-                            if fix_resp.status_code == 200:
-                                fix_content = fix_resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-                                fix_match = re.search(r'\[[\s\S]*\]', fix_content)
-                                if fix_match:
-                                    try:
-                                        events = json.loads(fix_match.group())
-                                        print(f"✅ AI修复JSON成功")
-                                    except json.JSONDecodeError:
-                                        return {"status": "error", "error": f"JSON解析失败（AI修复也失败）", "raw": content[:500]}
-                                else:
-                                    return {"status": "error", "error": "AI修复未返回有效JSON", "raw": content[:500]}
-                            else:
-                                return {"status": "error", "error": f"JSON解析失败，AI修复请求失败: HTTP {fix_resp.status_code}", "raw": content[:500]}
-            else:
-                return {"status": "error", "error": "无法解析 AI 返回的 JSON", "raw": content}
+            # Fence/prose cleanup is local and free. If it still fails, spend
+            # the remaining paid attempt on a clean full-chunk regeneration.
+            events = _drop_non_object_items(
+                _parse_consolidation_array(content), f"{event_date}/分块候选"
+            )
+            if events is None:
+                preview = re.sub(r"\s+", " ", str(content or ""))[:300]
+                print(f"⚠️ L2整块JSON解析失败 raw={preview}")
+                if paid_attempts >= CONSOLIDATE_AUTO_MAX_ATTEMPTS:
+                    return {"status": "error", "paid_attempts": paid_attempts,
+                            "error": "整块JSON解析失败且付费额度已用尽"}
+                regen = await client.post(
+                    API_BASE_URL,
+                    headers={
+                        "Authorization": f"Bearer {get_memory_api_key()}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": consolidation_model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 6000,
+                    },
+                )
+                paid_attempts += 1
+                if regen.status_code != 200:
+                    return {"status": "error", "paid_attempts": paid_attempts,
+                            "error": f"整块重生成HTTP {regen.status_code}"}
+                regen_choice = (regen.json().get("choices") or [{}])[0]
+                if str(regen_choice.get("finish_reason") or "") == "length":
+                    return {"status": "error", "paid_attempts": paid_attempts,
+                            "error": "整块重生成输出超过6000 tokens"}
+                regen_content = (regen_choice.get("message") or {}).get("content", "")
+                events = _drop_non_object_items(
+                    _parse_consolidation_array(regen_content),
+                    f"{event_date}/分块重生成",
+                )
+                if events is None:
+                    preview = re.sub(r"\s+", " ", str(regen_content or ""))[:300]
+                    print(f"⚠️ L2整块重生成JSON解析失败 raw={preview}")
+                    return {"status": "error", "paid_attempts": paid_attempts,
+                            "error": "整块重生成JSON解析失败"}
+
+            fed_ids = {f['id'] for f in fragments}
+            repaired = {}
+            policy_error = _consolidation_events_policy_error(events, fed_ids)
+            if policy_error:
+                if paid_attempts >= CONSOLIDATE_AUTO_MAX_ATTEMPTS:
+                    print(f"🚨 L2整块验收预算已用尽，保留合法事件：{policy_error}")
+                else:
+                    repaired = await _repair_consolidation_events(
+                        client, consolidation_model, events, fragments, fed_ids, policy_error
+                    )
+                    paid_attempts += 1
+                    if repaired.get("status") == "ok":
+                        events = repaired["events"]
+                    else:
+                        print(
+                            f"🚨 L2定点修补失败，保留原候选合法事件："
+                            f"{repaired.get('error')}"
+                        )
+                    policy_error = _consolidation_events_policy_error(events, fed_ids)
+                    if policy_error:
+                        print(f"🚨 L2定点修补后仍有验收问题，降级落库：{policy_error}")
+                events, covered_ids, missing_ids = _consolidation_usable_events(
+                    events, fed_ids, f"{event_date}/分块"
+                )
+                if not events:
+                    return {"status": "error", "paid_attempts": paid_attempts,
+                            "error": "L2修补后没有可落库的合法事件"}
+            if candidate_only:
+                return {"status": "ok", "events": events,
+                        "paid_attempts": paid_attempts,
+                        "fragments_processed": len(fragments),
+                        "events_created": len(events),
+                        "fragments_uncovered": len(fed_ids - {
+                            memory_id for event in events
+                            for memory_id in event.get("merged_ids", [])
+                        })}
             
             # 创建事件记忆并停用碎片
             created_count = 0
-            fed_ids = {f['id'] for f in fragments}
             covered_ids = set()
             for event in events:
                 merged_ids = []
@@ -6730,13 +9645,17 @@ async def _consolidate_fragment_chunk(fragments, event_date):
             # 只停用真的被合并进事件的碎片——AI 漏掉的碎片保持活跃等下轮，
             # 绝不"喂了就算处理过"整批停用(2026-07-05 因此丢过一整晚 100 条)
             if covered_ids:
-                await deactivate_memories(sorted(covered_ids))
+                await absorb_consolidated_memories(sorted(covered_ids))
 
+            uncovered_count = len(fed_ids - covered_ids)
             return {
-                "status": "ok",
+                # An incomplete model grouping is not a successful day. Keep the
+                # uncovered fragments eligible for the next nightly retry and
+                # surface the partial result to the outer job/status endpoint.
+                "status": "ok" if uncovered_count == 0 else "partial",
                 "fragments_processed": len(fragments),
                 "events_created": created_count,
-                "fragments_uncovered": len(fed_ids - covered_ids)
+                "fragments_uncovered": uncovered_count
             }
             
     except Exception as e:
@@ -6803,13 +9722,46 @@ async def api_consolidate_status():
 
 
 # ===== 凌晨自动整理（按「逻辑日」，GitHub Actions 定时触发）=====
-# 逻辑日 = 当天 boundary 点 ~ 次日 boundary 点（北京时间，默认凌晨4点）。
+# 逻辑日 = 当天 boundary 点 ~ 次日 boundary 点（新加坡时间，默认凌晨4点）。
 # 跨零点的连续对话（23:00 聊到 01:30）落在同一个逻辑日里，不会被日历日切成两半。
 AUTO_CONSOLIDATE_LOOKBACK_DAYS = int(os.getenv("AUTO_CONSOLIDATE_LOOKBACK_DAYS", "3"))
 AUTO_CONSOLIDATE_BOUNDARY_HOUR = int(os.getenv("AUTO_CONSOLIDATE_BOUNDARY_HOUR", "4"))
 
 
-async def auto_consolidate_recent(lookback_days=None, dry_run=False):
+def _consolidation_overall_status(report: list) -> str:
+    return "partial_error" if any(
+        str(item.get("status") or "") in {"error", "fail", "partial"}
+        for item in (report or [])
+    ) else "ok"
+
+
+async def _reset_forced_consolidation_day(event_date):
+    """Clear retry brakes while preserving reusable validated candidates."""
+    state = await _load_consolidation_state(event_date)
+    for entry in state.get("chunks", {}).values():
+        entry["attempts"] = 0
+        if entry.get("events"):
+            entry["status"] = "validated"
+            entry["error"] = None
+        else:
+            entry["status"] = "pending"
+            entry["error"] = None
+    # One fresh alignment try per forced run, not a full budget. A full reset
+    # made the rescue path non-convergent: each run spends exactly one attempt,
+    # so align_attempts could never reach the ceiling that releases the
+    # "give up aligning, commit the already-validated chunk candidates"
+    # fallback, and a day whose alignment keeps failing was retried forever
+    # without ever landing its events (2026-08-18).
+    state["align_attempts"] = max(0, CONSOLIDATE_AUTO_MAX_ATTEMPTS - 1)
+    state["align_status"] = "pending"
+    state["align_error"] = None
+    state.pop("final_events", None)
+    state["status"] = "forced_retry"
+    await _save_consolidation_state(event_date, state)
+
+
+async def auto_consolidate_recent(lookback_days=None, dry_run=False,
+                                  force_days=None):
     """整理最近 lookback_days 个已结束的逻辑日的碎片。
 
     - 只看最近几天：漏跑的中间天会自动补上，但更早的积压
@@ -6825,29 +9777,48 @@ async def auto_consolidate_recent(lookback_days=None, dry_run=False):
     # 最近一个已结束的逻辑日：过了今天 boundary 点，昨天的逻辑日才算结束
     anchor = now_local.date() if now_local.hour >= boundary else now_local.date() - timedelta(days=1)
     days = [anchor - timedelta(days=i) for i in range(lookback_days, 0, -1)]  # 从旧到新
+    forced = set()
+    for value in force_days or []:
+        forced_day = datetime.strptime(str(value), "%Y-%m-%d").date()
+        forced.add(forced_day)
+        if forced_day not in days:
+            days.append(forced_day)
+    days.sort()
 
     report = []
     for d in days:
         start_local = datetime(d.year, d.month, d.day, boundary, tzinfo=local_tz)
         end_local = start_local + timedelta(days=1)
-        fragments = await get_fragments_by_time_window(
-            start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc))
+        if d in forced:
+            fragments = await get_uncovered_fragments_by_time_window(
+                start_local.astimezone(timezone.utc),
+                end_local.astimezone(timezone.utc),
+            )
+        else:
+            fragments = await get_fragments_by_time_window(
+                start_local.astimezone(timezone.utc),
+                end_local.astimezone(timezone.utc),
+            )
         if not fragments:
             continue
         if dry_run:
-            report.append({"day": str(d), "fragments": len(fragments), "dry_run": True})
+            report.append({"day": str(d), "fragments": len(fragments),
+                           "dry_run": True, "forced": d in forced})
             continue
+        if d in forced:
+            await _reset_forced_consolidation_day(d)
         result = await _consolidate_fragment_batch(fragments, d)
         result["day"] = str(d)
         report.append(result)
         print(f"[auto/consolidate] 逻辑日 {d}: {result}")
 
     summary = {
-        "status": "ok",
+        "status": _consolidation_overall_status(report),
         "checked_days": [str(d) for d in days],
         "processed": report,
         "ran_at": now_local.strftime("%Y-%m-%d %H:%M"),
         "dry_run": dry_run,
+        "force_days": sorted(str(day) for day in forced),
     }
     if not dry_run:
         try:
@@ -6859,7 +9830,7 @@ async def auto_consolidate_recent(lookback_days=None, dry_run=False):
 
 @app.post("/api/memories/consolidate/auto")
 async def api_auto_consolidate(request: Request):
-    """凌晨自动整理入口。body 可选: {"dry_run": true, "lookback_days": 3}
+    """凌晨自动整理入口。body 可选: dry_run, lookback_days, force_days。
     dry_run 同步返回将要处理的天和碎片数；正式跑异步执行，结果查 /api/memories/consolidate/status
     """
     if not MEMORY_ENABLED:
@@ -6869,17 +9840,35 @@ async def api_auto_consolidate(request: Request):
     except Exception:
         data = {}
     lookback = data.get("lookback_days")
+    force_days = data.get("force_days") or []
+    if not isinstance(force_days, list):
+        return {"error": "force_days 必须是日期字符串数组"}
+    try:
+        force_days = [
+            str(datetime.strptime(str(value), "%Y-%m-%d").date())
+            for value in force_days
+        ]
+    except ValueError:
+        return {"error": "force_days 日期格式必须为 YYYY-MM-DD"}
 
     if data.get("dry_run"):
-        return await auto_consolidate_recent(lookback, dry_run=True)
+        return await auto_consolidate_recent(
+            lookback, dry_run=True, force_days=force_days
+        )
 
     if _consolidate_status.get("running"):
         return {"status": "already_running", "started_at": _consolidate_status.get("started_at")}
 
+    # Mark running before returning the HTTP response. If this is only done
+    # inside the scheduled coroutine, an immediate status poll can observe the
+    # previous completed job and falsely conclude that this run has finished.
+    _consolidate_status.update({"running": True, "started_at": "auto", "result": None, "error": None})
+
     async def _run():
-        _consolidate_status.update({"running": True, "started_at": "auto", "result": None, "error": None})
         try:
-            result = await auto_consolidate_recent(lookback)
+            result = await auto_consolidate_recent(
+                lookback, force_days=force_days
+            )
             _consolidate_status["result"] = result
             print(f"[auto/consolidate] 完成: {result}")
         except Exception as e:
@@ -6889,7 +9878,7 @@ async def api_auto_consolidate(request: Request):
             _consolidate_status["running"] = False
 
     asyncio.create_task(_run())
-    return {"status": "started", "mode": "auto"}
+    return {"status": "started", "mode": "auto", "force_days": force_days}
 
 
 @app.post("/api/migrate/memory-wall")
@@ -6908,7 +9897,7 @@ async def api_migrate_memory_wall(request: Request):
     password = body.get("password") or ""
     dry_run = bool(body.get("dry_run", False))
     summary_threshold = int(body.get("summary_threshold", 400))
-    author_cn_map = {"ruanruan": USER_NAME, "xiaoke": (AI_NAME or "AI")}
+    author_cn_map = {"ruanruan": "Harper", "xiaoke": "V"}
 
     # 1) 服务端拉取回忆墙全部条目
     try:
@@ -7037,8 +10026,10 @@ async def api_get_photo(photo_id: int):
 @app.get("/api/imagegen/status")
 async def api_imagegen_status():
     """画图(/画)当前配置——给操作间 DRAW 面板。key 只报"设没设",真值绝不回传。"""
-    eff_base = (IMAGE_GEN_BASE_URL or getattr(_db_module, "EMBEDDING_BASE_URL", "") or "").rstrip("/")
+    _, eff_base = _imagegen_effective_config()
     own_key = bool(IMAGE_GEN_API_KEY)
+    v_reference = _load_imagegen_reference(IMAGE_GEN_V_REFERENCE_PATH)
+    harper_reference = _load_imagegen_reference(IMAGE_GEN_HARPER_REFERENCE_PATH)
     return {
         "enabled": IMAGE_GEN_ENABLED,
         "model": IMAGE_GEN_MODEL,
@@ -7046,9 +10037,41 @@ async def api_imagegen_status():
         "base_url": eff_base,                        # 实际生效的地址(可能是复用向量检索那套)
         "own_base": bool(IMAGE_GEN_BASE_URL),        # 是否单独设了画图地址
         "own_key": own_key,                          # 是否单独设了画图 key
-        "key_set": own_key or bool(getattr(_db_module, "EMBEDDING_API_KEY", "")),
+        "key_set": bool(_imagegen_effective_config()[0]),
+        "reference_enabled": IMAGE_GEN_REFERENCE_ENABLED,
+        "v_reference_ready": bool(v_reference),
+        "harper_reference_ready": bool(harper_reference),
         "last_error": _imagegen_last_error,          # 最近一次存图失败的真实报错(成功后自动清空)
     }
+
+
+@app.get("/api/desire/lexicon")
+async def api_desire_lexicon():
+    """Return the private lexicon and its recent audit trail."""
+    try:
+        return desire_lexicon_snapshot(audit_limit=40)
+    except LexiconError as error:
+        return JSONResponse(status_code=500, content={"error": str(error)})
+
+
+@app.post("/api/desire/lexicon/mutate")
+async def api_mutate_desire_lexicon(request: Request):
+    """Add/remove one term only; the private file is never replaced wholesale."""
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise LexiconError("请求格式不正确")
+        return mutate_desire_lexicon(
+            action=body.get("action"),
+            group=body.get("group"),
+            term=body.get("term"),
+            actor=body.get("actor"),
+            reason=body.get("reason", ""),
+        )
+    except LexiconError as error:
+        return JSONResponse(status_code=400, content={"error": str(error)})
+    except (json.JSONDecodeError, TypeError):
+        return JSONResponse(status_code=400, content={"error": "请求格式不正确"})
 
 
 # ============================================================
@@ -7057,7 +10080,12 @@ async def api_imagegen_status():
 # 因此它们也能被检索/注入给 AI（守铁律：界面可见=AI可感知）。
 # ============================================================
 
-MW_AUTHOR_CN = {"ruanruan": USER_NAME, "xiaoke": (AI_NAME or "AI")}
+MW_AUTHOR_CN = {
+    "ruanruan": "Harper",
+    "xiaoke": "V",
+    "v": "V",
+    "harper": "Harper",
+}
 MW_SUMMARY_THRESHOLD = 400
 
 
@@ -7080,20 +10108,44 @@ def _extract_mw_body(content):
     return "\n\n".join(rest)
 
 
+def _memorywall_summary_is_valid(summary, author):
+    """回忆墙检索摘要的统一入口校验；V 写的卡片必须保持 V 第一人称。"""
+    s = str(summary or "").strip()
+    if not s or "\n" in s or _summary_word_count(s) > DAILY_DIARY_SUMMARY_MAX_CHARS:
+        return False
+    if re.search(r"(^|\s)#{1,6}\s|[*_`]|用户", s):
+        return False
+    if not re.search(r"[。！？.!?]$", s):
+        return False
+    normalized_author = str(author or "").strip().lower()
+    if normalized_author in {"xiaoke", "v"} and "我" not in s:
+        return False
+    return True
+
+
+def _memorywall_summary_fallback(body, author):
+    # Never promote an arbitrary opening sentence to a searchable wall summary.
+    # Callers already made a model summarization attempt from the full body; if it
+    # is invalid, leaving the summary empty is safer than inventing a false digest.
+    return ""
+
+
 def _mw_item(row):
     mm = row.get("mw_meta") or {}
+    event_date = str(row["event_date"]) if row.get("event_date") else None
     return {
         "id": row["id"],
         "title": row.get("title") or mm.get("title") or "",
         "body": mm.get("body") or _extract_mw_body(row.get("content") or ""),
+        "summary": mm.get("summary") or "",
         "author": mm.get("author"),
         "author_cn": mm.get("author_cn") or MW_AUTHOR_CN.get(mm.get("author"), mm.get("author")),
         "mood": mm.get("mood"),
         "source": mm.get("source"),
         "is_period_day": mm.get("is_period_day"),
         "location": mm.get("location"),
-        "date": mm.get("date") or (str(row.get("created_at")) if row.get("created_at") else None),
-        "event_date": str(row["event_date"]) if row.get("event_date") else None,
+        "date": event_date or mm.get("date") or (str(row.get("created_at")) if row.get("created_at") else None),
+        "event_date": event_date,
         "importance": row.get("importance"),
         "is_active": row.get("is_active"),
         "pinned": bool(mm.get("pinned")),
@@ -7125,13 +10177,18 @@ async def api_mw_create(request: Request):
         is_period = 1 if b.get("is_period_day") else 0
         location = b.get("location") or None
         created_at = b.get("date") or datetime.now(timezone.utc).isoformat()
-        summary = ""
-        if len(body) > MW_SUMMARY_THRESHOLD:
+        event_date = b.get("event_date") or created_at
+        summary = str(b.get("summary") or "").strip() if "summary" in b else ""
+        if summary and not _memorywall_summary_is_valid(summary, author):
+            return JSONResponse(status_code=400, content={"error": "检索摘要人称、长度或格式不合格"})
+        if "summary" not in b and len(body) > MW_SUMMARY_THRESHOLD:
             try:
                 summary = await generate_summary([{"role": "user", "content": f"{title}\n{body}"}])
             except Exception as se:
                 print(f"⚠️ 回忆摘要生成失败: {se}")
-        content = _compose_mw_content(title, body, author, mood, created_at, summary)
+            if not _memorywall_summary_is_valid(summary, author):
+                summary = _memorywall_summary_fallback(body, author)
+        content = _compose_mw_content(title, body, author, mood, event_date, summary)
         importance = 9 if mood == "纪念" else 8
         mw_meta = {"original_id": f"dash-{int(datetime.now().timestamp()*1000)}",
                    "date": created_at, "author": author,
@@ -7140,7 +10197,7 @@ async def api_mw_create(request: Request):
                    "location": location, "title": title, "body": body,
                    "summary": summary, "pinned": bool(b.get("pinned")), "photos": []}
         mid = await save_migrated_memory(content=content, importance=importance, title=title,
-                                         event_date=created_at, created_at=created_at, mw_meta=mw_meta)
+                                         event_date=event_date, created_at=created_at, mw_meta=mw_meta)
         one = await get_memorywall_one(mid)
         return {"status": "ok", "item": _mw_item(one) if one else {"id": mid}}
     except Exception as ex:
@@ -7167,20 +10224,34 @@ async def api_mw_update(mid: int, request: Request):
     location = b.get("location") if "location" in b else mm.get("location")
     pinned = bool(b.get("pinned")) if "pinned" in b else bool(mm.get("pinned"))
     created_at = b.get("date") or mm.get("date") or (str(existing.get("created_at")) if existing.get("created_at") else datetime.now(timezone.utc).isoformat())
-    summary = ""
-    if len(body) > MW_SUMMARY_THRESHOLD:
-        try:
-            summary = await generate_summary([{"role": "user", "content": f"{title}\n{body}"}])
-        except Exception as se:
-            print(f"⚠️ 回忆摘要更新失败: {se}")
-    content = _compose_mw_content(title, body, author, mood, created_at, summary)
+    # event_date 是回忆归属的逻辑日期，不能从带时区的保存时间重新推导。
+    # 旧客户端不传时严格保留原值；新页面只有用户改日期框才会改变它。
+    event_date = b.get("event_date") or (str(existing.get("event_date")) if existing.get("event_date") else str(created_at)[:10])
+    if "summary" in b:
+        summary = str(b.get("summary") or "").strip()
+        if summary and not _memorywall_summary_is_valid(summary, author):
+            return JSONResponse(status_code=400, content={"error": "检索摘要人称、长度或格式不合格"})
+    else:
+        # 人工编辑以现有摘要为准：改正文、标题或其他资料都不得暗中调用模型
+        # 重写昨日桥。只有客户端显式提交 summary 时才更新（显式空值=人工清空）。
+        summary = str(mm.get("summary") or "").strip()
+    content = _compose_mw_content(title, body, author, mood, event_date, summary)
     importance = 9 if mood == "纪念" else 8
     new_meta = dict(mm)
     new_meta.update({"date": created_at, "author": author, "author_cn": MW_AUTHOR_CN.get(author, author or ""),
                      "mood": mood, "source": source, "is_period_day": is_period, "location": location,
                      "title": title, "body": body, "summary": summary, "pinned": pinned})
-    await update_memorywall(mid, content, title, importance, created_at, new_meta)
+    await update_memorywall(mid, content, title, importance, event_date, new_meta)
     one = await get_memorywall_one(mid)
+    # 每日回忆墙的“昨日桥”被人工定稿后，必须立即覆盖 L2 的运行态与
+    # 持久态；否则回忆墙虽已保存，V 仍会读到夜间生成时复制的旧桥。
+    event_date_s = str((one or {}).get("event_date") or "")
+    yesterday_s = str(_l2_logical_today() - timedelta(days=1))
+    if source == "daily_diary" and event_date_s == yesterday_s:
+        _l2_state["bridge"] = summary
+        _l2_state["bridge_date"] = yesterday_s
+        await set_gateway_config("l2_bridge", summary)
+        await set_gateway_config("l2_bridge_date", yesterday_s)
     return {"status": "ok", "item": _mw_item(one) if one else {"id": mid}}
 
 
@@ -7321,11 +10392,72 @@ async def api_l2_refresh(request: Request):
             "today": _l2_state.get("today", ""), "bridge": _l2_state.get("bridge", "")}
 
 
+L2_OPEN_REFRESH_WAIT_S = float(os.getenv("L2_OPEN_REFRESH_WAIT_S", "8"))
+
+
+async def _l2_refresh_for_opening() -> str:
+    """Refresh the digest at thread-open, the one moment cyberboss reads it.
+
+    The digest is injected exactly once per thread, in its opening turn, so a
+    turn-counter cadence could hand a brand-new thread an hours-old snapshot
+    (2026-08-19: a thread opened 15:30 onto the 11:30 digest and V replayed a
+    stale line as if it were now). Two rules keep this from ever being worse
+    than the old behaviour: never block the opening for long, and never let a
+    failed generation blank a good digest — on timeout or error the caller
+    keeps the stored one while the background refresh still lands for the
+    next open. Returns a short outcome tag for the log.
+    """
+    today_s = str(_l2_logical_today())
+    updated_at = _l2_state.get("updated_at")
+    if _l2_state.get("date") == today_s and updated_at:
+        try:
+            rows = await get_recent_conversation_messages(_l2_digest_session_id(), limit=1)
+            newest = rows[-1].get("created_at") if rows else None
+            previous = datetime.fromisoformat(str(updated_at))
+            if previous.tzinfo is None:
+                previous = previous.replace(tzinfo=timezone.utc)
+            if newest is not None:
+                if newest.tzinfo is None:
+                    newest = newest.replace(tzinfo=timezone.utc)
+                if newest <= previous:
+                    print("ℹ️ L2开场刷新: 距上次生成无新对话，直接用现成的")
+                    return "already_fresh"
+        except Exception as exc:
+            print(f"⚠️ L2开场刷新: 新鲜度判断失败({type(exc).__name__})，仍照常刷新")
+    task = asyncio.ensure_future(_refresh_l2_guarded(_l2_digest_session_id()))
+    try:
+        # shield: 超时只放弃等待，后台那次生成继续跑完并落库，供下次开线程用。
+        digest = await asyncio.wait_for(asyncio.shield(task), timeout=L2_OPEN_REFRESH_WAIT_S)
+    except asyncio.TimeoutError:
+        print(f"🚨 L2开场刷新: 超过{L2_OPEN_REFRESH_WAIT_S:.0f}秒未出稿，本次用现成的，后台继续")
+        return "timeout_used_stored"
+    except Exception as exc:
+        print(f"🚨 L2开场刷新: 生成异常({type(exc).__name__})，本次用现成的")
+        return "error_used_stored"
+    if digest:
+        print(f"✅ L2开场刷新: 已刷新 {len(digest)}字")
+        return "refreshed"
+    print("🚨 L2开场刷新: 本次没产出，用现成的（旧稿保留，未清空）")
+    return "empty_used_stored"
+
+
 @app.get("/api/l2")
-async def api_l2_get():
-    """② L2今日视图：当前注入的今日浓缩 + 昨日桥。"""
+async def api_l2_get(for_opening: bool = False):
+    """② L2今日视图：当前注入的今日浓缩 + 昨日桥。
+
+    for_opening=1 只由 cyberboss 开新线程时传——浓缩只在那一刻被读，就只在
+    那一刻按需刷新。普通调用绝不触发生成：这个接口还被昨日桥按每条消息轮询，
+    无条件刷新等于每说一句话烧一次模型钱。
+    """
+    open_refresh = ""
+    if for_opening and L2_TODAY_ENABLED:
+        open_refresh = await _l2_refresh_for_opening()
     return {"date": _l2_state.get("date"), "len": len(_l2_state.get("today") or ""),
-            "today": _l2_state.get("today", ""), "bridge": _l2_state.get("bridge", "")}
+            "today": _l2_state.get("today", ""), "updated_at": _l2_state.get("updated_at"),
+            "last_attempt_at": _l2_state.get("last_attempt_at"), "last_status": _l2_state.get("last_status"),
+            "bridge": _l2_state.get("bridge", ""),
+            "bridge_date": _l2_state.get("bridge_date"),
+            "open_refresh": open_refresh}
 
 
 @app.get("/api/persona-suggestions")
@@ -7550,7 +10682,7 @@ async def api_debug_token_breakdown(message: str = "宝贝我到家了"):
     summary_parts = state.get("summary_parts") or []
     summary_text = "\n".join(summary_parts)
     a_start = state.get("a_start_round", 0)
-    history = await get_conversation_messages(sid, limit=100000) if sid else []
+    history = await get_conversation_messages(sid) if sid else []
     rounds = group_by_rounds(history)
     X = CACHE_PARTITION_X
     a_msgs = [m for rnd in rounds[a_start:a_start + X] for m in rnd]
@@ -8513,6 +11645,8 @@ async def get_settings():
             "MEMORY_ENABLED":          _parse_bool(db.get("MEMORY_ENABLED"), MEMORY_ENABLED),
             "MEMORY_API_KEY":          _mask_key(memory_key_raw),
             "MEMORY_MODEL":            db.get("MEMORY_MODEL") or os.environ.get("MEMORY_MODEL", ""),
+            "MEMORY_EXTRACT_MODEL":    db.get("MEMORY_EXTRACT_MODEL") or str(MEMORY_EXTRACT_MODEL),
+            "CONSOLIDATION_MODEL":     db.get("CONSOLIDATION_MODEL") or str(CONSOLIDATION_MODEL),
             "MAX_MEMORIES_INJECT":     int(db.get("MAX_MEMORIES_INJECT") or MAX_MEMORIES_INJECT),
             "MIN_SCORE_THRESHOLD":     float(db.get("MIN_SCORE_THRESHOLD") or _db_module.MIN_SCORE_THRESHOLD),
             "MEMORY_EXTRACT_INTERVAL": int(db.get("MEMORY_EXTRACT_INTERVAL") or MEMORY_EXTRACT_INTERVAL),
@@ -8598,6 +11732,9 @@ async def save_settings(request: Request):
             "IMAGE_GEN_BASE_URL":    str,
             "IMAGE_GEN_API_KEY":     str,
             "IMAGE_GEN_SIZE":        str,
+            "IMAGE_GEN_REFERENCE_ENABLED": lambda v: _parse_bool(v),
+            "IMAGE_GEN_V_REFERENCE_PATH": str,
+            "IMAGE_GEN_HARPER_REFERENCE_PATH": str,
             "USER_NAME":             str,
             "AI_NAME":               str,
             "HEALTH_SAFETY_NOTE":    str,
@@ -8632,7 +11769,11 @@ async def save_settings(request: Request):
         }
 
         # 只存 os.environ 的变量
-        _ENV_ONLY = {"MEMORY_MODEL": str}
+        _ENV_ONLY = {
+            "MEMORY_MODEL": str,
+            "MEMORY_EXTRACT_MODEL": str,
+            "CONSOLIDATION_MODEL": str,
+        }
 
         # 打码字段
         _MASKED_KEYS = {"API_KEY", "EMBEDDING_API_KEY", "MEMORY_API_KEY"}
@@ -8707,6 +11848,10 @@ async def save_settings(request: Request):
             elif key in _ENV_ONLY:
                 typed_value = _ENV_ONLY[key](value)
                 os.environ[key] = str(typed_value)
+                globals()[key] = typed_value
+                if key == "MEMORY_EXTRACT_MODEL":
+                    import memory_extractor as _me_mod
+                    _me_mod.MEMORY_EXTRACT_MODEL = typed_value
                 updated.append(key)
                 print(f"[settings] {key} = {typed_value} (env)")
 
@@ -8940,7 +12085,7 @@ _selfserve_backup = None  # 最近一次删除的内存备份(撤销用;另持�
 async def _selfserve_fix_summary(session_id: str, full_rebuild: bool) -> dict:
     """删后修 A区滚动摘要。full_rebuild=False(尾删):按剩余对话重算应有段数→截断已有段(便宜,不重压,前缀段未变);
        True(中间删):逐窗 generate_summary 整段重压(慢、含haiku、但干净无残痕)。"""
-    history = await get_conversation_messages(session_id, limit=100000)
+    history = await get_conversation_messages(session_id)
     rounds = group_by_rounds(history)
     X = CACHE_PARTITION_X
     state = await get_session_cache_state(session_id)
@@ -9138,6 +12283,367 @@ async def api_dreams_regenerate(request: Request):
         except Exception as e:
             out.append({"date": str(d), "ok": False, "error": str(e)})
     return {"dry_run": dry, "results": out}
+
+
+def _desire_json(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, list):
+        return [_desire_json(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _desire_json(item) for key, item in value.items()}
+    return value
+
+
+@app.get("/api/desire/state")
+async def api_desire_state():
+    enabled = os.getenv("V_DESIRE_ENABLED", "1") == "1"
+    if not enabled or not _desire_store:
+        return {"enabled": enabled, "drives": {}, "scores": {}, "intent": None, "thoughts": [], "pulses": [], "gates": {"driven": False}}
+    now = datetime.now(timezone.utc)
+    state, last_tick = await _desire_store.load(now)
+    intent = pick_intent(state)
+    from desire import desire_scores
+    return _desire_json({
+        "enabled": True, "drives": state.drives, "baselines": __import__("desire").BASELINES,
+        "scores": desire_scores(state), "intent": vars(intent), "thoughts": [vars(t) for t in state.thoughts],
+        "followups": await _desire_store.list_open_followups(20),
+        "pulses": await _desire_store.recent_pulses(20), "updated_at": last_tick,
+        "gates": {"driven": bool(_desire_scheduler and _desire_scheduler.driven),
+                  "threshold": _desire_scheduler.threshold if _desire_scheduler else 0.70,
+                  "thresholds": _desire_scheduler.thresholds if _desire_scheduler else {},
+                  "daily_cap": _desire_scheduler.daily_cap if _desire_scheduler else 6},
+    })
+
+
+@app.get("/api/desire/wakes")
+async def api_desire_wakes():
+    if not _desire_store:
+        return {"enabled": False, "wakes": []}
+    rows = list(reversed(await _desire_store.recent_wake_events(240)))
+    wakes = {}
+    for row in rows:
+        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        wake_id = str(meta.get("wake_id") or "").strip()
+        if not wake_id:
+            continue
+        item = wakes.setdefault(wake_id, {
+            "wake_id": wake_id, "started_at": None, "finished_at": None,
+            "origin": "", "drive_key": row.get("drive_key") or "",
+            "score": None, "reason": "", "want_action": "",
+            "actions": [], "peek": "none", "outcome": "running", "message": "",
+        })
+        event_type = row.get("event_type")
+        created_at = row.get("created_at")
+        item["drive_key"] = item["drive_key"] or row.get("drive_key") or str(meta.get("drive_key") or "")
+        if event_type == "desire_wake_started":
+            item.update({
+                "started_at": created_at, "origin": str(meta.get("origin") or ""),
+                "score": meta.get("score"), "reason": str(meta.get("reason") or ""),
+                "want_action": str(meta.get("want_action") or ""),
+            })
+        elif event_type == "desire_wake_action":
+            item["actions"].append({
+                "tool": str(meta.get("tool_name") or ""),
+                "ok": meta.get("ok") is True, "at": created_at,
+            })
+            if str(meta.get("tool_name") or "") == "cyberboss_peek_screen":
+                item["peek"] = "requested"
+        elif event_type == "desire_wake_peek_arrived":
+            item["peek"] = "arrived"
+        elif event_type == "desire_wake_finished":
+            item["finished_at"] = created_at
+            item["outcome"] = str(meta.get("outcome") or "finished")
+            item["message"] = str(meta.get("message") or "")[:240]
+    result = sorted(
+        wakes.values(), key=lambda item: str(item.get("started_at") or ""), reverse=True,
+    )[:50]
+    return _desire_json({"enabled": True, "wakes": result})
+
+
+@app.post("/api/desire/pulse")
+async def api_desire_pulse(request: Request):
+    data = await request.json()
+    applied = await _apply_desire_event(str(data.get("event_type") or "")[:64], str(data.get("source_ref") or "")[:200],
+                                        str(data.get("drive_key") or ""), None, data.get("meta") or {})
+    return {"ok": True, "applied_pulses": applied}
+
+
+@app.post("/api/desire/probe-unanswered")
+async def api_desire_probe_unanswered(request: Request):
+    """Probe recent cyberboss dialogue; dry-run by default, explicit apply only."""
+    if not _desire_store or not _desire_batcher:
+        return {"ok": False, "error": "desire_disabled"}
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    dry_run = bool(data.get("dry_run", True))
+    rounds = max(4, min(30, int(data.get("rounds") or 20)))
+    rows = await get_recent_messages(CYBERBOSS_LINE_ID, rounds)
+    dialogue = [
+        row for row in rows
+        if str(row.get("role") or "") in ("user", "assistant")
+        and str(row.get("content") or "").strip()
+    ]
+    context = "\n".join(
+        f"{'她' if str(row.get('role') or '') == 'user' else 'V'}：{str(row.get('content') or '').strip()}"
+        for row in dialogue
+    )[-6000:]
+    latest_user = next(
+        (str(row.get("content") or "").strip() for row in reversed(dialogue)
+         if str(row.get("role") or "") == "user"),
+        "〔只读回看最近对话〕",
+    )
+    from desire_pulse import PendingClassification
+    item = PendingClassification(f"manual-probe:{uuid.uuid4()}", latest_user[:1000], context)
+    results = await _desire_batcher._request([item])
+    result = results[0] if results else {}
+    accepted_items = _desire_batcher._validated_unanswered_items(result, item)
+    if accepted_items and not dry_run:
+        apply_result = dict(result)
+        apply_result["needs_reflection"] = False
+        apply_result["_unanswered_accepted"] = accepted_items
+        await _apply_deepseek_desire_results([apply_result])
+    fields = [{
+        key: candidate.get(key) for key in (
+            "unanswered_status", "unanswered_kind", "unanswered_event_key",
+            "unanswered_drive_key", "unanswered_confidence", "unanswered_intensity",
+            "v_evidence", "unanswered_thought",
+        )
+    } for candidate in accepted_items]
+    return {"ok": True, "dry_run": dry_run, "accepted": bool(accepted_items), "results": fields}
+
+
+@app.post("/api/desire/feed")
+async def api_desire_feed(request: Request):
+    if not _desire_store:
+        return {"ok": False, "error": "desire_disabled"}
+    data, now = await request.json(), datetime.now(timezone.utc)
+    state, last_tick = await _desire_store.load(now)
+    before = len(state.thoughts)
+    state = feed_thought(state, str(data.get("text") or ""), str(data.get("drive_key") or ""),
+                         str(data.get("kind") or "flit"), float(data.get("strength") or 0.5), now)
+    await _desire_store.save(state, last_tick, now)
+    return {"ok": len(state.thoughts) >= before, "thought_id": None}
+
+
+@app.post("/api/desire/tick")
+async def api_desire_tick():
+    if not _desire_scheduler:
+        return {"ok": False, "error": "desire_disabled"}
+    result = await _desire_scheduler.run_once()
+    state = result.pop("state", None)
+    if state:
+        result["new_state"] = state_dict(state)
+    return _desire_json({"ok": True, **result})
+
+
+@app.post("/api/desire/reset")
+async def api_desire_reset(request: Request):
+    data = await request.json()
+    if data.get("confirm") is not True:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "confirm_required"})
+    if not _desire_store:
+        return {"ok": False, "error": "desire_disabled"}
+    await _desire_store.reset(datetime.now(timezone.utc))
+    return {"ok": True}
+
+
+async def _arousal_drive_snapshot(requested=None):
+    """Return only the five approved numeric drive values."""
+    allowed = ("libido", "attachment", "fatigue", "stress", "duty")
+    values = {}
+    if _desire_store:
+        state, _ = await _desire_store.load(datetime.now(timezone.utc))
+        values.update({key: state.drives.get(key) for key in allowed if key in state.drives})
+    if isinstance(requested, dict):
+        for key in allowed:
+            if key in requested and key not in values:
+                values[key] = requested[key]
+    clean = {}
+    for key, raw in values.items():
+        try:
+            value = float(raw)
+            if value == value and value not in (float("inf"), float("-inf")):
+                clean[key] = max(0.0, min(1.0, value))
+        except (TypeError, ValueError):
+            pass
+    clean.setdefault("libido", __import__("desire").BASELINES["libido"])
+    return clean
+
+
+def _arousal_libido_target(body_value):
+    """Map BODY buildup onto the LIBIDO overview without making them one gauge."""
+    baseline = __import__("desire").BASELINES["libido"]
+    try:
+        body = max(0.0, min(1.0, float(body_value)))
+    except (TypeError, ValueError):
+        body = 0.0
+    # BODY remains the fast physical state. LIBIDO is the overview drive and may
+    # lead it from explicit desire, but physical buildup must never leave LIBIDO
+    # pinned at baseline.
+    return baseline + (1.0 - baseline) * body
+
+
+async def _follow_arousal_with_libido(state, event_id, now, credit_event_id=""):
+    """Raise LIBIDO to the BODY envelope; decay/release own the downward path."""
+    if not _desire_store:
+        return
+    snapshot = public_snapshot(state, now)
+    body_value = snapshot.get("value", 0.0)
+    receipt = pending_release_effect(state, now)
+    if receipt:
+        # A release resets BODY inside the same transaction. Its durable receipt
+        # carries the pre-reset peak so LIBIDO does not miss the strongest event.
+        body_value = max(body_value, receipt.get("body_value", 0.0))
+    target = _arousal_libido_target(body_value)
+    desire_state, _ = await _desire_store.load(datetime.now(timezone.utc))
+    current = float(desire_state.drives.get("libido", 0.0))
+    if target <= current + 1e-9:
+        return
+    # desire.pulse applies diminishing returns to positive input. Compensate so
+    # the committed result reaches the BODY-derived target exactly.
+    headroom = max(1e-12, 1.0 - current) ** 0.5
+    await _apply_desire_event(
+        "arousal_buildup", source_ref=f"arousal_buildup:{event_id}",
+        drive_key="libido", explicit_delta=(target - current) / headroom,
+        meta={
+            "body_value": body_value, "target": target,
+            "event_id": str(credit_event_id or event_id).rsplit(":", 1)[-1],
+            "body_event_id": str(event_id),
+        },
+    )
+
+
+async def _deliver_arousal_effects(state, now):
+    """Deliver outside the state transaction, acking each durable target."""
+    receipt = pending_release_effect(state, now)
+    if not receipt or not _arousal_store:
+        return
+    effect_id = receipt["effect_id"]
+    if not receipt["targets"].get("somatic"):
+        state = await _arousal_store.ack_effect(
+            effect_id=effect_id, target="somatic", now=now,
+        )
+    receipt = pending_release_effect(state, now)
+    if receipt and not receipt["targets"].get("drive"):
+        # A completed release always consumes libido. Libido already feeds the
+        # arousal sensitivity calculation on every user/assistant event, making
+        # this a durable two-way link instead of an optional deployment switch.
+        await _apply_desire_event(
+            "satisfy", source_ref=f"arousal_release:{effect_id}",
+            drive_key="libido", meta={"action": "voice_libido"},
+        )
+        await _arousal_store.ack_effect(effect_id=effect_id, target="drive", now=now)
+
+
+@app.post("/api/arousal/user_event")
+async def api_arousal_user_event(request: Request):
+    if not AROUSAL_ENABLED:
+        return {"enabled": False}
+    try:
+        data = await request.json()
+        event_id = str(data.get("event_id") or "")
+        if not event_id:
+            return {"ok": False, "error": "event_id_required"}
+        now = time.time()
+        drives = await _arousal_drive_snapshot(data.get("drive_snapshot"))
+        lexicon = load_lexicon()
+        state, _, duplicate = await _arousal_store.transact(
+            event_id=event_id, kind="user", now=now,
+            apply=lambda current: apply_user_event(
+                current, str(data.get("text") or ""), event_id=event_id,
+                libido=drives["libido"], now=now, lexicon=lexicon,
+                drive_snapshot=drives,
+            ),
+        )
+        if not duplicate:
+            await _follow_arousal_with_libido(state, event_id, now)
+        return {
+            "ok": True, "phase": public_snapshot(state, now)["phase"],
+            "status_line": status_line(state, now), "duplicate": duplicate,
+        }
+    except Exception as exc:
+        print(f"⚠️ arousal user_event failed: {exc}")
+        return {"ok": False, "error": "internal_error"}
+
+
+@app.post("/api/arousal/assistant_event")
+async def api_arousal_assistant_event(request: Request):
+    if not AROUSAL_ENABLED:
+        return {"enabled": False}
+    try:
+        data = await request.json()
+        event_id = str(data.get("event_id") or "")
+        if not event_id:
+            return {"ok": False, "error": "event_id_required"}
+        complete = data.get("complete") is True
+        now = time.time()
+        drives = await _arousal_drive_snapshot(data.get("drive_snapshot"))
+        lexicon = load_lexicon()
+        if not complete:
+            state = await _arousal_store.read(now)
+            state, fired = apply_assistant_event(
+                state, str(data.get("text") or ""), event_id=event_id,
+                source_user_event_id=data.get("source_user_event_id"), complete=False,
+                libido=drives["libido"], now=now, drive_snapshot=drives,
+                release_intent=data.get("release_intent"), lexicon=lexicon,
+            )
+            return {"ok": True, "fired": fired, "duplicate": False}
+        state, fired, duplicate = await _arousal_store.transact(
+            event_id=event_id, kind="assistant", now=now,
+            apply=lambda current: apply_assistant_event(
+                current, str(data.get("text") or ""), event_id=event_id,
+                source_user_event_id=data.get("source_user_event_id"), complete=True,
+                libido=drives["libido"], now=now, drive_snapshot=drives,
+                release_intent=data.get("release_intent"), lexicon=lexicon,
+            ),
+        )
+        if not duplicate:
+            await _follow_arousal_with_libido(
+                state, event_id, now, str(data.get("source_user_event_id") or ""),
+            )
+            await _deliver_arousal_effects(state, now)
+        return {"ok": True, "fired": bool(fired), "duplicate": duplicate}
+    except Exception as exc:
+        print(f"⚠️ arousal assistant_event failed: {exc}")
+        return {"ok": False, "error": "internal_error"}
+
+
+@app.post("/api/arousal/control")
+async def api_arousal_control(request: Request):
+    if not AROUSAL_ENABLED:
+        return {"enabled": False}
+    try:
+        data = await request.json()
+        event_id, kind = str(data.get("event_id") or ""), str(data.get("kind") or "")
+        if not event_id or kind not in {"lock", "release_once", "unlock"}:
+            return {"ok": False, "error": "invalid_control"}
+        now = time.time()
+        state, _, _ = await _arousal_store.transact(
+            event_id=event_id, kind="control", now=now,
+            apply=lambda current: (control_event(
+                current, kind=kind, event_id=event_id, now=now,
+            ), None),
+        )
+        gate = state["release_gate"]
+        return {"ok": True, "locked": gate["locked"], "generation": gate["generation"]}
+    except Exception as exc:
+        print(f"⚠️ arousal control failed: {exc}")
+        return {"ok": False, "error": "internal_error"}
+
+
+@app.get("/api/arousal/state")
+async def api_arousal_state():
+    if not AROUSAL_ENABLED:
+        return {"enabled": False}
+    try:
+        now = time.time()
+        return public_snapshot(await _arousal_store.read(now), now)
+    except Exception as exc:
+        print(f"⚠️ arousal state failed: {exc}")
+        return {"ok": False, "error": "internal_error"}
 
 
 # ============================================================

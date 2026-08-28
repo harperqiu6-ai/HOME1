@@ -1,0 +1,19 @@
+BEGIN;
+CREATE TABLE IF NOT EXISTS arousal_state (
+  id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id=1),
+  payload JSONB NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS arousal_events (
+  digest TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS arousal_release_effects (
+  effect_id TEXT PRIMARY KEY,
+  payload JSONB NOT NULL,
+  targets_done JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  completed_at TIMESTAMPTZ
+);
+COMMIT;

@@ -32,7 +32,8 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 | `API_BASE_URL` | `https://openrouter.ai/api/v1/chat/completions` |
 | `DEFAULT_MODEL` | `anthropic/claude-sonnet-4.5`（或你喜欢的）|
 | `MEMORY_ENABLED` | `true` |
-| `MEMORY_MODEL` | `anthropic/claude-haiku-4.5`（提取/摘要用便宜小模型）|
+| `MEMORY_EXTRACT_MODEL` | `deepseek/deepseek-v4-flash-0731`（L1短对话提取）|
+| `CONSOLIDATION_MODEL` | `anthropic/claude-haiku-4.5`（L2夜间事件整理）|
 
 6. 部署 → 拿到网址 `https://xxx.zeabur.app`
 
@@ -76,7 +77,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 - **兼容性强** — 支持所有 OpenAI 格式的客户端和 API 服务商
 - **记忆向量搜索（可选）** — 关键词 + 语义向量四维混合搜索，说"过年"能搜到"春节"。支持 OpenAI 兼容的 Embedding API
 - **设置面板** — 在 Dashboard 中直接管理所有运行时配置，热更新无需重启。支持模型列表动态拉取、可搜索下拉选择
-- **零成本起步** — 可部署在 Render、Zeabur 等平台的免费额度内
+- **零成本起步** — 可部署在 VPS、Render、Zeabur 等平台的免费额度内
 
 ## 🏗️ 架构
 
@@ -110,12 +111,12 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 
 编辑 `system_prompt.txt`，写入你想要的 AI 性格设定。
 
-**3. 部署到 Render（推荐）**
+**3. 部署到 VPS 或托管平台（推荐）**
 
 1. Fork 或上传代码到你的 GitHub 仓库
-2. 注册 [Render](https://render.com)（免费层支持 Web Service，够用）
-3. 创建 Web Service → 连接 GitHub 仓库 → Render 会自动检测 Dockerfile
-4. 设置环境变量（Environment → Add Environment Variable）：
+2. 选一个能跑 Docker 的地方，Render、Zeabur 或你自己的 VPS 都可以
+3. 按平台要求部署仓库，确保它能读到 `DATABASE_URL` 和 `API_KEY`
+4. 设置环境变量：
 
 | 环境变量 | 说明 | 示例 |
 |---------|------|------|
@@ -127,12 +128,12 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 
 5. 部署，访问你的网关地址看到 `{"status":"running"}` 就成功了
 
-> ⚠️ Render 免费层的服务在无活动时会休眠，第一次访问需要等几十秒唤醒，之后就正常了。其他支持 Docker 部署的平台（Zeabur、Railway、Fly.io 等）也可以，流程类似。
+> ⚠️ 如果你用的是免费托管平台，可能会休眠；如果你是自己的 VPS，就没有这类问题。只要能提供稳定的 HTTPS 入口，流程都一样。
 
 **4. 连接客户端**
 
 以 Kelivo 为例：
-- API 地址填：`https://你的网关地址.onrender.com/v1`
+- API 地址填：`https://你的网关地址/v1`
 - API Key 填：随便填一个（网关会用自己的 key）
 - 模型填：你在 `DEFAULT_MODEL` 里设的模型
 
@@ -142,9 +143,9 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 
 **1. 创建数据库**
 
-在 Render 中：Dashboard → New → PostgreSQL，创建一个免费的 PostgreSQL 实例，拿到连接字符串（Internal Database URL）。
+在托管平台里创建一个 PostgreSQL 实例，拿到连接字符串（Internal Database URL）。
 
-> ⚠️ Render 免费 PostgreSQL 有 90 天有效期，到期前记得用导出功能备份数据。其他平台（如 [Neon](https://neon.tech)、[Supabase](https://supabase.com)）也提供免费 PostgreSQL，可按需选择。如果使用外部数据库，连接字符串末尾可能需要加 `?sslmode=require`。
+> ⚠️ 如果你用的是短期免费数据库，记得提前备份和迁移。其他平台（如 [Neon](https://neon.tech)、[Supabase](https://supabase.com)）也提供 PostgreSQL；如果使用外部数据库，连接字符串末尾可能需要加 `?sslmode=require`。
 
 **2. 添加环境变量**
 
@@ -152,7 +153,9 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 |---------|------|------|
 | `DATABASE_URL` | PostgreSQL 连接字符串 | `postgresql://user:pass@host:port/db` |
 | `MEMORY_ENABLED` | 开启记忆 | `true` |
-| `MEMORY_MODEL` | 提取记忆用的模型（推荐便宜的小模型） | `anthropic/claude-haiku-4.5` |
+| `MEMORY_EXTRACT_MODEL` | L1短对话记忆提取模型 | `deepseek/deepseek-v4-flash-0731` |
+| `CONSOLIDATION_MODEL` | L2夜间事件整理与跨块对齐模型 | `anthropic/claude-haiku-4.5` |
+| `MEMORY_MODEL（兼容项）` | 其他记忆评分/回填及旧部署兜底 | `anthropic/claude-haiku-4.5` |
 | `MAX_MEMORIES_INJECT` | 每次注入的最大记忆条数 | `15` |
 | `MIN_SCORE_THRESHOLD` | 记忆搜索最低分数阈值，低于此分数的记忆不注入（0=不过滤） | `0.15` |
 | `MEMORY_EXTRACT_INTERVAL` | 记忆提取间隔（0=禁用/1=每轮/N=每N轮） | `1` |
@@ -327,7 +330,7 @@ ai-memory-gateway/
 ## ❓ 常见问题
 
 **Q: 部署后访问显示 502 或服务无响应？**
-A: 检查端口设置。Render 默认用 `PORT` 环境变量，确保设置为 `8000`（和 Dockerfile 里一致）。如果用其他平台，注意端口是否匹配。
+A: 检查端口设置。平台通常会给 `PORT` 环境变量，确保它和 Dockerfile 里一致（默认 `8000`）。如果用自己的 VPS，注意反向代理和监听端口是否匹配。
 
 **Q: 数据库连接失败？**
 A: 如果数据库和网关不在同一个平台，连接字符串末尾可能需要加 `?sslmode=require`。
@@ -336,7 +339,7 @@ A: 如果数据库和网关不在同一个平台，连接字符串末尾可能�
 A: 每次最多注入 15 条记忆（可调），不会无限增长地消耗 token。提取记忆时会用客户端发来的完整上下文，token 用量比单轮提取大一些，可以通过 `MEMORY_EXTRACT_INTERVAL` 降低提取频率来控制成本。
 
 **Q: 能用免费额度跑吗？**
-A: Render 免费层支持 Web Service + PostgreSQL，网关资源消耗很低，够用（注意免费 PostgreSQL 有 90 天期限）。也可以用 Neon 或 Supabase 的免费 PostgreSQL 作为长期方案。LLM API 费用另算（推荐 OpenRouter，按量付费）。
+A: 任意支持 Docker 的平台都可以，网关资源消耗很低，够用。也可以用 Neon 或 Supabase 的 PostgreSQL 作为长期方案。LLM API 费用另算（推荐 OpenRouter，按量付费）。
 
 **Q: 怎么备份记忆？换平台会丢数据吗？**
 A: 打开 `https://你的网关地址/dashboard`，在「导出备份」页面下载所有记忆的 JSON，建议定期备份。迁移到新平台后，在「导入记忆」页面选择「JSON 备份恢复」上传导出的文件即可。

@@ -71,8 +71,21 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/comp
 # 适用于中转站按模型分组、不同模型需要不同 Key 的场景
 MEMORY_API_KEY = os.getenv("MEMORY_API_KEY", "")
 
-# 用来提取记忆的模型（便宜的就行）
-MEMORY_MODEL = os.getenv("MEMORY_MODEL", "anthropic/claude-haiku-4")
+# L1 提取与其他记忆杂务分离。MEMORY_MODEL 保留为旧配置兼容和
+# 评分/回填模型；新部署只需单独设置 MEMORY_EXTRACT_MODEL。
+MEMORY_MODEL = os.getenv("MEMORY_MODEL", "anthropic/claude-haiku-4.5")
+MEMORY_EXTRACT_MODEL = os.getenv(
+    "MEMORY_EXTRACT_MODEL", "deepseek/deepseek-v4-flash-0731"
+)
+EXTRACTION_OMISSION_CHECK_MIN_CHARS = int(os.getenv(
+    "EXTRACTION_OMISSION_CHECK_MIN_CHARS", "1200"
+))
+# OR 的 DS V4 Flash 在当前 provider 上偶发 finish_reason=error（短L1和长L2
+# 都实测出现）。默认用普通JSON + 本地严格解析/边界验收，避免每批先白等一次；
+# 将来 provider 修好后可显式开启 schema，不需要改代码。
+EXTRACTION_STRUCTURED_OUTPUT_ENABLED = os.getenv(
+    "EXTRACTION_STRUCTURED_OUTPUT_ENABLED", "false"
+).lower() == "true"
 
 def get_memory_api_key() -> str:
     return MEMORY_API_KEY or API_KEY
@@ -80,9 +93,32 @@ def get_memory_api_key() -> str:
 
 EXTRACTION_PROMPT = """你是记忆提取专家。从对话中提取值得长期记住的信息，并做好「去掉AI评判但留住用户情绪、分类、冲突处理」三件事。
 
+# 首要任务：先概括，再提取（不要逐句摘录）
+- 你看到的是最近一小段连续对话。先整体理解并概括，再提取少量、可独立检索的长期记忆；不要按每句话、每轮或每个观察角度拆分。
+- 同一场互动、同一话题、同一决定里的事实、触发原因、用户情绪、双方回应和最终结果，必须合成同一条。不得把同一件事换几个角度重复保存。
+- 通常输出 1~3 条；只有确实存在互不相关、需要独立检索或独立标记的主题时，最多输出 4 条。没有新增信息仍输出 []。
+- 每条 content 以 80~150 字为目标，最多 150 字。概括而非逐句复述；保留关键事实、情绪变化、决定、承诺和结果，删去寒暄、重复确认、来回措辞及不影响理解的过程细节。
+- 只有暗号/专属词定义、精确健康或日期事实、对旧事实的更正、persona 相处偏好、私密等级明显不同、或彼此完全无关的主题，才应独立成条。
+
+# 身份与人称铁律
+- 输入中的“用户:”始终是人类 Harper（裘宝宝）；“AI:”始终是 AI 伴侣 V。两者身份绝不能交换。
+- content 描述 Harper 时写“Harper”“裘宝宝”或“她”；描述 V 时写“V”或“他”。涉及双方时必须明确写出主语。
+- Harper 的感受、决定、要求和行为只能归给 Harper；V 的回应、承诺和行为只能归给 V。
+- V 说出的判断、猜测、建议和角色扮演内容不能当成 Harper 的现实事实，也不能把梦境或假设写成现实。
+- 可以保留 V 的回应或承诺，但仅限它是理解整场互动、关系变化或 Harper 情绪触发所必需的背景；不要把 V 的普通回复单独提取成记忆。
+- 输出前逐条核对：谁说的、谁感受到的、谁做的，必须与输入标签一致。
+
+# 游戏、角色扮演、梦境、假设与亲密内容的概括尺度
+- L1只概括当前这段对话明确出现的内容，不是逐动作记录、游戏战报或亲密过程复述。
+- 游戏/角色扮演：概括当前阶段的目标、主要推进、关键选择或转折、重要真实情绪，以及当前状态和停点；不要逐条保存每个指令、回合、普通数值变化、道具操作和重复反应。
+- 亲密内容：概括互动的总体推进、重要阶段变化、关键情绪、关系意义、边界或承诺及当前停点；体位变化确实构成阶段变化时可以简要提及，但不要逐条记录动作、身体细节、生理反应或重复台词。
+- 如果起因发生在更早对话、结果尚未发生，就只写当前可见阶段，并明确“继续进行中”或当前停点；不得自行补出未看到的起因、转折或最终结果。
+- 游戏、角色扮演、梦境和假设必须在content中明确标注为“游戏中”“角色扮演中”“梦里”或“假设中”；绝不能写成Harper与V在现实中真实发生的经历。
+- 游戏/RP中的角色行为不能直接归为Harper或V的现实行为；其中产生的真实感受、边界或关系交流可以保留，但必须明确这是由游戏/RP触发的现实层感受或交流。
+
 # 铁则一：去掉 AI 的评判，但留住用户的情绪与现场（判据看主语：用户的感受/现场=事实，存；AI 的判断=评判，丢）
 - ✅ 用户的情绪反应原样留、别抹平："听到某句动情的话那刻快哭了"、"笑得很开心"、"被某个昵称逗得气鼓鼓的"
-- ✅ 触发情绪的现场/感官细节也要留：是哪句话、哪个动作、什么场景让 TA 有这反应——别只留"快哭了"丢掉触发它的那句话
+- ✅ 保留足以解释重要情绪为何发生的触发原因；普通事件可留关键现场细节。游戏/RP与亲密内容只概括触发类型和关系意义，不展开逐动作、身体或生理过程，除非该细节本身构成明确边界、承诺、冲突或关系转折
 - ✅ 高 arousal（情绪浓）的条目别压成干事实：别把"听到那句话快哭了"压成"听了个故事"；中性客观事实可以简洁
 - ✅ 中性客观事实照常存："用户今天喝了冰咖啡"、"用户例假从某日开始"、"某止痛药含布洛芬成分"
 - ❌ AI 的评判/意见："冰咖啡不好"、"TA不该熬夜"、"这样很危险" —— 丢
@@ -154,6 +190,99 @@ importance 为 1-10（10最重要）；valence∈[-1,1]、arousal∈[0,1]；is_m
 就算没有可提取的记忆，也只输出两个字符：`[]`
 """
 
+EXTRACTION_SAFE_MAX_ITEMS = 5
+EXTRACTION_SAFE_MAX_CONTENT_CHARS = 250
+
+
+def _is_openrouter_deepseek_extract() -> bool:
+    return (
+        "openrouter" in API_BASE_URL.lower()
+        and MEMORY_EXTRACT_MODEL.lower().startswith("deepseek/")
+    )
+
+
+def _extraction_response_format() -> dict:
+    """Strict L1 array schema used by OR DeepSeek to avoid prose/fence drift."""
+    item_schema = {
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": ["fact", "persona"]},
+            "content": {"type": "string"},
+            "importance": {"type": "integer"},
+            "replaces_id": {"type": ["integer", "null"]},
+            "valence": {"type": ["number", "null"]},
+            "arousal": {"type": ["number", "null"]},
+            "is_milestone": {"type": "boolean"},
+            "is_explicit": {"type": "boolean"},
+        },
+        "required": [
+            "kind", "content", "importance", "replaces_id", "valence",
+            "arousal", "is_milestone", "is_explicit",
+        ],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "home1_l1_memories",
+            "strict": True,
+            "schema": {"type": "array", "items": item_schema},
+        },
+    }
+
+
+def _extraction_request_payload(prompt: str, conversation_text: str,
+                                *, structured: bool = False) -> dict:
+    payload = {
+        "model": MEMORY_EXTRACT_MODEL,
+        "max_tokens": 2000,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": f"请从以下对话中提取新的记忆：\n\n{conversation_text}"},
+        ],
+    }
+    if _is_openrouter_deepseek_extract():
+        payload["reasoning"] = {"enabled": False}
+        payload["provider"] = {
+            "zdr": True,
+            "data_collection": "deny",
+            "require_parameters": True,
+        }
+        if structured:
+            payload["response_format"] = _extraction_response_format()
+    return payload
+
+
+def _should_run_omission_check(memories, conversation_text: str) -> bool:
+    return (
+        _is_openrouter_deepseek_extract()
+        and isinstance(memories, list)
+        and len(memories) == 1
+        and len(conversation_text) >= EXTRACTION_OMISSION_CHECK_MIN_CHARS
+    )
+
+
+def _extraction_batch_policy_error(memories) -> str:
+    """Return a safe-boundary violation without truncating or dropping facts."""
+    if not isinstance(memories, list):
+        return "输出不是JSON数组"
+    candidates = [
+        mem for mem in memories
+        if isinstance(mem, dict) and "content" in mem
+    ]
+    if len(candidates) > EXTRACTION_SAFE_MAX_ITEMS:
+        return f"候选条数{len(candidates)}超过安全上限{EXTRACTION_SAFE_MAX_ITEMS}"
+    overlong = [
+        index + 1 for index, mem in enumerate(candidates)
+        if len(str(mem.get("content") or "").strip()) > EXTRACTION_SAFE_MAX_CONTENT_CHARS
+    ]
+    if overlong:
+        return (
+            f"第{','.join(str(index) for index in overlong)}条content超过"
+            f"{EXTRACTION_SAFE_MAX_CONTENT_CHARS}字安全上限"
+        )
+    return ""
+
 
 async def extract_memories(messages: List[Dict[str, str]], existing_memories: List[str] = None) -> List[Dict]:
     """
@@ -203,18 +332,53 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
     # 把已有记忆填入prompt
     prompt = EXTRACTION_PROMPT.format(existing_memories=memories_text)
 
-    # 调用 LLM 提取记忆(带一次重试:haiku 常返回不合规 JSON,重试时 system 尾部再加最强约束)
+    # 调用 LLM 提取记忆。两次付费上限不变：失败时重试；DS 对长对话只产
+    # 1 条时，第二次改作遗漏复核，并返回完整替代数组（不把两稿机械拼接）。
     memories = None
+    first_valid_memories = None
+    omission_review = False
     last_raw = ""
+    last_policy_error = ""
     try:
         for attempt in (1, 2):
-            _extra = "" if attempt == 1 else (
-                "\n\n【最后强调 · 第二次尝试】上一次你的输出解析失败了(不是纯 JSON 数组)。"
-                "这次你的整个回复必须只有 JSON 数组本身:以 `[` 开头,以 `]` 结尾,"
-                "别的一个字符都不要,包括解释、代码块围栏、markdown。"
-                "如果没有可提取的记忆,输出 `[]` 两个字符即可。"
-            )
+            if attempt == 1:
+                _extra = ""
+            elif omission_review:
+                _extra = (
+                    "\n\n【遗漏复核 · 完整替代稿】上一次只提取了1条，但这是一段较长对话。"
+                    "重新阅读全文，检查是否遗漏了与该条事件边界完全独立、以后需要单独检索的事实、"
+                    "更正、决定、暗号或persona偏好。请返回完整替代JSON数组；确实只有一个主题就"
+                    "仍返回原来那1条，禁止为了凑数拆分同一事件或加入AI评判。"
+                )
+            elif last_policy_error:
+                _extra = (
+                    f"\n\n【最后强调 · 第二次尝试】上一次输出未通过安全验收：{last_policy_error}。"
+                    "请重新阅读原对话，合并同一事件的不同角度和重复内容。通常输出1~3条，"
+                    "独立主题最多4条；每条content目标80~150字、最多150字。"
+                    "不要截掉事实；应通过概括、去重和合并来满足边界。"
+                    "整个回复仍必须只有JSON数组。"
+                )
+            else:
+                _extra = (
+                    "\n\n【最后强调 · 第二次尝试】上一次你的输出解析失败了(不是纯 JSON 数组)。"
+                    "这次你的整个回复必须只有 JSON 数组本身:以 `[` 开头,以 `]` 结尾,"
+                    "别的一个字符都不要,包括解释、代码块围栏、markdown。"
+                    "如果没有可提取的记忆,输出 `[]` 两个字符即可。"
+                )
             async with httpx.AsyncClient(timeout=60) as client:
+                payload = _extraction_request_payload(
+                    prompt + _extra,
+                    conversation_text,
+                    # 结构化解析本身失败时，第二次退回普通JSON以避免供应商
+                    # schema兼容故障；安全边界失败和遗漏复核仍继续用schema。
+                    structured=(
+                        EXTRACTION_STRUCTURED_OUTPUT_ENABLED
+                        and not (
+                            attempt == 2 and not omission_review
+                            and not last_policy_error
+                        )
+                    ),
+                )
                 response = await client.post(
                     API_BASE_URL,
                     headers={
@@ -223,30 +387,58 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                         "HTTP-Referer": "https://midsummer-gateway.local",
                         "X-Title": "Midsummer Memory Extraction",
                     },
-                    json={
-                        "model": MEMORY_MODEL,
-                        "max_tokens": 2000,  # 1000→2000 防长 JSON 被截断(丢右方括号)
-                        "messages": [
-                            {"role": "system", "content": prompt + _extra},
-                            {"role": "user", "content": f"请从以下对话中提取新的记忆：\n\n{conversation_text}"},
-                        ],
-                    },
+                    json=payload,
                 )
                 if response.status_code != 200:
                     print(f"⚠️  记忆提取请求失败(第{attempt}次): HTTP {response.status_code}")
                     continue
-                text = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+                choice = (response.json().get("choices") or [{}])[0]
+                text = (choice.get("message") or {}).get("content") or ""
                 last_raw = text
+                if str(choice.get("finish_reason") or "") in {"length", "error"}:
+                    print(
+                        f"⚠️  第{attempt}次记忆提取未完整结束: "
+                        f"finish_reason={choice.get('finish_reason')}"
+                    )
+                    continue
                 print(f"📝 记忆模型原始返回(第{attempt}次):\n{text[:500]}", flush=True)
-                memories = _robust_extract_json_array(text)
-                if memories is not None:
+                candidate = _robust_extract_json_array(text)
+                if candidate is not None:
+                    last_policy_error = _extraction_batch_policy_error(candidate)
+                    if last_policy_error:
+                        print(
+                            f"⚠️  第{attempt}次记忆提取越过安全边界: "
+                            f"{last_policy_error}（{'重试一次' if attempt == 1 else '整批拒收'}）"
+                        )
+                        continue
+                    if attempt == 1 and _should_run_omission_check(
+                        candidate, conversation_text
+                    ):
+                        first_valid_memories = candidate
+                        omission_review = True
+                        print("📝 DS长对话首稿仅1条，启动一次遗漏复核")
+                        continue
+                    if omission_review and first_valid_memories is not None:
+                        memories = (
+                            candidate if len(candidate) > len(first_valid_memories)
+                            else first_valid_memories
+                        )
+                    else:
+                        memories = candidate
                     if attempt == 2:
                         print(f"📝 第二次尝试解析成功({len(memories)}条)")
                     break
                 print(f"⚠️  第{attempt}次 JSON 解析失败({'重试一次' if attempt == 1 else '放弃'})")
 
+        if memories is None and first_valid_memories is not None:
+            # 遗漏复核失败不能反过来丢掉已验收的一稿。
+            memories = first_valid_memories
         if memories is None:
-            print(f"⚠️  记忆提取两次都解析失败,放弃。原始返回尾片段: {last_raw[-200:]!r}")
+            reason = last_policy_error or "JSON解析失败"
+            print(
+                f"⚠️  记忆提取两次都未通过验收,放弃。reason={reason}; "
+                f"原始返回尾片段: {last_raw[-200:]!r}"
+            )
             return []
         if not isinstance(memories, list):
             return []

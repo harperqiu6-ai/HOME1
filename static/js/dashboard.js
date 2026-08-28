@@ -58,6 +58,9 @@ let pendingJsonData = null;
 let currentLayer = 'all';
 let memCurrentPage = 1;
 const MEM_PER_PAGE = 50;
+let memTotalItems = 0;
+let memTotalPages = 1;
+let memLoadTimer = null;
 
 const LAYER_NAMES = {
     1: '碎片',
@@ -73,10 +76,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initNavigation();
     // 初始化Tab切换
     initTabs();
-    // 加载记忆数据
-    loadMemories();
-    // 加载导出统计
-    loadExportStats();
+    // 完整记忆库只在进入「记忆」房时按页加载；首页不再预取全库。
     // 主页（默认首页）：房间跳转 + 拉数据 + 心跳
     initRooms();
     loadHome();
@@ -205,9 +205,11 @@ function updateLayerCounts(stats) {
     const el1 = document.getElementById('count-layer-1');
     const el2 = document.getElementById('count-layer-2');
     const el3 = document.getElementById('count-layer-3');
+    const elSuixiang = document.getElementById('count-suixiang');
     if (el1) el1.textContent = stats.layer_1?.active || 0;
     if (el2) el2.textContent = stats.layer_2?.active || 0;
     if (el3) el3.textContent = stats.layer_3?.active || 0;
+    if (elSuixiang) elSuixiang.textContent = stats.suixiang?.active || 0;
 }
 
 // ============================================
@@ -234,13 +236,42 @@ function sourceLabel(src) {
 
 async function loadMemories() {
     try {
-        const resp = await fetch('/api/memories');
+        const params = new URLSearchParams({
+            page: String(memCurrentPage),
+            per_page: String(MEM_PER_PAGE),
+            sort: document.getElementById('sortSelect')?.value || 'id-desc'
+        });
+        if (currentLayer === 'suixiang') {
+            params.set('suixiang_only', 'true');
+        } else if (currentLayer !== 'all') {
+            params.set('layer', String(currentLayer));
+        }
+        const q = document.getElementById('searchBox')?.value.trim() || '';
+        const dateVal = document.getElementById('dateFilter')?.value || '';
+        if (q) params.set('q', q);
+        if (dateVal) params.set('date', dateVal);
+        if (document.getElementById('showInactive')?.checked) params.set('include_inactive', 'true');
+        document.getElementById('stats').textContent = '加载中…';
+        const resp = await fetch('/api/memories?' + params.toString());
         const data = await resp.json();
         allMemories = data.memories || [];
+        memTotalItems = Number(data.total || 0);
+        memTotalPages = Math.max(1, Number(data.total_pages || 1));
+        if (memCurrentPage > memTotalPages) {
+            memCurrentPage = memTotalPages;
+            return loadMemories();
+        }
         if (data.layer_stats) updateLayerCounts(data.layer_stats);
-        const _act = allMemories.filter(m => m.is_active !== false).length;
-        document.getElementById('stats').textContent = '共 ' + allMemories.length + ' 条（活跃 ' + _act + ' / 归档 ' + (allMemories.length - _act) + '）';
-        filterAndSort();
+        renderTable(allMemories, (memCurrentPage - 1) * MEM_PER_PAGE);
+        renderMemPagination(memTotalItems, memTotalPages);
+        const filters = [];
+        if (q) filters.push('关键词: ' + q);
+        if (dateVal) filters.push('日期: ' + dateVal);
+        if (currentLayer === 'suixiang') filters.push('栏目: V的随想');
+        else if (currentLayer !== 'all') filters.push('层级: ' + LAYER_NAMES[currentLayer]);
+        document.getElementById('stats').textContent =
+            '共 ' + memTotalItems + ' 条' + (filters.length ? '（' + filters.join(' · ') + '）' : '') +
+            (memTotalPages > 1 ? '  第 ' + memCurrentPage + '/' + memTotalPages + ' 页' : '');
     } catch(e) {
         showManageMsg('error', '加载失败：' + e.message);
     }
@@ -254,6 +285,8 @@ function renderTable(mems, startIndex) {
         const isInactive = m.is_active === false;
         const rowClass = isInactive ? 'inactive-row' : '';
         const titleDisplay = m.title || '';
+        const isSuixiang = layer === 1 && (m.kind === 'musing' || (m.content || '').startsWith('【V的随想】'));
+        const contentDisplay = isSuixiang ? m.content.slice('【V的随想】'.length) : m.content;
         const mergedFrom = m.merged_from || [];
         // 情绪列 + 状态徽标（内联样式，不依赖 CSS）
         const _v = (m.valence !== undefined && m.valence !== null) ? m.valence : 0;
@@ -296,12 +329,12 @@ function renderTable(mems, startIndex) {
             deleteBtn = '<button class="btn btn-danger btn-sm" onclick="delMem(' + m.id + ', true)">永久删除</button>';
         }
         
-        return '<tr data-id="' + m.id + '" class="' + rowClass + '">' +
+        return '<tr data-id="' + m.id + '" data-suixiang="' + (isSuixiang ? 'true' : 'false') + '" class="' + rowClass + '">' +
             '<td class="col-check"><input type="checkbox" class="mem-check" value="' + m.id + '" onchange="updateFloatingBar()"></td>' +
             '<td class="col-id">' + m.id + mergeInfo + '</td>' +
             '<td class="col-layer">' + layerSelect + '</td>' +
             '<td class="col-title"><input type="text" class="title-input" id="t_' + m.id + '" value="' + escHtml(titleDisplay) + '" placeholder="无标题"></td>' +
-            '<td class="col-content"><textarea class="content-textarea" id="c_' + m.id + '">' + escHtml(m.content) + '</textarea></td>' +
+            '<td class="col-content"><textarea class="content-textarea" id="c_' + m.id + '">' + escHtml(contentDisplay) + '</textarea></td>' +
             '<td class="col-importance"><input type="number" class="importance-input" id="i_' + m.id + '" value="' + m.importance + '" min="1" max="10"></td>' +
             _emoCell +
             _statusCell +
@@ -324,48 +357,8 @@ function escHtml(s) {
 function fmtTime(s) { return s || '-'; }
 
 function filterAndSort() {
-    const q = document.getElementById('searchBox').value.trim().toLowerCase();
-    const sort = document.getElementById('sortSelect').value;
-    const dateVal = document.getElementById('dateFilter').value;
-    const showInactiveEl = document.getElementById('showInactive');
-    const showInactive = showInactiveEl ? showInactiveEl.checked : false;
-    
-    let mems = allMemories;
-    if (currentLayer !== 'all') mems = mems.filter(m => (m.layer || 1) == currentLayer);
-    if (!showInactive) mems = mems.filter(m => m.is_active !== false);
-    if (q) mems = mems.filter(m => m.content.toLowerCase().includes(q) || (m.title && m.title.toLowerCase().includes(q)));
-    if (dateVal) mems = mems.filter(m => m.created_at && fmtTime(m.created_at).slice(0, 10) === dateVal);
-    
-    mems = [...mems].sort((a, b) => {
-        if (sort === 'id-desc') return b.id - a.id;
-        if (sort === 'id-asc') return a.id - b.id;
-        if (sort === 'imp-desc') return b.importance - a.importance || b.id - a.id;
-        if (sort === 'imp-asc') return a.importance - b.importance || a.id - b.id;
-        return 0;
-    });
-    
-    // 分页
-    const totalItems = mems.length;
-    const totalPages = Math.max(1, Math.ceil(totalItems / MEM_PER_PAGE));
-    if (memCurrentPage > totalPages) memCurrentPage = totalPages;
-    const start = (memCurrentPage - 1) * MEM_PER_PAGE;
-    const pageMems = mems.slice(start, start + MEM_PER_PAGE);
-    
-    renderTable(pageMems, start);
-    renderMemPagination(totalItems, totalPages);
-    
-    const parts = [];
-    if (q || dateVal || currentLayer !== 'all') {
-        parts.push('筛选到 ' + totalItems + ' 条');
-        if (currentLayer !== 'all') parts.push('层级: ' + LAYER_NAMES[currentLayer]);
-        if (dateVal) parts.push('日期: ' + dateVal);
-    } else {
-        parts.push('共 ' + allMemories.filter(m => m.is_active !== false).length + ' 条活跃记忆');
-    }
-    if (totalPages > 1) {
-        parts.push(`第 ${memCurrentPage}/${totalPages} 页`);
-    }
-    document.getElementById('stats').textContent = parts.join('  ');
+    clearTimeout(memLoadTimer);
+    memLoadTimer = setTimeout(loadMemories, 250);
 }
 
 function renderMemPagination(totalItems, totalPages) {
@@ -410,7 +403,7 @@ function renderMemPagination(totalItems, totalPages) {
 
 function goMemPage(page) {
     memCurrentPage = page;
-    filterAndSort();
+    loadMemories();
     // 滚到表格顶部
     document.querySelector('.table-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
@@ -487,7 +480,11 @@ async function changeLayer(id) {
 }
 
 async function saveMem(id) {
-    const content = document.getElementById('c_' + id).value;
+    let content = document.getElementById('c_' + id).value;
+    const row = document.querySelector('tr[data-id="' + id + '"]');
+    if (row?.dataset.suixiang === 'true' && !content.startsWith('【V的随想】')) {
+        content = '【V的随想】' + content;
+    }
     const importance = parseInt(document.getElementById('i_' + id).value);
     const titleEl = document.getElementById('t_' + id);
     const layerEl = document.getElementById('l_' + id);
@@ -882,7 +879,7 @@ async function cleanupOldFragments() {
 // 连根删 · 自助删除（删段对话+碎片 + 备份/撤销 + 重建L2/可选重做梦）
 // ============================================
 function _ssBeijingToUtcIso(localVal) {
-    // datetime-local 的值按北京时间(UTC+8)解释 → UTC ISO（与回滚接口的 UTC 口径一致）
+    // datetime-local 的值按新加坡时间(UTC+8)解释 → UTC ISO（与回滚接口的 UTC 口径一致）
     if (!localVal) return null;
     const d = new Date(localVal + ':00+08:00');
     return isNaN(d.getTime()) ? null : d.toISOString();
@@ -2110,7 +2107,7 @@ let _modelList = [];
 // 所有需要读写的字段 key（开源版：EMBEDDING_API_KEY + EMBEDDING_BASE_URL）
 const _SETTINGS_FIELDS = {
     // 'CACHE_TTL_MODE' 走 str 路径：加载时读 .value（select 元素）、保存时发字符串
-    str: ['API_BASE_URL', 'API_KEY', 'DEFAULT_MODEL', 'MEMORY_API_KEY', 'MEMORY_MODEL',
+    str: ['API_BASE_URL', 'API_KEY', 'DEFAULT_MODEL', 'MEMORY_API_KEY', 'MEMORY_EXTRACT_MODEL', 'CONSOLIDATION_MODEL',
           'CACHE_SUMMARY_MODEL', 'CACHE_PARTITION_TRIGGER', 'CACHE_TTL_MODE', 'EMBEDDING_API_KEY', 'EMBEDDING_BASE_URL', 'EMBEDDING_MODEL', 'REASONING_EFFORT'],
     int: ['MAX_MEMORIES_INJECT', 'MEMORY_EXTRACT_INTERVAL', 'CACHE_PARTITION_X', 'CACHE_PARTITION_WINDOW', 'EMBEDDING_DIM'],
     float: ['MIN_SCORE_THRESHOLD'],
@@ -2120,7 +2117,7 @@ const _SETTINGS_FIELDS = {
     text: ['systemPrompt'],
 };
 
-const _MODEL_COMBOS = ['DEFAULT_MODEL', 'MEMORY_MODEL', 'CACHE_SUMMARY_MODEL'];
+const _MODEL_COMBOS = ['DEFAULT_MODEL', 'MEMORY_EXTRACT_MODEL', 'CONSOLIDATION_MODEL', 'CACHE_SUMMARY_MODEL'];
 
 // 触发模式联动：time模式才显示时间窗口字段
 function _togglePartitionWindow(trigger) {
@@ -2400,6 +2397,7 @@ function renderMwCard(m) {
     const srcBadge = m.source ? `<span class="mw-badge src">${escapeHtml(MW_SRC_CN[m.source] || m.source)}</span>` : '';
     const photos = (m.photos || []).map(p => `<img class="mw-thumb" src="${mwPhotoSrc(p.photo_id)}" onclick="window.open(this.src,'_blank')" alt="">`).join('');
     const body = escapeHtml(m.body || '').replace(/\n/g, '<br>');
+    const summary = escapeHtml(m.summary || '').replace(/\n/g, '<br>');
     const longCls = (m.body || '').length > 220 ? ' mw-collapsed' : '';
     const pinned = !!m.pinned;
     const pinBadge = pinned ? `<span class="mw-badge" style="background:#ffe9a8;color:#7a5b00">📌 置顶</span>` : '';
@@ -2421,6 +2419,7 @@ function renderMwCard(m) {
             ${dateBadge}
         </div>
         ${photos ? `<div class="mw-photos">${photos}</div>` : ''}
+        ${summary ? `<div class="mw-summary"><strong>昨日桥 / 检索摘要</strong><br>${summary}</div>` : ''}
         <div class="mw-body${longCls}" onclick="this.classList.toggle('mw-collapsed')">${body}</div>
     </div>`;
 }
@@ -2441,6 +2440,7 @@ function _mwForm() {
         id: document.getElementById('mwEditId'),
         title: document.getElementById('mwTitle'),
         body: document.getElementById('mwBody'),
+        summary: document.getElementById('mwSummary'),
         author: document.getElementById('mwAuthor'),
         mood: document.getElementById('mwMood'),
         source: document.getElementById('mwSource'),
@@ -2461,7 +2461,7 @@ function _localDateValue(iso) {
 function openMwForm() {
     const f = _mwForm();
     document.getElementById('mwModalTitle').textContent = '写一条回忆';
-    f.id.value = ''; f.title.value = ''; f.body.value = ''; f.author.value = 'ruanruan';
+    f.id.value = ''; f.title.value = ''; f.body.value = ''; f.summary.value = ''; f.author.value = 'ruanruan';
     f.mood.value = ''; f.source.value = 'manual'; f.location.value = ''; f.period.checked = false;
     f.date.value = _localDateValue(null);
     f.photosEdit.innerHTML = ''; f.file.value = '';
@@ -2474,11 +2474,11 @@ function editMw(id) {
     const f = _mwForm();
     document.getElementById('mwModalTitle').textContent = '编辑回忆';
     f.id.value = m.id;
-    f.title.value = m.title || ''; f.body.value = m.body || '';
+    f.title.value = m.title || ''; f.body.value = m.body || ''; f.summary.value = m.summary || '';
     f.author.value = m.author || 'ruanruan'; f.mood.value = m.mood || '';
     f.source.value = m.source || 'manual'; f.location.value = m.location || '';
     f.period.checked = !!m.is_period_day;
-    f.date.value = _localDateValue(m.date);
+    f.date.value = m.event_date ? `${m.event_date}T12:00` : _localDateValue(m.date);
     f.file.value = '';
     f.photosEdit.innerHTML = (m.photos || []).map(p =>
         `<span class="mw-pe"><img src="${mwPhotoSrc(p.photo_id)}"><button onclick="removeMwPhoto(${m.id},${p.photo_id})" title="删除照片">✕</button></span>`).join('');
@@ -2492,10 +2492,11 @@ async function saveMw() {
     const btn = document.getElementById('mwSaveBtn');
     const id = f.id.value;
     const payload = {
-        title: f.title.value.trim(), body: f.body.value.trim(),
+        title: f.title.value.trim(), body: f.body.value.trim(), summary: f.summary.value.trim(),
         author: f.author.value, mood: f.mood.value || null, source: f.source.value,
         is_period_day: f.period.checked ? 1 : 0, location: f.location.value.trim() || null,
         date: f.date.value ? new Date(f.date.value).toISOString() : undefined,
+        event_date: f.date.value ? f.date.value.slice(0, 10) : undefined,
     };
     if (!payload.title && !payload.body) { alert('标题和正文不能都为空'); return; }
     btn.disabled = true; btn.textContent = '保存中…';
@@ -2665,8 +2666,18 @@ function fallbackCopy(txt, id) {
 // ============================================
 let _homeMood = { valence: 0, arousal: 0.2 };
 let _ecgStarted = false;
+const HOME_LINKS_SINCE = [2026, 1, 14];
 
 function _setH(id, v) { const e = document.getElementById(id); if (e) e.textContent = (v == null ? '—' : v); }
+
+function _homeLinksDaysTogether() {
+    const [y, m, d] = HOME_LINKS_SINCE;
+    const start = new Date(y, m - 1, d);
+    const today = new Date();
+    const localToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const diff = Math.floor((localToday - start) / 86400000) + 1;
+    return diff > 0 ? diff : 1;
+}
 
 async function loadHome() {
     try {
@@ -2690,14 +2701,13 @@ async function loadHome() {
         // 去个人化:标题/副标/作者/起始日 从配置(/api/home.home)填,不写死
         const H = j.home || {};
         if (H.title) _setH('home-title', H.title);
-        const subEl = document.getElementById('home-sub'); if (subEl) subEl.textContent = H.subtitle || '';
+        const subEl = document.getElementById('home-sub');
+        if (subEl && H.subtitle) {
+            subEl.textContent = H.subtitle;
+        }
         const authEl = document.getElementById('home-author'); if (authEl) authEl.textContent = H.ai_name ? ('—— ' + H.ai_name) : '';
         const dw = document.getElementById('home-days-wrap');
-        if (H.since && /^\d{4}-\d{2}-\d{2}$/.test(H.since)) {
-            const p = H.since.split('-'); const start = new Date(+p[0], +p[1] - 1, +p[2]);
-            const d = Math.floor((new Date() - start) / 86400000) + 1;
-            _setH('home-days', d > 0 ? d : 1); if (dw) dw.style.display = '';
-        } else if (dw) { dw.style.display = 'none'; }
+        if (dw) dw.style.display = 'none';
         const foot = document.getElementById('home-foot-text');
         if (foot) foot.textContent = '♦ ' + (H.title || 'Memory Gateway') + (H.since ? (' · since ' + H.since) : '') + ' ♦';
     } catch (e) { /* 静默降级，仍画心跳 */ }

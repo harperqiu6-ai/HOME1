@@ -21,7 +21,9 @@
 
 .home-header{padding:30px 0 10px;text-align:center;}
 .home-title{font-family:var(--serif);font-size:30px;font-weight:300;letter-spacing:8px;color:var(--gold-light);margin-bottom:4px;}
-.home-sub{font-family:var(--serif);font-size:13px;letter-spacing:5px;color:var(--t-dim);}
+.home-sub{font-family:var(--serif);font-size:11px;letter-spacing:2px;color:var(--t-dim);margin-top:2px;opacity:.95;}
+.home-since{font-family:var(--serif);font-size:13px;line-height:1.2;letter-spacing:4px;color:var(--t-secondary);margin-top:4px;opacity:.78;font-weight:300;}
+.home-since #home-since-days{color:var(--gold-light);font-weight:400;font-size:14px;letter-spacing:0;}
 .home-days{margin-top:12px;font-family:var(--serif);font-size:14px;color:var(--gold);letter-spacing:2px;}
 .home-days b{font-size:22px;font-weight:500;}
 

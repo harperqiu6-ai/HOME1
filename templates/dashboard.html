@@ -6,8 +6,8 @@
     <title>Memory Gateway</title>
     <link rel="stylesheet" href="/static/css/fonts.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css">
-    <link rel="stylesheet" href="/static/css/theme.css?v=1.0">
-    <link rel="stylesheet" href="/static/css/dashboard.css?v=4.1-rooms">
+    <link rel="stylesheet" href="/static/css/theme.css?v=1.2">
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=4.3-memory-editor">
 </head>
 <body>
     <div class="dashboard">
@@ -93,9 +93,18 @@
                 <svg class="home-corner br" viewBox="0 0 50 50"><path d="M2 48 L2 2 L48 2" fill="none" stroke="#c5a55a" stroke-width=".5"/><path d="M2 10 L10 2" fill="none" stroke="#c5a55a" stroke-width=".5"/><circle cx="2" cy="2" r="1.5" fill="#c5a55a"/></svg>
 
                 <div class="home-header">
-                  <div class="home-title" id="home-title">OUR HOME</div>
-                  <div class="home-sub" id="home-sub"></div>
-                  <div class="home-days" id="home-days-wrap" style="display:none">在一起的第 <b id="home-days">—</b> 天</div>
+                  <div class="home-title" id="home-title">VH LINKS</div>
+                  <div class="home-since" id="home-since">since 2026/01/14 · <span id="home-since-days">1</span> Days together</div>
+                  <script>
+                    (() => {
+                      const start = new Date(2026, 0, 14);
+                      const today = new Date();
+                      const localToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+                      const days = Math.max(1, Math.floor((localToday - start) / 86400000) + 1);
+                      const el = document.getElementById('home-since');
+                      if (el) el.innerHTML = `since 2026/01/14 · <span id="home-since-days">${days}</span> Days together`;
+                    })();
+                  </script>
                 </div>
 
                 <div class="heartbeat-wrap"><canvas id="home-ecg"></canvas></div>
@@ -159,14 +168,14 @@
             <section id="section-memorywall" class="section">
                 <div class="section-header">
                     <h1>🌸 回忆墙</h1>
-                    <p class="section-desc">阮阮 &amp; 小克的回忆 · 可看可写</p>
+                    <p class="section-desc">V&amp;Harper的回忆 · 可看可写</p>
                 </div>
                 <div class="card">
                     <div class="mw-toolbar">
                         <select id="mwFilterAuthor" class="select-input" onchange="loadMemoryWall()">
                             <option value="">全部作者</option>
-                            <option value="ruanruan">阮阮</option>
-                            <option value="xiaoke">小克</option>
+                            <option value="ruanruan">Harper</option>
+                            <option value="xiaoke">V</option>
                         </select>
                         <select id="mwFilterMood" class="select-input" onchange="loadMemoryWall()">
                             <option value="">全部心情</option>
@@ -188,14 +197,16 @@
                     <label class="mw-lbl">标题</label>
                     <input type="text" id="mwTitle" class="search-input" placeholder="给这条回忆起个标题">
                     <label class="mw-lbl">正文</label>
-                    <textarea id="mwBody" class="mw-textarea" rows="8" placeholder="写下这段回忆…（超过400字会自动配一段检索摘要）"></textarea>
+                    <textarea id="mwBody" class="mw-textarea" rows="8" placeholder="写下这段回忆…"></textarea>
+                    <label class="mw-lbl">昨日桥 / 检索摘要</label>
+                    <textarea id="mwSummary" class="mw-textarea" rows="3" placeholder="这是 V 跨天接续和检索时看到的摘要；人工编辑后以这里为准，不会自动重写"></textarea>
                     <div class="mw-form-row">
                         <div><label class="mw-lbl">作者</label>
-                            <select id="mwAuthor" class="select-input"><option value="ruanruan">阮阮</option><option value="xiaoke">小克</option></select></div>
+                            <select id="mwAuthor" class="select-input"><option value="ruanruan">Harper</option><option value="xiaoke">V</option></select></div>
                         <div><label class="mw-lbl">心情</label>
                             <select id="mwMood" class="select-input"><option value="">—</option><option>纪念</option><option>开心</option><option>感动</option><option>搞笑</option><option>温柔</option><option>日常</option><option>难过</option></select></div>
                         <div><label class="mw-lbl">来源</label>
-                            <select id="mwSource" class="select-input"><option value="manual">手动</option><option value="claude">Claude</option><option value="tavern">酒馆</option></select></div>
+                            <select id="mwSource" class="select-input"><option value="manual">手动</option><option value="daily_diary">每日回忆墙</option><option value="claude">Claude</option><option value="tavern">酒馆</option></select></div>
                     </div>
                     <div class="mw-form-row">
                         <div><label class="mw-lbl">日期</label><input type="datetime-local" id="mwDate" class="search-input"></div>
@@ -247,6 +258,7 @@
                         <button class="layer-tab" data-layer="3" onclick="switchLayer(3)">核心记忆 <span id="count-layer-3">0</span></button>
                         <button class="layer-tab" data-layer="2" onclick="switchLayer(2)">事件记忆 <span id="count-layer-2">0</span></button>
                         <button class="layer-tab" data-layer="1" onclick="switchLayer(1)">原始碎片 <span id="count-layer-1">0</span></button>
+                        <button class="layer-tab" data-layer="suixiang" onclick="switchLayer('suixiang')">V的随想 <span id="count-suixiang">0</span></button>
                         <label class="checkbox-label" style="margin-left:auto;">
                             <input type="checkbox" id="showInactive" onchange="memCurrentPage=1;filterAndSort()">
                             <span>显示已归档</span>
@@ -336,8 +348,8 @@
                         <span style="font-size:12px; color:var(--text-muted);">删某段对话 + 派生碎片 + 重建L2（🛡️回忆墙永不删；删前自动备份、可一键撤销）</span>
                     </div>
                     <div style="display:flex; flex-wrap:wrap; align-items:flex-end; gap:14px; margin-top:8px;">
-                        <label style="font-size:12px; color:var(--text-light);">起（北京时间）<br><input type="datetime-local" id="ss-start" class="form-input" style="width:215px;"></label>
-                        <label style="font-size:12px; color:var(--text-light);">止（北京时间）<br><input type="datetime-local" id="ss-end" class="form-input" style="width:215px;" disabled></label>
+                        <label style="font-size:12px; color:var(--text-light);">起（新加坡时间）<br><input type="datetime-local" id="ss-start" class="form-input" style="width:215px;"></label>
+                        <label style="font-size:12px; color:var(--text-light);">止（新加坡时间）<br><input type="datetime-local" id="ss-end" class="form-input" style="width:215px;" disabled></label>
                         <label class="checkbox-label" title="勾上=删到现在（尾删，A区摘要最干净）"><input type="checkbox" id="ss-tonow" checked onchange="document.getElementById('ss-end').disabled=this.checked"><span>到现在</span></label>
                     </div>
                     <div style="display:flex; flex-direction:column; gap:8px; margin-top:12px;">
@@ -673,11 +685,20 @@
                         <label class="toggle"><input type="checkbox" id="set-MEMORY_ENABLED"><span class="toggle-slider"></span></label>
                     </div>
                     <div class="settings-field">
-                        <label>记忆提取 / 整理模型</label>
-                        <div class="combo-box" id="combo-MEMORY_MODEL">
-                            <input type="text" id="set-MEMORY_MODEL" class="combo-input" placeholder="搜索或输入模型名（留空用默认）" autocomplete="off">
-                            <div class="combo-dropdown" id="dropdown-MEMORY_MODEL"></div>
+                        <label>L1 记忆提取模型</label>
+                        <div class="combo-box" id="combo-MEMORY_EXTRACT_MODEL">
+                            <input type="text" id="set-MEMORY_EXTRACT_MODEL" class="combo-input" placeholder="例如 deepseek/deepseek-v4-flash-0731" autocomplete="off">
+                            <div class="combo-dropdown" id="dropdown-MEMORY_EXTRACT_MODEL"></div>
                         </div>
+                        <small class="form-hint">从短对话提取新的长期记忆；DeepSeek 会自动关闭推理，并由程序严格验收 JSON。</small>
+                    </div>
+                    <div class="settings-field">
+                        <label>L2 夜间事件整理模型</label>
+                        <div class="combo-box" id="combo-CONSOLIDATION_MODEL">
+                            <input type="text" id="set-CONSOLIDATION_MODEL" class="combo-input" placeholder="例如 anthropic/claude-haiku-4.5" autocomplete="off">
+                            <div class="combo-dropdown" id="dropdown-CONSOLIDATION_MODEL"></div>
+                        </div>
+                        <small class="form-hint">负责事件边界、跨分块对齐和夜间 L2 整理，与 L1 独立。</small>
                     </div>
                     <div class="settings-field">
                         <label>记忆模型 API Key (MEMORY_API_KEY)</label>
@@ -869,6 +890,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=5.0-importsafe"></script>
+    <script src="/static/js/dashboard.js?v=5.5-suixiang"></script>
 </body>
 </html>

@@ -207,10 +207,17 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border:none;border-ra
     <div class="panel wide">
       <div class="panel-h"><span class="en">DRAW</span><span class="cn">画图(/画) · 换服务商</span><i class="ti ti-palette"></i></div>
       <div class="row"><div><div class="label">画图总开关</div><div class="hint" id="ig-stat">聊天里发「/画 想要的画面」就出图；下面换画图用的服务商，保存立即生效、不用重启</div></div><div class="ctl"><label class="tg"><input type="checkbox" id="ig-enabled"><span class="track"></span><span class="knob"></span></label></div></div>
-      <div class="row"><div><div class="label">接口地址</div><div class="hint">中转站给的地址，末尾带 /v1；清空保存=回到共用向量检索那套(硅基流动)</div></div><div class="ctl"><input id="ig-base" type="text" placeholder="https://中转站/v1" style="width:300px"></div></div>
+      <div class="row"><div><div class="label">接口地址</div><div class="hint">OpenRouter 填 https://openrouter.ai/api/v1；OR 可留空 key 复用主聊天 key</div></div><div class="ctl"><input id="ig-base" type="text" placeholder="https://openrouter.ai/api/v1" style="width:300px"></div></div>
       <div class="row"><div class="label">API Key</div><div class="ctl"><input id="ig-key" type="password" placeholder="sk-…（留空=不改）" style="width:300px"></div></div>
-      <div class="row"><div><div class="label">模型名</div><div class="hint">以服务商模型列表里写的为准，如 gpt-image-2、Kwai-Kolors/Kolors</div></div><div class="ctl"><input id="ig-model" type="text" style="width:300px"></div></div>
+      <div class="row"><div><div class="label">模型名</div><div class="hint">OpenRouter 的 ChatGPT Image 2：openai/gpt-image-2</div></div><div class="ctl"><input id="ig-model" type="text" style="width:300px"></div></div>
+      <div class="row"><div><div class="label">双人脸锚点</div><div class="hint" id="ig-reference">V 单人只带男图，Harper 单人只带女图，合照带两张；无人物不带图</div></div><div class="ctl"><span class="hint" id="ig-reference-state">检查中…</span></div></div>
       <div class="row"><div class="hint" id="ig-msg">　</div><div class="ctl"><button class="btn sm" id="ig-save">保存(立即生效)</button><button class="btn sm" id="ig-refresh">刷新状态</button></div></div>
+    </div>
+
+    <!-- DESIRE LEXICON -->
+    <div class="panel wide">
+      <div class="panel-h"><span class="en">DESIRE LEXICON</span><span class="cn">亲密语境词表 · Harper 与 V 共管</span><i class="ti ti-heart-cog"></i></div>
+      <div class="row"><div><div class="label">打开词表管理</div><div class="hint">查看、添加、删除开场词/亲密词/排除短语；每次修改留记录，保存后下一条消息立即生效</div></div><div class="ctl"><a class="btn sm" id="desire-lexicon-link" href="#">打开词表</a></div></div>
     </div>
 
     <!-- DECAY -->
@@ -277,13 +284,14 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border:none;border-ra
 const KEY = new URLSearchParams(location.search).get('gateway_key') || '';
 function computeBasePath(){
   const p = location.pathname || '';
-  const stripped = p.replace(/\\/(dashboard|console)\\/?$/, '');
+  const stripped = p.replace(/\/(dashboard|console)\/?$/, '');
   if (!stripped || stripped === '/') return '';
   return stripped.replace(/\/$/, '');
 }
 const BASE = computeBasePath();
 function apiPath(path){ return BASE + path; }
-document.getElementById('back-link').href = BASE + '/' + (KEY ? ('?gateway_key=' + encodeURIComponent(KEY)) : '');
+document.getElementById('back-link').href = BASE + '/dashboard' + (KEY ? ('?gateway_key=' + encodeURIComponent(KEY)) : '');
+document.getElementById('desire-lexicon-link').href = BASE + '/desire-lexicon' + (KEY ? ('?gateway_key=' + encodeURIComponent(KEY)) : '');
 let DATA = null;
 
 function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove('show'),2600); }
@@ -592,6 +600,7 @@ async function igLoad(){
     const k = document.getElementById('ig-key');
     k.value=''; k.placeholder = s.own_key ? '已单独设置（留空=不改）' : (s.key_set ? '正在共用向量检索的 key（留空=继续共用）' : '⚠️ 未配置任何 key');
     document.getElementById('ig-model').value = s.model||'';
+    document.getElementById('ig-reference-state').textContent = (s.v_reference_ready&&s.harper_reference_ready) ? '✅ 两张已装好' : '⏳ 锚点未齐';
     document.getElementById('ig-stat').textContent = (s.enabled?'✅ 开着':'⛔ 关着')+' ｜ 模型: '+(s.model||'?')+' ｜ 地址: '+(s.base_url||'未配置');
   }catch(e){ document.getElementById('ig-stat').textContent='状态加载失败:'+e.message; }
 }
