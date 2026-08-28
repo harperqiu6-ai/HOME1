@@ -1,0 +1,33 @@
+{
+  "note": "Machine-checkable disagreements between layers. Leads for review, not project facts — never merge these into Stage bodies.",
+  "scanned_sources": 41,
+  "counts": {
+    "prose_cites_missing_path": 3
+  },
+  "findings": [
+    {
+      "kind": "prose_cites_missing_path",
+      "summary": "CLAUDE.md refers to CONTEXT.md, which is not in the live tree",
+      "evidence": {
+        "document": "CLAUDE.md",
+        "cited": "CONTEXT.md"
+      }
+    },
+    {
+      "kind": "prose_cites_missing_path",
+      "summary": "domain.md refers to CONTEXT.md, which is not in the live tree",
+      "evidence": {
+        "document": "domain.md",
+        "cited": "CONTEXT.md"
+      }
+    },
+    {
+      "kind": "prose_cites_missing_path",
+      "summary": "domain.md refers to CONTEXT-MAP.md, which is not in the live tree",
+      "evidence": {
+        "document": "domain.md",
+        "cited": "CONTEXT-MAP.md"
+      }
+    }
+  ]
+}

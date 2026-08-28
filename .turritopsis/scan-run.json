@@ -1,0 +1,34 @@
+{
+  "scanner_version": "0.2.0",
+  "schema_version": "2",
+  "mode": "installed-agent",
+  "agent": "codex",
+  "started_at": "2026-08-28T11:26:14.365749+00:00",
+  "completed_at": "2026-08-28T11:26:15.122405+00:00",
+  "state": "skeleton_applied",
+  "evidence_sha256": "9dd6745a01e5d975b4b67e0b05f7cb764804c63193ee82686abbcdc751681fa5",
+  "coverage": {
+    "tree_files": 75,
+    "material_files": 11,
+    "material_characters": 20000,
+    "structure": {
+      "files_mapped": 35,
+      "files_skipped": 0,
+      "chars": 27179,
+      "code_files_found": 41
+    }
+  },
+  "stage_capacity_estimate": {
+    "code_files_found": 41,
+    "typical_stage_count": 14,
+    "estimated_files_per_stage": 3,
+    "guidance": "<=5 detail-rich; 10-30 comfortable; >=100 map-only"
+  },
+  "classification_source": "installed-agent",
+  "warnings": [
+    "Material evidence truncated: omitted 2 ranked prose/data candidates after the 40-file and 20000-character limits; retained role-budgeted README, manifest, CI, and documentation materials in ranked order.",
+    "Material contents truncated: retained leading text only for 4 included files that exceeded the 4000-character per-file limit or remaining role/shared budget."
+  ],
+  "classification_agent_self_reported": "codex",
+  "skeleton_sha256": "ab14e54925a374dacbde185f41cdb17a66a953ad97adfe40f8d77aae8907850c"
+}

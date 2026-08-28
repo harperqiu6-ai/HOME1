@@ -1,0 +1,108 @@
+{
+  "title": "HOME1 Project Map",
+  "subtitle": "HOME1 的共享工程事实、边界和交接地图",
+  "version": 7,
+  "classification": {
+    "source": "installed-agent",
+    "agent_self_reported": "codex",
+    "created_at": "2026-08-28T11:30:00Z"
+  },
+  "currents": [
+    {
+      "id": "project",
+      "name": "项目入口",
+      "blurb": "HOME1 是什么以及新人从哪里开始",
+      "stages": [
+        {
+          "id": "project.orientation",
+          "title": "HOME1 是什么以及从哪里开始",
+          "body": "# HOME1 是什么以及从哪里开始\n\nType: orientation\nPurpose: 回答项目目标、主要入口、服务对象和首次阅读顺序。\nSearch hints: HOME1 是什么 新窗口 从哪开始 项目入口 Vesper KELIVO ECHO Telegram\nSummary: HOME1 是 V/Vesper 的 FastAPI 记忆网关，连接网页/ECHO/Telegram 与模型、PostgreSQL 记忆和主动行为系统；新窗口先读本 Stage、`work.handoff`、`safety.boundaries`，再按任务读取其余 Stage。\nVerified: 2026-08-28 by codex from repository evidence\nStatus: current\nAuthority: 项目定位与新人阅读入口；不负责详细架构、部署状态或当前任务。\nFreshness: steady\n\n## Knowledge\n\n- 服务对象是 Harper 与 V/Vesper 的长期连续关系，不是通用无状态聊天代理。\n- `main.py` 是主要 FastAPI 入口，承载聊天兼容接口、Web 页面、Telegram、记忆召回/摘要、主动消息及大量管理 API。\n- `database.py` 管 PostgreSQL 持久化；`memory_extractor.py` 管短对话记忆提取；欲望/主动行为已拆出若干 `desire*.py` 模块。\n- 人类入口包括 ECHO/KELIVO、Telegram、Dashboard/Console；这些入口共享人设和全局记忆，但逐字历史按会话线隔离。\n- 新任务的最小阅读顺序：`work.handoff` → `safety.boundaries` → 与任务匹配的架构/流程/数据/运维 Stage → 对应源码。\n\n## Evidence\n\n- `AGENTS.md` — 项目定位、技术栈、交接纪律和各功能说明。\n- `README.md` — 公开的启动、接口与功能概览。\n- `main.py` — FastAPI 应用和主要外部入口。\n\n## Unknowns\n\n- 仓库文档不能单独证明当前线上进程、数据库和配置值；需要现场检查。\n- ECHO/cyberboss 属于相邻项目，本仓库只包含 HOME1 侧接口，完整链路需同时查 cyberboss。\n\n## Update triggers\n\n- 项目主入口、服务对象或核心产品边界发生变化。\n- 主应用从 `main.py` 拆成独立服务或 ECHO/Telegram 的责任边界改变。\n"
+        }
+      ]
+    },
+    {
+      "id": "runtime",
+      "name": "真实运行位置",
+      "blurb": "源码、生产服务、配置和数据分别以哪里为准",
+      "stages": [
+        {
+          "id": "runtime.authority",
+          "title": "源码、线上服务和配置以哪里为准",
+          "body": "# 源码、线上服务和配置以哪里为准\n\nType: authority\nPurpose: 区分源码仓库、VPS 运行副本、数据库配置和历史部署。\nSearch hints: 线上跑哪个 生产版本 配置生效 VPS home1-local /opt/home1 Render 数据库 DB authority\nSummary: 当前文档声明 VPS 的 `home1-local` 为生产服务、`/opt/home1/app` 为运行副本；本仓库是源码工作区，运行配置优先以 PostgreSQL `gateway_config` 和 `/opt/home1/home1.env` 为准，旧 Render 不是主入口。\nVerified: 2026-08-28 by codex from repository evidence\nStatus: current\nAuthority: 当前环境与配置的权威顺序；不证明此刻进程健康或具体配置值。\nFreshness: volatile\n\n## Knowledge\n\n权威顺序按问题区分：\n\n1. 要改代码：以当前 HOME1 源码工作区为编辑来源，但部署前必须识别未提交改动和正确 HEAD。\n2. 要判断实际运行文件：检查 `/opt/home1/app`，不能假设源码工作区已自动同步。\n3. 要判断服务是否运行：现场检查 `home1-local` 进程、日志和 `/health`；文档不能证明实时健康。\n4. 要判断模型、开关等有效配置：启动时 DB `gateway_config` 会覆盖部分模块默认值，因此优先检查 DB，再看环境文件和源码默认值。\n5. 密钥只应存在 `/opt/home1/home1.env` 或 DB 等私有位置，不应进入仓库或 Turritopsis Stage。\n6. 旧 Render 是历史部署，不应用它判断 HOME1 当前是否可用。\n\n## Evidence\n\n- `AGENTS.md` — 明确记录 VPS、`home1-local`、`/opt/home1/app`、本机 PostgreSQL 和 DB 覆盖规则。\n- `README.md` — 当前部署与启动说明。\n- `Dockerfile` — 容器构建入口，仅证明可构建形态，不证明当前生产采用容器。\n\n## Unknowns\n\n- 本次试点没有读取 `/opt/home1/home1.env`、生产 DB、systemd 状态或线上健康接口。\n- 当前源码工作区与 `/opt/home1/app` 是否完全一致尚未核对。\n\n## Update triggers\n\n- 生产主机、服务名、部署路径、数据库或配置加载方式变化。\n- Render、容器或其他部署重新成为主入口。\n"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "name": "系统结构",
+      "blurb": "主要组件、职责和依赖方向",
+      "stages": [
+        {
+          "id": "architecture.components",
+          "title": "HOME1 的主要组件如何分工",
+          "body": "# HOME1 的主要组件如何分工\n\nType: architecture\nPurpose: 定位 API、数据库、记忆、欲望系统、前端和外部入口的代码责任。\nSearch hints: 架构 组件 main.py database memory_extractor desire dashboard cyberboss 哪个文件\nSummary: `main.py` 仍是编排中心，`database.py` 拥有持久化，`memory_extractor.py` 负责 L1 提取，`consolidation_transaction.py` 负责整理事务安全，`desire*.py` 负责欲望状态与调度，模板和 static 目录负责人类界面。\nVerified: 2026-08-28 by codex from repository evidence\nStatus: current\nAuthority: 组件职责和依赖方向；不负责完整请求时序或线上拓扑实况。\nFreshness: steady\n\n## Knowledge\n\n- `main.py`：FastAPI 生命周期、认证中间件、OpenAI 兼容聊天接口、上下文组装、缓存、召回、摘要、回忆墙、图片、Telegram、主动消息和管理 API 的总编排层。\n- `database.py`：asyncpg 数据访问层，拥有对话、记忆、配置、照片、缓存状态、主动消息及相关表的读写。\n- `memory_extractor.py`：从短对话生成受约束的 L1 记忆，执行结构、数量、长度与身份校验。\n- `consolidation_transaction.py`：L1→L2 整理写入的事务保护和失败处理。\n- `desire.py`、`desire_store.py`、`desire_pulse.py`、`desire_scheduler.py`、`desire_lexicon.py`：欲望维度、持久状态、脉冲和主动行为调度。\n- `arousal/`：亲密唤起相关的上下文、核心判断、词典和存储模块；存在多份 `.bak` 沉积物，不能把备份当当前实现。\n- `templates/` 与 `static/`：Dashboard、Console 和配置页面；它们通过 HOME1 API 操作服务端状态。\n- cyberboss/ECHO 是外部运行方，通过 HOME1 暴露的聊天、主动消息、亲密收件等接口接入，不由本仓库完整定义。\n\n依赖总体方向是：入口/页面 → `main.py` 编排 → 数据与专用模块 → PostgreSQL/模型提供商/Telegram 等外部系统。\n\n## Evidence\n\n- `main.py` — 路由、生命周期和编排函数声明。\n- `database.py` — 数据库函数与表访问。\n- `memory_extractor.py` — 记忆提取入口和校验。\n- `desire.py`, `desire_scheduler.py` — 欲望状态与调度边界。\n- `AGENTS.md` — 跨组件关系及线上经验。\n\n## Unknowns\n\n- `main.py` 当前有大量未提交改动；本 Stage 描述扫描时工作区，不等于已部署版本。\n- cyberboss 内部组件需在其自己的仓库地图中维护。\n\n## Update triggers\n\n- 模块拆分、服务边界、状态所有者或外部入口变化。\n- `main.py` 的职责迁出或欲望/记忆模块重新合并。\n"
+        }
+      ]
+    },
+    {
+      "id": "flow",
+      "name": "对话与记忆链路",
+      "blurb": "一次消息如何经过上下文、模型、持久化和跨线记忆",
+      "stages": [
+        {
+          "id": "flow.message_memory",
+          "title": "一条消息如何进入 V 并形成记忆",
+          "body": "# 一条消息如何进入 V 并形成记忆\n\nType: flow\nPurpose: 追踪网页、ECHO、Telegram 消息到模型回复、对话落库和记忆提取的完整路径。\nSearch hints: 消息链路 chat completions Telegram ECHO session line 缓存 召回 落库 记忆提取\nSummary: 消息最终进入 `/v1/chat/completions`，按会话线选择逐字历史和摘要，拼入共享人设/L5/召回记忆，经模型生成回复；非跳过日志请求再落对话并异步进入记忆提取，跨线共享依靠全局记忆而不是混用逐字历史。\nVerified: 2026-08-28 by codex from repository evidence\nStatus: current\nAuthority: 对话和记忆主链路；不负责单独的夜间整理算法或全部 API 契约。\nFreshness: steady\n\n## Knowledge\n\n1. KELIVO/ECHO 直接调用 OpenAI 兼容聊天接口；Telegram webhook 经 `_tg_brain_reply()` 内部转到同一聊天接口。\n2. 请求头 `X-Session-Line` 选择主线、`rp`、`tg` 或其他线；`contextvars` 隔离并发请求的线和回复风格。\n3. HOME1 读取共享人设、用户档案、L5 和召回记忆，同时读取当前线自己的逐字历史与摘要。\n4. `build_partitioned_messages()` 等组装函数构造缓存友好的 system/摘要/A区/B区/当前轮；子线近况以文本拼接进入既有块，不增加新的缓存断点。\n5. 请求转发给配置的模型提供商，流式或非流式回复由 `chat_completions()`/`stream_and_capture()` 返回并捕获。\n6. 正常请求将用户和助手消息写入当前会话线；带 `X-Skip-Conversation-Log` 的内部测试或辅助请求不能污染对话。\n7. `process_memories_background()` 在后台把合格对话交给 `memory_extractor.py`，生成受验收约束的 L1 记忆并写入数据库。\n8. L1 后续由整理管线合并为 L2；跨线长期连续性来自共享记忆召回。逐字历史和摘要仍按线隔离。\n\n## Evidence\n\n- `main.py` — `chat_completions`, `build_partitioned_messages`, `stream_and_capture`, `process_memories_background`。\n- `database.py` — 会话历史、摘要和记忆持久化接口。\n- `memory_extractor.py` — L1 提取与验收。\n- `AGENTS.md` — 会话线、缓存断点、TG/ECHO 接线和跨线规则。\n\n## Unknowns\n\n- 本次未发真实聊天请求，因此没有验证扫描时源码在生产环境中的端到端行为。\n- cyberboss 在调用 HOME1 前后的工具编排不属于本 Stage。\n\n## Update triggers\n\n- 聊天入口、会话线、缓存分区、召回或后台记忆写入链路变化。\n- `X-Skip-Conversation-Log`、跨线背景或模型转发语义改变。\n"
+        }
+      ]
+    },
+    {
+      "id": "memory",
+      "name": "记忆数据",
+      "blurb": "记忆层级、整理、回忆墙和数据生命周期",
+      "stages": [
+        {
+          "id": "memory.lifecycle",
+          "title": "记忆如何分层、整理和保留",
+          "body": "# 记忆如何分层、整理和保留\n\nType: data\nPurpose: 回答 L1/L2/L3、逐字历史、摘要、回忆墙、归档和整理的数据责任。\nSearch hints: 记忆 L1 L2 L3 layer fragment consolidation 回忆墙 daily diary 归档 数据库 生命周期\nSummary: 逐字对话与线摘要负责短期连续性，L1 保存原子碎片，L2 合并为事件，L3/回忆墙保存长期重要内容；整理采用可追溯来源和事务保护，特殊记忆必须防止被日常碎片清理误伤。\nVerified: 2026-08-28 by codex from repository evidence\nStatus: current\nAuthority: 记忆数据的分层、转换和保留规则；不负责模型人设内容或当前数据库行数。\nFreshness: steady\n\n## Knowledge\n\n- 逐字历史：按 session line 保存，给当前上下文重放；不能跨线直接混用。\n- 线摘要/分区缓存摘要：压缩较旧对话，控制模型输入成本，仍属于会话连续性而非长期事实库。\n- L1：`memory_extractor.py` 从短对话生成少量原子事实/事件碎片；必须明确 Harper 与 V 的主体，虚构/RP/梦境不得冒充现实。\n- L2：整理管线按逻辑日和事件合并 L1，保留 `merged_from` 来源并停用已吸收碎片；失败或部分失败不能伪报成功。\n- L3/核心/回忆墙：长期、高价值或日记式记忆，不应被普通碎片整理随意覆盖。\n- Telegram `/同步` 生成短期小抄供主线一次性读取，不写长期记忆；子线 `/归档` 才会生成全局记忆并软归档原线。\n- 特殊条目写入全局召回后，必须检查按日清理是否会错误停用它；RP 归档总结已有明确豁免教训。\n- 数据库是权威存储，正文、元数据和照片可能分表保存；更新回忆墙时必须保持正文与 `mw_meta` 一致。\n\n## Evidence\n\n- `database.py` — conversations、memories、照片、摘要和整理所需的数据操作。\n- `memory_extractor.py` — L1 生成与身份/长度/数量约束。\n- `consolidation_transaction.py` — 整理事务与安全落库。\n- `AGENTS.md` — L1/L2/L3、逻辑日、回忆墙、同步/归档和事故记录。\n\n## Unknowns\n\n- 本次没有查询生产数据库，因此不记录实时行数、积压量或当前整理状态。\n- 历史迁移形成的旧碎片是否仍待专门处理，需要通过 DB 现场核验。\n\n## Update triggers\n\n- 记忆层级、表结构、整理事务、回忆墙来源或归档规则变化。\n- 新增任何会被日常清理扫描到的特殊记忆类型。\n"
+        }
+      ]
+    },
+    {
+      "id": "safety",
+      "name": "不可破坏边界",
+      "blurb": "安全、隐私、缓存和内容修改红线",
+      "stages": [
+        {
+          "id": "safety.boundaries",
+          "title": "哪些东西不能随便改或删除",
+          "body": "# 哪些东西不能随便改或删除\n\nType: boundary\nPurpose: 在修改前快速确认缓存、配置、密钥、亲密内容、跨线和数据清理红线。\nSearch hints: 不能改 不能删 红线 cache_control 四个 密钥 亲密内容 数据清理 配置 DB 覆盖\nSummary: 最关键红线是缓存断点不超过 4、有效配置以 DB 覆盖结果为准、密钥不进仓库、亲密内容未经许可不改、跨线历史不混、特殊记忆和旧实现不能在未核验线上依赖前删除。\nVerified: 2026-08-28 by codex from repository evidence\nStatus: current\nAuthority: 已记录的工程与内容安全边界；不替代具体改动的测试和人工批准。\nFreshness: steady\n\n## Knowledge\n\n1. Anthropic 上下文中 `cache_control` 断点总数必须 ≤4；新增背景应拼入已有文本块，不能随手增加缓存块。\n2. `gateway_config` 可在启动时覆盖源码模块变量。改模型或配置前先判断真正权威来源，改完通常需要重启加载。\n3. 密钥、真实私密图片、数据库连接串不得写入 Git、日志、Stage 或扫描证据；只记录它们的存放位置。\n4. 已生成的亲密内容默认只可审计，不得因风格或主观质量重写；严重事实错误也必须先展示证据和拟修改内容，得到 Harper 明确许可。\n5. 主线、rp、tg 的逐字历史和摘要必须隔离；共享的是全局记忆。任何跨线近况注入都要防止回复风格和身份串线。\n6. 记忆删除、合并和回忆墙更新必须保留来源、软删除或回滚路径；不要把特殊归档记忆当普通当日碎片清走。\n7. `.bak`、旧部署和历史实现不是当前权威，但删除前必须确认没有导入、服务引用或恢复用途。\n8. 多窗口可能同时修改本仓库；提交、部署或批量更新前必须重新检查 HEAD、工作区和目标 revision。\n\n## Evidence\n\n- `AGENTS.md` — 血泪教训、密钥位置、亲密内容死命令、缓存与多窗口纪律。\n- `main.py` — 认证、缓存组装、会话线、数据清理和内容处理入口。\n- `database.py` — 配置覆盖、软删除和数据更新路径。\n- `memory_extractor.py` — 身份、事实、虚构与亲密内容约束。\n\n## Unknowns\n\n- 扫描器只能识别部分常见密钥形状，不是完整 secret scanner。\n- 某个备份文件或旧目录能否删除，必须结合生产引用和 Git 历史逐项确认。\n\n## Update triggers\n\n- 认证、隐私、缓存协议、内容修改许可或数据清理机制变化。\n- 新增外部模型、图片、语音或跨线数据通道。\n"
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "name": "运行与排障",
+      "blurb": "安全部署、重启、健康检查和常见故障入口",
+      "stages": [
+        {
+          "id": "operations.runbook",
+          "title": "如何安全部署、验证和排障 HOME1",
+          "body": "# 如何安全部署、验证和排障 HOME1\n\nType: operations\nPurpose: 给出从源码检查到生产同步、重启、健康确认和首要诊断的最短路径。\nSearch hints: 怎么部署 重启 home1-local 健康检查 排障 日志 systemctl /opt/home1 app VPS\nSummary: 安全部署顺序是先识别工作区与 HEAD、做针对性语法/测试、明确同步文件到 `/opt/home1/app`、重启 `home1-local`，最后检查服务状态、日志和 `/health`；任何一步失败都停止继续扩大变更。\nVerified: 2026-08-28 by codex from repository evidence\nStatus: current\nAuthority: 仓库记录的操作流程；不宣称未经现场检查的运行状态。\nFreshness: volatile\n\n## Knowledge\n\n部署前：\n\n- 读 `work.handoff` 和 `safety.boundaries`。\n- 运行 `git status --short`、`git log -1`，确认没有覆盖其他窗口的改动。\n- 明确本次要同步的文件清单；不要把整个脏工作区无差别部署。\n- Python 改动至少执行 `python -m py_compile`；再运行与改动区域对应的测试。\n\n部署：\n\n- 源码工作区不是自动生产目录；把已经核验的文件同步到 `/opt/home1/app`。\n- 需要重新读取全局配置的变更必须重启 `home1-local`。\n- 不在没有明确变更范围、测试结果和回滚来源时重启。\n\n部署后：\n\n- 检查 `home1-local` 状态和近期日志。\n- 请求 `/health`，再对改动功能做不会污染对话/记忆的 smoke test；聊天测试使用 `X-Skip-Conversation-Log: true`。\n- 若涉及 DB 配置，核对启动后有效值，而不是只看源码常量。\n- 若涉及 cyberboss/ECHO，再检查其日志和 HOME1 接口调用结果。\n\n常见首查：模型 502 先看有效模型名和缓存断点；主动消息不出先分清闸门未触发、模型拒发、Bark/TG 发送失败；夜间整理先查 timer、状态 API 和 partial/error 标记。\n\n## Evidence\n\n- `AGENTS.md` — 当前部署路径、重启要求、健康与故障经验。\n- `README.md`, `使用手册.md` — 启动、接口和人工操作说明。\n- `Dockerfile` — 可构建入口，但不证明生产当前使用容器。\n\n## Unknowns\n\n- 本次试点明确未执行同步、重启、线上 API 或数据库检查。\n- 生产服务的即时 PID、健康状态和源码 revision 尚未核验。\n\n## Update triggers\n\n- 部署目标、服务管理器、健康检查、定时任务或恢复步骤变化。\n- 生产转为容器、CI/CD 自动发布或多实例运行。\n"
+        }
+      ]
+    },
+    {
+      "id": "work",
+      "name": "当前工作交接",
+      "blurb": "当前工作区状态、停点、风险和下一步",
+      "stages": [
+        {
+          "id": "work.handoff",
+          "title": "当前做到哪里以及下一步做什么",
+          "body": "# 当前做到哪里以及下一步做什么\n\nType: handoff\nPurpose: 让新窗口先知道当前停点、未提交改动、阻塞项和最小下一步。\nSearch hints: 上次做到哪 当前工作 下一步 blocker 未提交 改动 handoff 接手\nSummary: 2026-08-28 已完成两个本地提交：HOME1 累积业务检查点 `fd95f1c` 和随后位于 HEAD 的 Turritopsis 项目地图；工作区干净，未推送、未部署、未重启，下一步由 Harper 决定是否推送。\nVerified: 2026-08-28 by codex from repository and live Git evidence\nStatus: current\nAuthority: 当前工程工作交接；不负责稳定架构或历史决策。\nFreshness: volatile\n\n## Current state\n\n- 两个月累积的 57 个业务、文档、迁移和测试文件已提交为 `fd95f1c`（`checkpoint accumulated HOME1 memory and desire work`）。\n- 提交排除了 `.bak`、解释器缓存和 Turritopsis 滚动备份；密钥形状扫描和 `git diff --cached --check` 均通过。\n- `.git/index.lock` 已自行消失，检查时没有活动 Git 进程占用；未执行删除锁文件操作。\n- 新增 `.turritopsis/`，包含离线扫描证据和 8 个 Stage；未读取生产密钥或数据库。\n- Turritopsis canonical map、扫描证据和 changelog 已作为独立的第二个本地提交保存在 HEAD。\n- `turritopsis brief` 报出的 3 个 `CONTEXT.md`/`CONTEXT-MAP.md` 缺失项是条件性文档引用，不是已确认故障；`docs/agents/domain.md` 明确说这些文件不存在时静默继续，暂按误报处理。\n- Harper 于 2026-08-28 决定保留回忆墙 L1 兜底：正常优先读 active L2；当天没有 L2 时允许读取最近最多 60 条 L1，并继续执行人物身份、事实来源和虚构/现实边界约束。对应旧测试已按这一规则及递进压缩/私密漫游当前接口更新。\n- 提交前运行了不含数据库集成/复现脚本的 `tests/test_*.py`：256 项通过，另有 17 个子测试通过；该测试范围全绿。\n\n## Smallest next action\n\n1. 不自动部署或重启；由 Harper 决定是否把当前领先远端的 5 个提交推送到 GitHub。\n2. 推送前如有其他窗口继续提交，重新检查 HEAD、测试和分支领先数量。\n3. 后续新窗口先运行 `turritopsis brief` 或读取本 Stage。\n\n## Do not repeat\n\n- 不要因为看到大量 `.bak`、untracked 文件或旧 workflow 就批量删除。\n- 不要把被忽略的本地备份重新强制加入 Git，也不要把本地提交等同于已经部署。\n- 不要把 Turritopsis 扫描结果当作当前线上状态。\n\n## Evidence\n\n- Git commit `fd95f1c` — 累积业务检查点。\n- `git status --short`, `git diff --cached --check` and staged secret-shape scan — 2026-08-28 提交前检查。\n- `AGENTS.md` — 多窗口纪律、部署路径和待办。\n- `migrations/20260828_desire_classification_retry_state.sql` — 近期欲望分类重试状态变更线索。\n\n## Unknowns\n\n- 线上 `/opt/home1/app` 与当前工作区的实际差异。\n\n## Update triggers\n\n- 当前任务、工作区状态、阻塞项、验证结果或下一步变化。\n- 发生提交、部署、回滚或生产核验。\n"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,156 @@
+{
+  "title": "HOME1 Project Map",
+  "subtitle": "HOME1 的共享工程事实、边界和交接地图",
+  "classification_provenance": {
+    "source": "installed-agent",
+    "agent_self_reported": "codex",
+    "created_at": "2026-08-28T11:30:00Z",
+    "notes": "基于 Turritopsis 0.2.0 离线扫描、仓库文档和源码声明建立；未查询生产数据库或线上运行时。"
+  },
+  "currents": [
+    {
+      "id": "project",
+      "name": "项目入口",
+      "blurb": "HOME1 是什么以及新人从哪里开始",
+      "stages": [
+        {
+          "id": "project.orientation",
+          "title": "HOME1 是什么以及从哪里开始",
+          "type": "orientation",
+          "freshness": "steady",
+          "purpose": "回答项目目标、主要入口、服务对象和首次阅读顺序。",
+          "search_hints": "HOME1 是什么 新窗口 从哪开始 项目入口 Vesper KELIVO ECHO Telegram",
+          "authority": "项目定位与新人阅读入口；不负责详细架构、部署状态或当前任务。",
+          "evidence_paths": ["AGENTS.md", "README.md", "main.py"],
+          "update_triggers": ["项目主入口、服务对象或核心产品边界发生变化"]
+        }
+      ]
+    },
+    {
+      "id": "runtime",
+      "name": "真实运行位置",
+      "blurb": "源码、生产服务、配置和数据分别以哪里为准",
+      "stages": [
+        {
+          "id": "runtime.authority",
+          "title": "源码、线上服务和配置以哪里为准",
+          "type": "authority",
+          "freshness": "volatile",
+          "purpose": "区分源码仓库、VPS 运行副本、数据库配置和历史部署。",
+          "search_hints": "线上跑哪个 生产版本 配置生效 VPS home1-local /opt/home1 Render 数据库 DB authority",
+          "authority": "当前环境与配置的权威顺序；不证明此刻进程健康或具体配置值。",
+          "evidence_paths": ["AGENTS.md", "README.md", "Dockerfile"],
+          "update_triggers": ["生产主机、服务名、部署路径、数据库或配置加载方式变化"]
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "name": "系统结构",
+      "blurb": "主要组件、职责和依赖方向",
+      "stages": [
+        {
+          "id": "architecture.components",
+          "title": "HOME1 的主要组件如何分工",
+          "type": "architecture",
+          "freshness": "steady",
+          "purpose": "定位 API、数据库、记忆、欲望系统、前端和外部入口的代码责任。",
+          "search_hints": "架构 组件 main.py database memory_extractor desire dashboard cyberboss 哪个文件",
+          "authority": "组件职责和依赖方向；不负责完整请求时序或线上拓扑实况。",
+          "evidence_paths": ["AGENTS.md", "main.py", "database.py", "memory_extractor.py", "desire.py", "desire_scheduler.py"],
+          "update_triggers": ["模块拆分、服务边界、状态所有者或外部入口变化"]
+        }
+      ]
+    },
+    {
+      "id": "flow",
+      "name": "对话与记忆链路",
+      "blurb": "一次消息如何经过上下文、模型、持久化和跨线记忆",
+      "stages": [
+        {
+          "id": "flow.message_memory",
+          "title": "一条消息如何进入 V 并形成记忆",
+          "type": "flow",
+          "freshness": "steady",
+          "purpose": "追踪网页、ECHO、Telegram 消息到模型回复、对话落库和记忆提取的完整路径。",
+          "search_hints": "消息链路 chat completions Telegram ECHO session line 缓存 召回 落库 记忆提取",
+          "authority": "对话和记忆主链路；不负责单独的夜间整理算法或全部 API 契约。",
+          "evidence_paths": ["AGENTS.md", "main.py", "database.py", "memory_extractor.py"],
+          "update_triggers": ["聊天入口、会话线、缓存分区、召回或后台记忆写入链路变化"]
+        }
+      ]
+    },
+    {
+      "id": "memory",
+      "name": "记忆数据",
+      "blurb": "记忆层级、整理、回忆墙和数据生命周期",
+      "stages": [
+        {
+          "id": "memory.lifecycle",
+          "title": "记忆如何分层、整理和保留",
+          "type": "data",
+          "freshness": "steady",
+          "purpose": "回答 L1/L2/L3、逐字历史、摘要、回忆墙、归档和整理的数据责任。",
+          "search_hints": "记忆 L1 L2 L3 layer fragment consolidation 回忆墙 daily diary 归档 数据库 生命周期",
+          "authority": "记忆数据的分层、转换和保留规则；不负责模型人设内容或当前数据库行数。",
+          "evidence_paths": ["AGENTS.md", "database.py", "memory_extractor.py", "consolidation_transaction.py"],
+          "update_triggers": ["记忆层级、表结构、整理事务、回忆墙来源或归档规则变化"]
+        }
+      ]
+    },
+    {
+      "id": "safety",
+      "name": "不可破坏边界",
+      "blurb": "安全、隐私、缓存和内容修改红线",
+      "stages": [
+        {
+          "id": "safety.boundaries",
+          "title": "哪些东西不能随便改或删除",
+          "type": "boundary",
+          "freshness": "steady",
+          "purpose": "在修改前快速确认缓存、配置、密钥、亲密内容、跨线和数据清理红线。",
+          "search_hints": "不能改 不能删 红线 cache_control 四个 密钥 亲密内容 数据清理 配置 DB 覆盖",
+          "authority": "已记录的工程与内容安全边界；不替代具体改动的测试和人工批准。",
+          "evidence_paths": ["AGENTS.md", "main.py", "database.py", "memory_extractor.py"],
+          "update_triggers": ["认证、隐私、缓存协议、内容修改许可或数据清理机制变化"]
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "name": "运行与排障",
+      "blurb": "安全部署、重启、健康检查和常见故障入口",
+      "stages": [
+        {
+          "id": "operations.runbook",
+          "title": "如何安全部署、验证和排障 HOME1",
+          "type": "operations",
+          "freshness": "volatile",
+          "purpose": "给出从源码检查到生产同步、重启、健康确认和首要诊断的最短路径。",
+          "search_hints": "怎么部署 重启 home1-local 健康检查 排障 日志 systemctl /opt/home1 app VPS",
+          "authority": "仓库记录的操作流程；不宣称未经现场检查的运行状态。",
+          "evidence_paths": ["AGENTS.md", "README.md", "使用手册.md", "Dockerfile"],
+          "update_triggers": ["部署目标、服务管理器、健康检查、定时任务或恢复步骤变化"]
+        }
+      ]
+    },
+    {
+      "id": "work",
+      "name": "当前工作交接",
+      "blurb": "当前工作区状态、停点、风险和下一步",
+      "stages": [
+        {
+          "id": "work.handoff",
+          "title": "当前做到哪里以及下一步做什么",
+          "type": "handoff",
+          "freshness": "volatile",
+          "purpose": "让新窗口先知道当前停点、未提交改动、阻塞项和最小下一步。",
+          "search_hints": "上次做到哪 当前工作 下一步 blocker 未提交 改动 handoff 接手",
+          "authority": "当前工程工作交接；不负责稳定架构或历史决策。",
+          "evidence_paths": ["AGENTS.md", "docs/agents/issue-tracker.md", "migrations/20260828_desire_classification_retry_state.sql"],
+          "update_triggers": ["当前任务、工作区状态、阻塞项、验证结果或下一步变化"]
+        }
+      ]
+    }
+  ]
+}
