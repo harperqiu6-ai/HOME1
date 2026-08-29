@@ -1,3 +1,5 @@
+import math
+
 from arousal.core import initial_state, public_snapshot
 
 
@@ -36,3 +38,19 @@ def test_public_snapshot_value_is_projected_and_clamped():
     state["value"] = 1.4
     snapshot = public_snapshot(state, 1000)
     assert snapshot["value"] == 1.0
+
+
+def test_public_snapshot_can_show_current_libido_floor_without_mutating_state():
+    state = initial_state(1000)
+    snapshot = public_snapshot(state, 1000, libido=.90)
+    assert math.isclose(snapshot["value"], 0.244)
+    assert snapshot["phase"] == "idle"
+    assert state["value"] == 0
+
+
+def test_public_snapshot_suppresses_libido_floor_during_refractory():
+    state = initial_state(1000)
+    state["refractory_until"] = 1100
+    snapshot = public_snapshot(state, 1050, libido=1)
+    assert snapshot["value"] == 0
+    assert snapshot["phase"] == "refractory"

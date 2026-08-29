@@ -12561,7 +12561,9 @@ async def api_arousal_user_event(request: Request):
         if not duplicate:
             await _follow_arousal_with_libido(state, event_id, now)
         return {
-            "ok": True, "phase": public_snapshot(state, now)["phase"],
+            "ok": True, "phase": public_snapshot(
+                state, now, libido=drives["libido"],
+            )["phase"],
             "status_line": status_line(state, now), "duplicate": duplicate,
         }
     except Exception as exc:
@@ -12640,7 +12642,10 @@ async def api_arousal_state():
         return {"enabled": False}
     try:
         now = time.time()
-        return public_snapshot(await _arousal_store.read(now), now)
+        drives = await _arousal_drive_snapshot()
+        return public_snapshot(
+            await _arousal_store.read(now), now, libido=drives["libido"],
+        )
     except Exception as exc:
         print(f"⚠️ arousal state failed: {exc}")
         return {"ok": False, "error": "internal_error"}

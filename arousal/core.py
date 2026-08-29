@@ -33,6 +33,9 @@ RESERVE_RECOVERY = 3 * 60 * 60.0
 PASSIVE_CONTACT_CAP = 0.72
 ROUND_MULTIPLIER = 0.72
 REFRACTORY_MULTIPLIER = 0.35
+LIBIDO_BODY_WAKE = 0.50
+LIBIDO_BODY_FLOOR_AT_WAKE = 0.02
+LIBIDO_BODY_FLOOR_MAX = 0.30
 LEDGER_LIMIT = 256
 PENDING_RELEASE_MAX_AGE = 30 * 60.0
 PROMPT_CONSTRAINT = "这是身体状态，让它影响节奏和动作；不要复述数字、不要把状态报告给伴侣。"
@@ -60,6 +63,25 @@ def _finite(value: Any, default: float = 0.0) -> float:
 
 def _clamp(value: Any) -> float:
     return max(0.0, min(1.0, _finite(value)))
+
+
+def libido_body_floor(libido: Any) -> float:
+    """Return tonic BODY readiness without reaching the charged phase alone."""
+    value = _clamp(libido)
+    if value < LIBIDO_BODY_WAKE:
+        return 0.0
+    progress = (value - LIBIDO_BODY_WAKE) / (1.0 - LIBIDO_BODY_WAKE)
+    return _clamp(
+        LIBIDO_BODY_FLOOR_AT_WAKE
+        + progress * (LIBIDO_BODY_FLOOR_MAX - LIBIDO_BODY_FLOOR_AT_WAKE)
+    )
+
+
+def _apply_libido_floor(state: dict, libido: Any, now: float) -> None:
+    """Prime BODY from desire, except during the explicit recovery window."""
+    if _finite(now) < _finite(state.get("refractory_until")):
+        return
+    state["value"] = max(_clamp(state.get("value")), libido_body_floor(libido))
 
 
 def initial_state(now: float = 0.0) -> dict:
@@ -269,6 +291,7 @@ def apply_user_event(state, text, *, event_id, libido, now, lexicon, drive_snaps
     if digest in state["processed_event_ids"]:
         return state, status_line(state, now)
     state, _, _ = _project(state, now)
+    _apply_libido_floor(state, libido, now)
     scene_open = state["value"] >= CHARGED
     analysis = analyze_text(text, lexicon, actor="user", scene_open=scene_open)
     if analysis["accepted"]:
@@ -308,6 +331,7 @@ def apply_assistant_event(state, text, *, event_id, source_user_event_id, comple
     if digest in state["processed_event_ids"]:
         return state, False
     state, _, _ = _project(state, now)
+    _apply_libido_floor(state, libido, now)
     _expire_pending_release(state, _finite(now))
     active_lexicon = lexicon if isinstance(lexicon, dict) else {}
     scene_open = state["value"] >= CHARGED
@@ -396,7 +420,7 @@ def _label(value: float, bands: tuple[tuple[float, str], ...]) -> str:
     return bands[-1][1]
 
 
-def public_snapshot(state, now) -> dict:
+def public_snapshot(state, now, *, libido=None) -> dict:
     """Return the panel-safe body snapshot.
 
     Intentional tutorial deviation: ``value`` is exposed because Harper needs
@@ -409,6 +433,8 @@ def public_snapshot(state, now) -> dict:
     cannot tell whether a hold she pressed at low arousal actually took.
     """
     state = _view(state, now)
+    if libido is not None:
+        _apply_libido_floor(state, libido, now)
     refractory = _finite(now) < state["refractory_until"]
     if refractory:
         phase = "refractory"

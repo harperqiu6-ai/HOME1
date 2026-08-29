@@ -1,18 +1,24 @@
 import copy
 import json
+import math
 import tempfile
 from pathlib import Path
 
 from arousal.context import analyze_text, detect_release
 from arousal.core import (
+    CHARGED,
     EDGE,
     GAIN,
+    LIBIDO_BODY_FLOOR_AT_WAKE,
+    LIBIDO_BODY_FLOOR_MAX,
+    LIBIDO_BODY_WAKE,
     PASSIVE_CONTACT_CAP,
     PONR,
     apply_assistant_event,
     apply_user_event,
     control_event,
     initial_state,
+    libido_body_floor,
     status_line,
 )
 from arousal.lexicon import load_lexicon
@@ -49,6 +55,43 @@ def beat(state, index, text="按动敏感点"):
 
 def test_active_stimulus_gain_is_tuned_for_real_dialogue_pacing():
     assert GAIN == .28
+
+
+def test_libido_body_floor_starts_at_wake_and_caps_below_charged():
+    assert LIBIDO_BODY_WAKE == .50
+    assert LIBIDO_BODY_FLOOR_AT_WAKE == .02
+    assert LIBIDO_BODY_FLOOR_MAX == .30
+    assert libido_body_floor(.49) == 0
+    assert libido_body_floor(.50) == .02
+    assert math.isclose(libido_body_floor(.65), .104)
+    assert math.isclose(libido_body_floor(.90), .244)
+    assert libido_body_floor(1) == .30
+    assert LIBIDO_BODY_FLOOR_MAX < CHARGED
+
+
+def test_high_libido_primes_body_even_when_words_do_not_match():
+    state = initial_state(1000)
+    primed, _ = apply_user_event(
+        state, "ordinary message", event_id="libido-floor:user",
+        libido=1, now=1000, lexicon=LEXICON,
+    )
+    assert primed["value"] == .30
+    assert primed["value"] < CHARGED
+
+
+def test_libido_floor_waits_until_refractory_window_ends():
+    state = initial_state(1000)
+    state["refractory_until"] = 1100
+    recovering, _ = apply_user_event(
+        state, "ordinary message", event_id="libido-floor:refractory",
+        libido=1, now=1050, lexicon=LEXICON,
+    )
+    assert recovering["value"] == 0
+    recovered, _ = apply_user_event(
+        recovering, "ordinary message", event_id="libido-floor:recovered",
+        libido=1, now=1100, lexicon=LEXICON,
+    )
+    assert recovered["value"] == .30
 
 
 def test_current_action_rises_and_unsafe_contexts_do_not():
