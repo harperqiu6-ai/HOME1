@@ -217,6 +217,10 @@ HOME1 是一个 **FastAPI 写的"AI 记忆网关"**：前面接 KELIVO（网页�
 - DS 对长对话首稿只返回1条时，在原有两次付费上限内做一次完整遗漏复核；复核失败保留已经验收的一稿，不会因保护逻辑反向丢记忆。
 - `CONSOLIDATION_MODEL` 单独控制 L2 分块整理与跨块对齐，继续使用 `anthropic/claude-haiku-4.5`。实测 DS L2 曾损坏JSON、漏ID，并把无关事件合并后错误盖上来源ID，因此禁止用一个共享 `MEMORY_MODEL` 整体切换。
 - 已同步生产并经Harper同意重启；运行中配置核对为 L1 DS V4 Flash、L2 Haiku 4.5、今日浓缩 `CACHE_SUMMARY_MODEL` Haiku 4.5。重启后PID=1194511，健康检查正常。
+### 2026-08-29 — 昨日桥压缩改为按实测字数反馈
+- 昨日桥首稿超过150计数字时，压缩提示会读取程序实测值，以120为安全目标，动态要求至少删掉“当前计字数-120”，并优先删除次要日常、保留关键转折和最后停点；不再重复发送没有实测反馈的固定压缩要求。
+- 字数已合格但人称、安全或格式未通过时，只反馈具体问题，并明确禁止为了修错机械删减事实。真实155→120样本与非长度失败均有回归测试。
+- 2026-08-28 回忆墙 id=4820 的997字正文未改；经Harper确认后写入已验收的120计字摘要并接管昨日桥，线上 `bridge_date=2026-08-28`。先观察数日，再决定是否推广到其他总结链。
 ### 2026-07-17 19:06 CST — HOME1 迁移最终切换完成
 - **结果**：Neon 数据已最后一次导入到本机 PostgreSQL，`home1-local` 重新启动并通过健康检查；`cyberboss` 已重启，HOME1 指向改为本机 VPS。
 - **对账**：关键表行数与 Neon 一致：conversations 5059、memories 1679、memory_photos 17、persona_suggestions 395、token_usage 624、dreams 18、gateway_config 66、intimacy 3、proactive_push_outbox 3、session_cache_state 2。

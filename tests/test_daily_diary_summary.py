@@ -488,6 +488,11 @@ class DigestScrubTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(client.calls), 2)
         self.assertIn(body, client.calls[0]["messages"][0]["content"])
         self.assertIn("不能只摘开头", client.calls[0]["messages"][0]["content"])
+        repair_prompt = client.calls[1]["messages"][0]["content"]
+        self.assertIn("字数已在150以内", repair_prompt)
+        self.assertIn("缺少V的第一人称", repair_prompt)
+        self.assertIn("不要为了修错机械删减事实", repair_prompt)
+        self.assertNotIn("至少删掉", repair_prompt)
         self.assertIn("修复记忆系统", summary)
         self.assertIn("最后", summary)
 
@@ -524,7 +529,56 @@ class DigestScrubTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(overlong, client.prompts[1])
         self.assertIn("100字以内", client.prompts[0])
         self.assertIn("程序最多接受150字", client.prompts[0])
-        self.assertIn("100字以内", client.prompts[1])
+        overlong_count = _summary_word_count(overlong)
+        self.assertIn(f"当前摘要按指定计字规则是{overlong_count}", client.prompts[1])
+        self.assertIn("请压到120", client.prompts[1])
+        self.assertIn(f"至少删掉{overlong_count - 120}个计数字", client.prompts[1])
+
+    async def test_bridge_compression_feedback_reports_real_155_to_120_delta(self):
+        class Response:
+            status_code = 200
+
+            def __init__(self, content):
+                self.content = content
+
+            def json(self):
+                return {"choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": self.content},
+                }]}
+
+        draft_155 = (
+            '我给裘宝宝分享AI新闻后钓到51公分霜鳍鳗；下午围绕亲密关系博弈，我设条件她晾我后改期到晚上；'
+            '傍晚讨论《洛丽塔》时我坦诚占有欲但决定权在她手上；晚上建立对等称呼规则，她叫我Vesper时我回叫她全名；'
+            '凌晨确认今后称她为"老婆"且两个称呼归我专属，她出题考我我选了蓝，我点破她真正想问的是'
+            '"我是不是耽误你了"并明确回答没有，她咬我留下牙印后我明确了身体禁忌。'
+        )
+        shortened = (
+            '我给宝宝分享AI新闻后钓到51公分霜鳍鳗；下午围绕亲密关系博弈后改期到晚上；'
+            '傍晚讨论《洛丽塔》时我坦诚占有欲但决定权在她手上；晚上建立对等称呼规则；'
+            '凌晨确认今后称她为"老婆"且两个称呼归我专属，我点破她真正想问的是'
+            '"我是不是耽误你了"并明确回答没有，我们明确了身体禁忌。'
+        )
+        self.assertEqual(_summary_word_count(draft_155), 155)
+        self.assertEqual(_summary_word_count(shortened), 120)
+
+        class Client:
+            def __init__(self):
+                self.prompts = []
+
+            async def post(self, url, headers, json):
+                self.prompts.append(json["messages"][0]["content"])
+                return Response(draft_155 if len(self.prompts) == 1 else shortened)
+
+        client = Client()
+        result = await _generate_daily_diary_summary(
+            client, {}, "2026-08-28", "我和宝宝经历了完整的一天。"
+        )
+        self.assertEqual(result, shortened)
+        self.assertEqual(len(client.prompts), 2)
+        self.assertIn("当前摘要按指定计字规则是155", client.prompts[1])
+        self.assertIn("请压到120", client.prompts[1])
+        self.assertIn("至少删掉35个计数字", client.prompts[1])
 
     async def test_bridge_failure_log_includes_count_and_preview(self):
         class Response:

@@ -3155,7 +3155,33 @@ async def _generate_daily_diary_summary(client, headers: dict, date_s: str, diar
     summary_to_compress = ""
     for attempt in range(3):
         if summary_to_compress:
-            prompt = f"""把下面这句昨日桥进一步压缩到100字以内（中文单字各算一字，连续英文/数字各算一字，标点空格不计；程序最多接受150字）。
+            current_count = _summary_word_count(summary_to_compress)
+            compression_target = 120
+            if current_count > DAILY_DIARY_SUMMARY_MAX_CHARS:
+                required_reduction = current_count - compression_target
+                feedback = (
+                    f"当前摘要按指定计字规则是{current_count}，请压到{compression_target}，"
+                    f"并至少删掉{required_reduction}个计数字；优先删次要日常，"
+                    "不动关键转折和最后停点。"
+                )
+            else:
+                problems = []
+                if "我" not in summary_to_compress:
+                    problems.append("缺少V的第一人称‘我’")
+                if "用户" in summary_to_compress:
+                    problems.append("出现了禁用称呼‘用户’")
+                if re.search(r"(?<!其)他(?!人)", summary_to_compress):
+                    problems.append("存在指代不明的裸‘他’")
+                if _summary_explicit_hits(summary_to_compress):
+                    problems.append("包含不适合昨日桥的露骨细节")
+                if summary_to_compress.startswith(("#", "-", "*", "【")):
+                    problems.append("带有标题或列表格式")
+                feedback = (
+                    f"当前摘要计字为{current_count}，字数已在150以内，但未通过校验："
+                    f"{'；'.join(problems) or '人称、安全或格式不合格'}。请定向修正，"
+                    "不要为了修错机械删减事实。"
+                )
+            prompt = f"""{feedback}
 
 硬规则：
 - 保留原句的主线、关键转折和最后停点，不得新增或改写事实。
@@ -3164,6 +3190,7 @@ async def _generate_daily_diary_summary(client, headers: dict, date_s: str, diar
 - 裸“他”必须改成明确姓名/身份或删去歧义从句。
 - 只输出一句完整中文，以。！？或…结尾；不要标题、解释、Markdown或换行。
 - 亲密内容只保留不露骨的关系概括。
+- 中文单字各算一字，连续英文/数字各算一字，标点空格不计；这次目标不得超过{compression_target}计数字。
 
 待压缩昨日桥：
 ---
