@@ -488,7 +488,7 @@ def _compose_l5_block(l5: str) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用启动时初始化数据库，关闭时断开连接"""
-    global PARTITION_SESSION_ID
+    global PARTITION_SESSION_ID, _cyberboss_l2_round_counter
     if MEMORY_ENABLED:
         try:
             await init_tables()
@@ -505,6 +505,12 @@ async def lifespan(app: FastAPI):
                 _l2_state["last_status"] = (await get_gateway_config("l2_today_last_status", "")) or None
                 _l2_state["bridge"] = await get_gateway_config("l2_bridge", "") or ""
                 _l2_state["bridge_date"] = (await get_gateway_config("l2_bridge_date", "")) or None
+                try:
+                    _cyberboss_l2_round_counter = max(
+                        0, int(await get_gateway_config("l2_today_round_counter", "0") or 0)
+                    )
+                except (TypeError, ValueError):
+                    _cyberboss_l2_round_counter = 0
             except Exception:
                 pass
             
@@ -2315,6 +2321,12 @@ def _l2_digest_body_result(text: str) -> tuple:
     body, tail = value.split("【浓缩结束】", 1)
     body = body.strip()
     tail = tail.strip()
+    # Models sometimes wrap the requested marker in Markdown or append one final
+    # punctuation mark. Those characters carry no prose and are safe to ignore;
+    # any real words after the marker remain ambiguous and must still be rejected.
+    body = re.sub(r"[\s`*_~#]{1,24}$", "", body).strip()
+    if tail and re.fullmatch(r"[\s`*_~#：:。.!！]{1,24}", tail):
+        tail = ""
     # Some providers deterministically put the requested marker first. This is
     # safe to recover only when it is the very first token and all prose follows;
     # a marker embedded between two prose regions remains ambiguous and rejected.
@@ -2445,20 +2457,43 @@ async def generate_today_digest(session_id: str) -> str:
             headers["HTTP-Referer"] = EXTRA_REFERER
             headers["X-Title"] = EXTRA_TITLE
         async with httpx.AsyncClient(timeout=90) as client:
-            response = await client.post(API_BASE_URL, headers=headers, json={
-                "model": CACHE_SUMMARY_MODEL,
-                # 先允许模型完整收尾；超长稿在下方二次压到常驻上下文预算内。
-                "max_tokens": 2400,
-                "temperature": 0,
-                "messages": [{"role": "user", "content": prompt}],
-            })
-            if response.status_code == 200:
+            response = None
+            raw_digest = ""
+            finish_reason = ""
+            d = ""
+            marker_error = ""
+            for draft_attempt in range(2):
+                attempt_prompt = prompt
+                if draft_attempt:
+                    attempt_prompt += (
+                        "\n\n上一次输出的结束标记格式不合法。请从今天的对话重新生成完整短稿，"
+                        "不要解释；正文后只输出一次【浓缩结束】，标记后不要再输出任何文字。"
+                    )
+                response = await client.post(API_BASE_URL, headers=headers, json={
+                    "model": CACHE_SUMMARY_MODEL,
+                    # 先允许模型完整收尾；超长稿在下方二次压到常驻上下文预算内。
+                    "max_tokens": 2400,
+                    "temperature": 0,
+                    "messages": [{"role": "user", "content": attempt_prompt}],
+                })
+                if response.status_code != 200:
+                    break
                 data = response.json()
+                if "choices" not in data:
+                    break
+                choice = data["choices"][0]
+                finish_reason = str(choice.get("finish_reason") or "")
+                raw_digest = choice["message"]["content"].strip()
+                d, marker_error = _l2_digest_body_result(raw_digest)
+                # A normal upstream stop plus a malformed marker is usually a
+                # formatting/refusal glitch. Regenerate from evidence once instead
+                # of repeatedly compacting that short broken fragment.
+                if marker_error and finish_reason != "length" and draft_attempt == 0:
+                    print(f"⚠️ L2初稿结束标记异常，重新生成一次: reason={marker_error}")
+                    continue
+                break
+            if response.status_code == 200:
                 if "choices" in data:
-                    choice = data["choices"][0]
-                    finish_reason = str(choice.get("finish_reason") or "")
-                    raw_digest = choice["message"]["content"].strip()
-                    d, marker_error = _l2_digest_body_result(raw_digest)
                     if finish_reason == "length" or marker_error or _l2_digest_needs_compaction(d):
                         compacted = await _compact_l2_digest(d)
                         if not compacted:
@@ -2604,6 +2639,10 @@ async def _refresh_l2_guarded(session_id: str):
         # 轮数表示“距上次成功刷新”，绝不能在尝试/失败时清零。
         if digest and session_id == _l2_digest_session_id():
             _cyberboss_l2_round_counter = 0
+            try:
+                await set_gateway_config("l2_today_round_counter", "0")
+            except Exception:
+                pass
             status = "success"
         elif not digest:
             print(f"⚠️ L2刷新未产出；保留轮数 {_cyberboss_l2_round_counter}，下一条继续重试")
@@ -6593,6 +6632,12 @@ async def api_line_log(request: Request):
     if role == "assistant" and line == CYBERBOSS_LINE_ID:
         global _cyberboss_l2_round_counter
         _cyberboss_l2_round_counter += 1
+        try:
+            await set_gateway_config(
+                "l2_today_round_counter", str(_cyberboss_l2_round_counter)
+            )
+        except Exception:
+            pass
         if L2_TODAY_ENABLED and L2_REFRESH_N > 0:
             _l2_today_s = str(_l2_logical_today())
             if (

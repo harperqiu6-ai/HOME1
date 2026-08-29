@@ -221,6 +221,9 @@ HOME1 是一个 **FastAPI 写的"AI 记忆网关"**：前面接 KELIVO（网页�
 - 昨日桥首稿超过150计数字时，压缩提示会读取程序实测值，以120为安全目标，动态要求至少删掉“当前计字数-120”，并优先删除次要日常、保留关键转折和最后停点；不再重复发送没有实测反馈的固定压缩要求。
 - 字数已合格但人称、安全或格式未通过时，只反馈具体问题，并明确禁止为了修错机械删减事实。真实155→120样本与非长度失败均有回归测试。
 - 2026-08-28 回忆墙 id=4820 的997字正文未改；经Harper确认后写入已验收的120计字摘要并接管昨日桥，线上 `bridge_date=2026-08-28`。先观察数日，再决定是否推广到其他总结链。
+### 2026-08-29 — 今日浓缩重启续算与格式异常自愈
+- `cyberboss` 陪伴线距上次成功浓缩的 assistant 回合数写入 `gateway_config.l2_today_round_counter`，成功后持久清零，HOME1 重启后恢复，不再因重启把未满18轮的进度抹掉。
+- 结束标记允许纯 Markdown 包裹和尾随标点；标记后有真实正文仍拒收。模型正常 stop 却返回非法标记时，从当天逐字证据完整重生成一次，不再连续压缩 70～80 字的坏片段；截断稿、空稿与失败稿仍不覆盖旧浓缩。
 ### 2026-07-17 19:06 CST — HOME1 迁移最终切换完成
 - **结果**：Neon 数据已最后一次导入到本机 PostgreSQL，`home1-local` 重新启动并通过健康检查；`cyberboss` 已重启，HOME1 指向改为本机 VPS。
 - **对账**：关键表行数与 Neon 一致：conversations 5059、memories 1679、memory_photos 17、persona_suggestions 395、token_usage 624、dreams 18、gateway_config 66、intimacy 3、proactive_push_outbox 3、session_cache_state 2。

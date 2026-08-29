@@ -100,6 +100,25 @@ class OpenRefreshTests(unittest.IsolatedAsyncioTestCase):
         rows.assert_not_awaited()
 
 
+class DigestMarkerTests(unittest.TestCase):
+    def test_markdown_or_punctuation_around_final_marker_is_harmless(self):
+        body = "今天发生了一件重要的事。"
+        for suffix in ("**", "。", "`", " **。** "):
+            with self.subTest(suffix=suffix):
+                parsed, error = main._l2_digest_body_result(
+                    f"{body}\n**【浓缩结束】{suffix}"
+                )
+                self.assertEqual(parsed, body)
+                self.assertEqual(error, "")
+
+    def test_real_prose_after_marker_remains_rejected(self):
+        parsed, error = main._l2_digest_body_result(
+            "今天发生了一件重要的事。\n【浓缩结束】希望这能帮到你。"
+        )
+        self.assertEqual(parsed, "今天发生了一件重要的事。")
+        self.assertEqual(error, "digest-output-after-end-marker")
+
+
 class OpenRefreshEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def test_plain_get_never_generates(self):
         """昨日桥每条消息都打这个接口，它绝不能烧钱。"""

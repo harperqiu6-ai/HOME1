@@ -706,6 +706,16 @@ def test_l2_round_counter_resets_only_after_success_and_queues_collisions():
     assert '_cyberboss_l2_round_counter = 0' in guarded
     assert '_cyberboss_l2_round_counter >= L2_REFRESH_N' in line_log
     assert '_cyberboss_l2_round_counter % L2_REFRESH_N' not in line_log
+    assert 'set_gateway_config("l2_today_round_counter", "0")' in guarded
+    assert '"l2_today_round_counter", str(_cyberboss_l2_round_counter)' in line_log
+
+
+def test_l2_round_counter_is_restored_after_restart():
+    source = open('/root/claude/HOME1/main.py', encoding='utf-8').read()
+    lifespan = source[source.index('async def lifespan'):source.index('@app.middleware("http")')]
+    assert 'global PARTITION_SESSION_ID, _cyberboss_l2_round_counter' in lifespan
+    assert 'get_gateway_config("l2_today_round_counter", "0")' in lifespan
+    assert '_cyberboss_l2_round_counter = max(' in lifespan
 
 
 def test_l2_digest_uses_progressive_wall_style_compaction():
@@ -725,6 +735,8 @@ def test_l2_digest_uses_progressive_wall_style_compaction():
     parser=source[source.index('def _l2_digest_body_result'):source.index('async def _compact_l2_digest')]
     assert 'if not body and tail' in parser
     assert 'a marker embedded between two prose regions remains ambiguous and rejected' in parser
+    assert 're.fullmatch(r"[\\s`*_~#：:。.!！]{1,24}", tail)' in parser
+    assert 'L2初稿结束标记异常，重新生成一次' in generate
 
 
 def test_recent_resolved_question_cannot_be_recreated_under_a_new_event_key():
