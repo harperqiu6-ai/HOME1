@@ -176,6 +176,16 @@ def test_pulse_endpoint_writes_pulse_log():
     s=Store(); asyncio.run(s.log_pulse('user_message','attachment',-.1,'1',{},NOW)); assert s.logs
 
 
+def test_cross_service_delivery_uses_atomic_state_and_audit_boundary():
+    source = (Path(__file__).resolve().parents[1] / "main.py").read_text()
+    store = (Path(__file__).resolve().parents[1] / "desire_store.py").read_text()
+    assert 'delivery_id = str((meta or {}).get("delivery_id")' in source
+    assert "await _commit_desire_state(state, last_tick, pulses, now, delivery_id)" in source
+    assert "async def save_with_pulses" in store
+    assert "pg_advisory_xact_lock" in store
+    assert "meta->>'delivery_id'" in store
+
+
 def test_pulse_idempotent_within_5min(): assert timedelta(minutes=4)<timedelta(minutes=5)
 
 

@@ -1160,6 +1160,7 @@ async def _apply_autonomous_thought(result):
 
 async def _apply_desire_event(event_type, source_ref="", drive_key="", explicit_delta=None, meta=None, now=None):
     now = now or datetime.now(timezone.utc)
+    delivery_id = str((meta or {}).get("delivery_id") or "").strip()[:240]
     wake_audit_events = {
         "desire_wake_started", "desire_wake_action",
         "desire_wake_peek_arrived", "desire_wake_finished",
@@ -1192,17 +1193,18 @@ async def _apply_desire_event(event_type, source_ref="", drive_key="", explicit_
         before = state.drives.get(drive_key, 0)
         state = desire_satisfy_to_baseline(state, "voice_reflection", drive_key)
         actual = state.drives.get(drive_key, before) - before
-        await _desire_store.log_pulse(
-            "diary_generated", drive_key, 0, source_ref or None,
-            {"effect": "reflection_processed"}, now,
-        )
+        pulses = [{
+            "event_type": "diary_generated", "drive_key": drive_key, "delta": 0,
+            "source_ref": source_ref or None, "meta": {"effect": "reflection_processed"},
+        }]
         if actual < 0:
-            await _desire_store.log_pulse(
-                "satisfy", drive_key, actual,
-                f"diary:{source_ref}" if source_ref else None,
-                {"action": "diary_reflection", "trigger_event": "diary_generated"}, now,
-            )
-        await _desire_store.save(state, last_tick, now)
+            pulses.append({
+                "event_type": "satisfy", "drive_key": drive_key, "delta": actual,
+                "source_ref": f"diary:{source_ref}" if source_ref else None,
+                "meta": {"action": "diary_reflection", "trigger_event": "diary_generated"},
+            })
+        if not await _commit_desire_state(state, last_tick, pulses, now, delivery_id):
+            return []
         return [{"drive_key": drive_key, "delta": actual, "settled": True}]
     if event_type == "satisfy" and drive_key:
         requested = (meta or {}).get("settle_drive_keys")
@@ -1212,25 +1214,28 @@ async def _apply_desire_event(event_type, source_ref="", drive_key="", explicit_
         ]
         settle_keys = list(dict.fromkeys(settle_keys)) or [drive_key]
         settled = []
+        pulses = []
         for settled_key in settle_keys:
             action = f"voice_{settled_key}" if len(settle_keys) > 1 else str((meta or {}).get("action") or "skip")
             before = state.drives.get(settled_key, 0)
             state = desire_satisfy(state, action, settled_key)
             actual = state.drives.get(settled_key, before) - before
-            await _desire_store.log_pulse(
-                "satisfy", settled_key, actual, source_ref or None,
-                {
+            pulses.append({
+                "event_type": "satisfy", "drive_key": settled_key, "delta": actual,
+                "source_ref": source_ref or None, "meta": {
                     "action": action,
                     "trigger_drive_key": str((meta or {}).get("trigger_drive_key") or drive_key),
                     "expression_drive_key": str((meta or {}).get("expression_drive_key") or drive_key),
-                }, now,
-            )
+                },
+            })
             settled.append({"drive_key": settled_key, "delta": actual})
-        await _desire_store.save(state, last_tick, now)
+        if not await _commit_desire_state(state, last_tick, pulses, now, delivery_id):
+            return []
         return settled
     text = str((meta or {}).get("text") or "")
     rules = [(drive_key, explicit_delta if explicit_delta is not None else 0.08)] if drive_key else classify_rules(event_type, text)
     applied = []
+    pulses = []
     for key, delta in rules:
         before = state.drives.get(key, 0)
         state = desire_pulse(state, {"drive_key": key, "delta": delta})
@@ -1238,10 +1243,14 @@ async def _apply_desire_event(event_type, source_ref="", drive_key="", explicit_
         pulse_meta = dict(meta or {})
         pulse_meta.setdefault("raw_delta", delta)
         pulse_meta.setdefault("event_credit_total", max(0.0, actual))
-        await _desire_store.log_pulse(event_type, key, actual, source_ref or None, pulse_meta, now)
+        pulses.append({
+            "event_type": event_type, "drive_key": key, "delta": actual,
+            "source_ref": source_ref or None, "meta": pulse_meta,
+        })
         applied.append({"drive_key": key, "delta": actual})
     if applied:
-        await _desire_store.save(state, last_tick, now)
+        if not await _commit_desire_state(state, last_tick, pulses, now, delivery_id):
+            return []
     if event_type in {"user_message", "v_ignored"} and _desire_batcher:
         context = ""
         try:
@@ -1283,6 +1292,20 @@ async def _apply_desire_event(event_type, source_ref="", drive_key="", explicit_
             print(f"[warning] thought context unavailable: {e}")
         await _thought_batcher.enqueue(source_ref or str(uuid.uuid4()), text, context)
     return applied
+
+
+async def _commit_desire_state(state, last_tick, pulses, now, delivery_id=""):
+    """Keep state and pulse audit atomic while preserving lightweight test stores."""
+    atomic_save = getattr(_desire_store, "save_with_pulses", None)
+    if atomic_save:
+        return await atomic_save(state, last_tick, pulses, now, delivery_id)
+    for pulse in pulses:
+        await _desire_store.log_pulse(
+            pulse["event_type"], pulse.get("drive_key"), pulse.get("delta", 0),
+            pulse.get("source_ref"), pulse.get("meta") or {}, now,
+        )
+    await _desire_store.save(state, last_tick, now)
+    return True
 
 # 大响应(如 /api/memories 全量 1.3MB)走跨境隧道裸传极慢，gzip 后约 1/4
 from fastapi.middleware.gzip import GZipMiddleware

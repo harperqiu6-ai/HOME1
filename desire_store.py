@@ -44,6 +44,39 @@ class DesireStore:
                     await conn.executemany("""INSERT INTO desire_thoughts(text,drive_key,kind,strength,fed_count,born_at,updated_at)
                         VALUES($1,$2,$3,$4,$5,$6,$7)""", [(t.text,t.drive_key,t.kind,t.strength,t.fed_count,t.born_at,now) for t in state.thoughts])
 
+    async def save_with_pulses(self, state: DesireState, last_tick_at, pulses, now, delivery_id=""):
+        """Commit drive state and its audit rows together; optionally dedupe one delivered event."""
+        normalized_delivery_id = str(delivery_id or "").strip()[:240]
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                if normalized_delivery_id:
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext($1))", normalized_delivery_id,
+                    )
+                    duplicate = await conn.fetchval(
+                        "SELECT 1 FROM desire_pulses WHERE meta->>'delivery_id'=$1 LIMIT 1",
+                        normalized_delivery_id,
+                    )
+                    if duplicate:
+                        return False
+                await conn.execute("""INSERT INTO desire_state(id,drives,last_tick_at,updated_at) VALUES(1,$1::jsonb,$2,$3)
+                    ON CONFLICT(id) DO UPDATE SET drives=EXCLUDED.drives,last_tick_at=EXCLUDED.last_tick_at,updated_at=EXCLUDED.updated_at""",
+                    json.dumps(state.drives), last_tick_at, now)
+                await conn.execute("DELETE FROM desire_thoughts")
+                if state.thoughts:
+                    await conn.executemany("""INSERT INTO desire_thoughts(text,drive_key,kind,strength,fed_count,born_at,updated_at)
+                        VALUES($1,$2,$3,$4,$5,$6,$7)""", [(t.text,t.drive_key,t.kind,t.strength,t.fed_count,t.born_at,now) for t in state.thoughts])
+                for pulse in pulses:
+                    pulse_meta = dict(pulse.get("meta") or {})
+                    if normalized_delivery_id:
+                        pulse_meta["delivery_id"] = normalized_delivery_id
+                    await conn.execute("""INSERT INTO desire_pulses(event_type,drive_key,delta,source_ref,meta,created_at)
+                        VALUES($1,$2,$3,$4,$5::jsonb,$6)""",
+                        str(pulse.get("event_type") or ""), pulse.get("drive_key"),
+                        float(pulse.get("delta") or 0), pulse.get("source_ref"),
+                        json.dumps(pulse_meta), now)
+        return True
+
     async def log_pulse(self, event_type, drive_key, delta, source_ref, meta, now):
         async with self.pool.acquire() as conn:
             return await conn.fetchval("""INSERT INTO desire_pulses(event_type,drive_key,delta,source_ref,meta,created_at)

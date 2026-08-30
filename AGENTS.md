@@ -229,6 +229,8 @@ HOME1 是一个 **FastAPI 写的"AI 记忆网关"**：前面接 KELIVO（网页�
 - L2初次整理、定点压缩、漏项修补、跨分块完整对齐与补丁对齐统一要求：情绪和关系变化只能通过原始证据支持的言行、决定与实际变化自然体现；禁止另加“这反映了/体现了/揭示了/展现了/说明了/代表了/这不仅是……更是……”式旁观者点评、主题升华或人物分析。只影响未来新生成事件，不改历史记忆。
 ### 2026-08-30 — 写日记正确结算反省欲望
 - `diary_generated` 不再作为新的 reflection 正向刺激。日记成功写入后改为结算 reflection，并以基线0.40为下限，避免“反省高→写日记→反省更高”的自我续高循环；结算记为 action=`diary_reflection`，可触发该维度冷却但不会冒充已向 Harper 发出的主动消息。
+### 2026-08-30 — 跨服务欲望事件原子结算
+- cyberboss 送来的事件可携带稳定 `meta.delivery_id`。HOME1 对该 ID 使用事务级 advisory lock 和永久 pulse 查重，并在同一 PostgreSQL 事务内写欲望状态、念头快照与全部 pulse 审计；网络重试不会重复加分，进程也不会再停在“审计已写、状态未存”或相反的半完成状态。无 delivery ID 的内部旧调用保持兼容。
 ### 2026-07-17 19:06 CST — HOME1 迁移最终切换完成
 - **结果**：Neon 数据已最后一次导入到本机 PostgreSQL，`home1-local` 重新启动并通过健康检查；`cyberboss` 已重启，HOME1 指向改为本机 VPS。
 - **对账**：关键表行数与 Neon 一致：conversations 5059、memories 1679、memory_photos 17、persona_suggestions 395、token_usage 624、dreams 18、gateway_config 66、intimacy 3、proactive_push_outbox 3、session_cache_state 2。
