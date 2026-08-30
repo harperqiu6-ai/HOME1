@@ -22,7 +22,7 @@ EVENT_RULES = {
     "user_silent_2h": [("attachment", 0.06)],
     "user_silent_4h": [("attachment", 0.10)], "user_silent_8h": [("attachment", 0.15)],
     "v_ignored": [("attachment", 0.05)],
-    "reminder_fired": [("duty", 0.05)], "diary_generated": [("reflection", 0.10)],
+    "reminder_fired": [("duty", 0.05)],
     "dream_generated": [("reflection", 0.08)],
     "night_hour": [("fatigue", 0.06)], "day_hour": [("fatigue", -0.04)],
 }

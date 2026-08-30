@@ -2,7 +2,7 @@ import random
 
 from desire import (BASELINES, DESIRE_THOUGHT_MAX, DesireState, Thought,
                     autonomous_thought_drive_delta, contextual_drive_delta, ranked_contextual_drive_delta, max_event_credit_gap, ease_drives, feed_thought, pick_intent,
-                    pulse, satisfy, tick_thoughts)
+                    pulse, satisfy, satisfy_to_baseline, tick_thoughts)
 from desire_pulse import classify_rules
 from desire_store import _row_with_decoded_meta
 
@@ -114,6 +114,21 @@ def test_satisfy_reduces_target_drive():
     state = DesireState({**BASELINES, "curiosity": .9, "stress": .4})
     after = satisfy(state, "voice_curiosity")
     assert after.drives["curiosity"] < .6 and after.drives["stress"] == .4
+
+
+def test_diary_style_satisfaction_reduces_reflection_but_not_below_baseline():
+    high = satisfy_to_baseline(
+        DesireState({**BASELINES, "reflection": .9}), "voice_reflection", "reflection",
+    )
+    low = satisfy_to_baseline(
+        DesireState({**BASELINES, "reflection": .45}), "voice_reflection", "reflection",
+    )
+    assert high.drives["reflection"] == .9 * .55
+    assert low.drives["reflection"] == BASELINES["reflection"]
+
+
+def test_diary_generation_is_not_a_positive_reflection_stimulus():
+    assert classify_rules("diary_generated") == []
 
 
 def test_sexual_release_satisfies_libido_without_silently_lowering_attachment():

@@ -52,7 +52,8 @@ from database import save_persona_suggestion, list_persona_suggestions, update_p
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, tag_emotions_batch, tag_explicit_batch
 from desire import (DesireState, autonomous_thought_drive_delta, contextual_drive_delta, ranked_contextual_drive_delta, max_event_credit_gap, feed_thought, pick_intent,
-                    pulse as desire_pulse, satisfy as desire_satisfy, state_dict)
+                    pulse as desire_pulse, satisfy as desire_satisfy,
+                    satisfy_to_baseline as desire_satisfy_to_baseline, state_dict)
 from desire_pulse import (AutonomousThoughtBatcher, DeepSeekBatcher, PendingClassification, classify_rules,
                           private_intimacy_scene)
 from desire_lexicon import LexiconError, mutate as mutate_desire_lexicon, snapshot as desire_lexicon_snapshot
@@ -1186,6 +1187,23 @@ async def _apply_desire_event(event_type, source_ref="", drive_key="", explicit_
     if not _desire_store or await _desire_store.is_duplicate(event_type, source_ref, now):
         return []
     state, last_tick = await _desire_store.load(now)
+    if event_type == "diary_generated":
+        drive_key = "reflection"
+        before = state.drives.get(drive_key, 0)
+        state = desire_satisfy_to_baseline(state, "voice_reflection", drive_key)
+        actual = state.drives.get(drive_key, before) - before
+        await _desire_store.log_pulse(
+            "diary_generated", drive_key, 0, source_ref or None,
+            {"effect": "reflection_processed"}, now,
+        )
+        if actual < 0:
+            await _desire_store.log_pulse(
+                "satisfy", drive_key, actual,
+                f"diary:{source_ref}" if source_ref else None,
+                {"action": "diary_reflection", "trigger_event": "diary_generated"}, now,
+            )
+        await _desire_store.save(state, last_tick, now)
+        return [{"drive_key": drive_key, "delta": actual, "settled": True}]
     if event_type == "satisfy" and drive_key:
         requested = (meta or {}).get("settle_drive_keys")
         settle_keys = [

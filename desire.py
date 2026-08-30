@@ -239,6 +239,16 @@ def satisfy(state: DesireState | Mapping[str, Any], action: str, drive_key: str 
     return out
 
 
+def satisfy_to_baseline(
+    state: DesireState | Mapping[str, Any], action: str, drive_key: str,
+) -> DesireState:
+    """Settle a processed drive without pushing it below its resting baseline."""
+    out = satisfy(state, action, drive_key)
+    if drive_key in DRIVE_KEYS:
+        out.drives[drive_key] = max(BASELINES[drive_key], out.drives[drive_key])
+    return out
+
+
 def desire_scores(state: DesireState | Mapping[str, Any]) -> dict[str, float]:
     out = _coerce(state)
     scores = {key: out.drives[key] for key in ACTION_BY_DRIVE}
