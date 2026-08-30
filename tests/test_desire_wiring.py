@@ -27,6 +27,10 @@ class Store:
 NOW=datetime(2026,7,22,12,tzinfo=timezone.utc)
 
 
+def _source(name):
+    return (Path(__file__).resolve().parents[1] / name).read_text(encoding="utf-8")
+
+
 def test_two_hour_silence_wake_uses_separate_quota_origin():
     source = (Path(__file__).resolve().parents[1] / "main.py").read_text()
     start = source.index("async def _maybe_enqueue_silence_wake(now, existing_is_handled=True):")
@@ -695,14 +699,14 @@ def test_deepseek_batcher_ignores_legacy_followup_updates():
 
 
 def test_unanswered_probe_endpoint_defaults_to_dry_run():
-    source=open('/root/claude/HOME1/main.py',encoding='utf-8').read()
+    source=_source('main.py')
     block=source[source.index('@app.post("/api/desire/probe-unanswered")'):source.index('@app.post("/api/desire/feed")')]
     assert 'dry_run = bool(data.get("dry_run", True))' in block
     assert 'if accepted_items and not dry_run:' in block
 
 
 def test_unanswered_results_feed_thoughts_but_do_not_create_followups():
-    source = open('/root/claude/HOME1/main.py', encoding='utf-8').read()
+    source = _source('main.py')
     block = source[source.index('async def _apply_deepseek_desire_results'):source.index('def _thought_similarity')]
     assert '_apply_autonomous_thought' in block
     assert 'unanswered_dialogue' in block
@@ -711,7 +715,7 @@ def test_unanswered_results_feed_thoughts_but_do_not_create_followups():
 
 
 def test_l2_round_counter_resets_only_after_success_and_queues_collisions():
-    source = open('/root/claude/HOME1/main.py', encoding='utf-8').read()
+    source = _source('main.py')
     guarded = source[source.index('async def _refresh_l2_guarded'):source.index('def _schedule_l2_refresh')]
     line_log = source[source.index('@app.post("/api/line/log")'):source.index('@app.get("/api/line/recent")')]
     assert '_l2_refresh_pending_session = session_id' in guarded
@@ -724,7 +728,7 @@ def test_l2_round_counter_resets_only_after_success_and_queues_collisions():
 
 
 def test_l2_round_counter_is_restored_after_restart():
-    source = open('/root/claude/HOME1/main.py', encoding='utf-8').read()
+    source = _source('main.py')
     lifespan = source[source.index('async def lifespan'):source.index('@app.middleware("http")')]
     assert 'global PARTITION_SESSION_ID, _cyberboss_l2_round_counter' in lifespan
     assert 'get_gateway_config("l2_today_round_counter", "0")' in lifespan
@@ -732,7 +736,7 @@ def test_l2_round_counter_is_restored_after_restart():
 
 
 def test_l2_digest_uses_progressive_wall_style_compaction():
-    source=open('/root/claude/HOME1/main.py',encoding='utf-8').read()
+    source=_source('main.py')
     compact=source[source.index('async def _compact_l2_digest'):source.index('async def generate_today_digest')]
     generate=source[source.index('async def generate_today_digest'):source.index('def _format_l2_conversation')]
     assert '_l2_digest_metrics(source_digest)' in compact
@@ -753,7 +757,7 @@ def test_l2_digest_uses_progressive_wall_style_compaction():
 
 
 def test_recent_resolved_question_cannot_be_recreated_under_a_new_event_key():
-    source = open('/root/claude/HOME1/desire_store.py', encoding='utf-8').read()
+    source = _source('desire_store.py')
     block = source[source.index('async def upsert_followup'):source.index('async def list_open_followups')]
     assert "old.status IN ('resolved','cancelled')" in block
     assert "INTERVAL '12 hours'" in block
@@ -761,7 +765,7 @@ def test_recent_resolved_question_cannot_be_recreated_under_a_new_event_key():
 
 
 def test_resolving_followup_removes_thought_by_provenance_not_display_text():
-    source = open('/root/claude/HOME1/desire_store.py', encoding='utf-8').read()
+    source = _source('desire_store.py')
     block = source[source.index('async def update_followup_status'):source.index('async def reset')]
     assert "source_ref='v-thought:unanswered:' || $1" in block
     assert "meta->>'thought'" in block
@@ -787,20 +791,20 @@ def test_deepseek_batcher_defaults_to_openrouter_v4_and_reuses_main_key():
 
 
 def test_user_message_deepseek_enqueue_is_not_an_elif():
-    source=open('/root/claude/HOME1/main.py',encoding='utf-8').read()
+    source=_source('main.py')
     block=source[source.index('async def _apply_desire_event'):source.index('# 大响应',source.index('async def _apply_desire_event'))]
     assert 'if event_type in {"user_message", "v_ignored"} and _desire_batcher:' in block
     assert 'elif event_type == "user_message"' not in block
 
 
 def test_agent_recall_is_not_wired_to_reflection():
-    source=open('/root/claude/HOME1/main.py',encoding='utf-8').read()
+    source=_source('main.py')
     recall=source[source.index('@app.post("/api/recall/agent")'):source.index('@app.post("/api/signal/nudge")')]
     assert 'recall_hit' not in recall
 
 
 def test_libido_context_is_applied_separately_without_restoring_legacy_classifier():
-    source=open('/root/claude/HOME1/main.py',encoding='utf-8').read()
+    source=_source('main.py')
     handler=source[source.index('async def _apply_deepseek_desire_results'):source.index('def _thought_similarity')]
     assert '"contextual_drive"' in handler
     assert 'ranked_contextual_drive_delta(drive, state_name' in handler
@@ -810,7 +814,7 @@ def test_libido_context_is_applied_separately_without_restoring_legacy_classifie
 
 
 def test_arousal_release_always_satisfies_libido_without_feature_flag():
-    source=open('/root/claude/HOME1/main.py',encoding='utf-8').read()
+    source=_source('main.py')
     block=source[source.index('async def _deliver_arousal_effects'):source.index('@app.post("/api/arousal/user_event")')]
     assert 'drive_key="libido"' in block
     assert 'meta={"action": "voice_libido"}' in block
@@ -818,7 +822,7 @@ def test_arousal_release_always_satisfies_libido_without_feature_flag():
 
 
 def test_body_buildup_raises_libido_but_does_not_overwrite_a_leading_drive():
-    source=open('/root/claude/HOME1/main.py',encoding='utf-8').read()
+    source=_source('main.py')
     helper=source[source.index('def _arousal_libido_target'):source.index('async def _deliver_arousal_effects')]
     assert 'baseline + (1.0 - baseline) * body' in helper
     assert 'receipt = pending_release_effect(state, now)' in helper
@@ -832,7 +836,7 @@ def test_body_buildup_raises_libido_but_does_not_overwrite_a_leading_drive():
 
 
 def test_ambiguous_intimacy_is_intentionally_biased_toward_libido():
-    source=open('/root/claude/HOME1/desire_pulse.py',encoding='utf-8').read()
+    source=_source('desire_pulse.py')
     assert '系统没有intimacy维度' in source
     assert '必须判libido为primary' in source
     assert '不要求额外出现明确性行为' in source
@@ -1027,7 +1031,7 @@ def test_morning_intimacy_replay_moves_libido_without_external_classifier():
 
 
 def test_desire_classification_is_persisted_before_in_memory_enqueue():
-    source=open('/root/claude/HOME1/main.py',encoding='utf-8').read()
+    source=_source('main.py')
     start=source.index('if event_type in {"user_message", "v_ignored"} and _desire_batcher:')
     block=source[start:source.index('if event_type == "v_thought_candidate"',start)]
     assert block.index('enqueue_pending_classification') < block.index('enqueue_item')
@@ -1051,7 +1055,7 @@ def test_autonomous_thought_accepts_at_most_one_grounded_result_per_hourly_flush
 
 
 def test_autonomous_thought_updates_pool_and_drive_value_together():
-    source=open('/root/claude/HOME1/main.py',encoding='utf-8').read()
+    source=_source('main.py')
     start=source.index('async def _apply_autonomous_thought(result):')
     end=source.index('\n\nasync def _apply_desire_event', start)
     body=source[start:end]
