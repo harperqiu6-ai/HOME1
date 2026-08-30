@@ -224,6 +224,8 @@ HOME1 是一个 **FastAPI 写的"AI 记忆网关"**：前面接 KELIVO（网页�
 ### 2026-08-29 — 今日浓缩重启续算与格式异常自愈
 - `cyberboss` 陪伴线距上次成功浓缩的 assistant 回合数写入 `gateway_config.l2_today_round_counter`，成功后持久清零，HOME1 重启后恢复，不再因重启把未满18轮的进度抹掉。
 - 结束标记允许纯 Markdown 包裹和尾随标点；标记后有真实正文仍拒收。模型正常 stop 却返回非法标记时，从当天逐字证据完整重生成一次，不再连续压缩 70～80 字的坏片段；截断稿、空稿与失败稿仍不覆盖旧浓缩。
+### 2026-08-30 — L2事件取消模板化升华尾句
+- L2初次整理、定点压缩、漏项修补、跨分块完整对齐与补丁对齐统一要求：情绪和关系变化只能通过原始证据支持的言行、决定与实际变化自然体现；禁止另加“这反映了/体现了/揭示了/展现了/说明了/代表了/这不仅是……更是……”式旁观者点评、主题升华或人物分析。只影响未来新生成事件，不改历史记忆。
 ### 2026-07-17 19:06 CST — HOME1 迁移最终切换完成
 - **结果**：Neon 数据已最后一次导入到本机 PostgreSQL，`home1-local` 重新启动并通过健康检查；`cyberboss` 已重启，HOME1 指向改为本机 VPS。
 - **对账**：关键表行数与 Neon 一致：conversations 5059、memories 1679、memory_photos 17、persona_suggestions 395、token_usage 624、dreams 18、gateway_config 66、intimacy 3、proactive_push_outbox 3、session_cache_state 2。

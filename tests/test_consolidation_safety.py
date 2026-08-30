@@ -160,8 +160,18 @@ class ConsolidationSafetyTest(unittest.TestCase):
         self.assertIn("不逐条记录每个指令、回合", CONSOLIDATION_PROMPT)
         self.assertIn("体位变化确实构成重要阶段变化时可以简要提及", CONSOLIDATION_PROMPT)
         self.assertIn("绝不能冒充现实", CONSOLIDATION_PROMPT)
+        analytic_coda_ban = "禁止在末尾另加旁观者点评、主题升华或人物分析"
+        self.assertIn(analytic_coda_ban, CONSOLIDATION_PROMPT)
+        self.assertIn("这反映了", CONSOLIDATION_PROMPT)
+        self.assertIn("禁止另加", CONSOLIDATION_ALIGNMENT_PROMPT)
+        self.assertIn("这不仅是……更是……", CONSOLIDATION_ALIGNMENT_PROMPT)
+        self.assertIn("禁止另加", CONSOLIDATION_ALIGNMENT_PATCH_PROMPT)
         self.assertEqual(CONSOLIDATION_MODEL_MAX_CONTENT_CHARS, 400)
         self.assertEqual(CONSOLIDATION_SAFE_MAX_CONTENT_CHARS, 550)
+
+    def test_l2_repair_prompts_keep_analytic_coda_ban(self):
+        source = inspect.getsource(_repair_consolidation_events)
+        self.assertEqual(source.count("禁止另加“这反映了/体现了/揭示了/展现了/说明了/代表了/这不仅是……更是……”"), 2)
 
     def test_l2_strict_policy_still_drives_repair_before_permissive_terminal(self):
         good = [
