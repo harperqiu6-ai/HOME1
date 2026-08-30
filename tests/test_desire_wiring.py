@@ -113,6 +113,9 @@ def test_wake_audit_has_read_only_visualization_endpoint():
     assert '@app.get("/api/desire/wakes")' in source
     assert '"desire_wake_started", "desire_wake_action"' in source
     assert '"desire_wake_peek_arrived", "desire_wake_finished"' in source
+    assert '"action": str(meta.get("tool_action") or "")' in source
+    assert '"treasure_id": str(meta.get("treasure_id") or "")' in source
+    assert '"treasure_label": str(meta.get("treasure_label") or "")[:120]' in source
 
 
 def test_tick_updates_state_and_logs_pulse():

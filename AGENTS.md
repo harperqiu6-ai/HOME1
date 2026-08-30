@@ -158,6 +158,7 @@ HOME1 是一个 **FastAPI 写的"AI 记忆网关"**：前面接 KELIVO（网页�
 
 ## 9. 变更日志
 
+- **2026-08-29**：Wake Trail 的自主工具行动增加可选安全 `action` 标签。Cyberboss 对 `cyberboss_treasure` 只上传白名单动作；`look/look_original` 另存宝藏 ID 和最多120字的 V 索引快照（无索引时退回原文件名），让页面显示“看了宝藏/又看了原图 · 哪一张”。不上传图片路径或完整 payload，也不显示缩略图；旧事件没有 action/索引时继续兼容只显示工具名。
 - **2026-08-28**：BODY 增加 LIBIDO 底火，弥补私密词表严格时高欲望仍近零的割裂：LIBIDO<0.50不托底，0.50时BODY最低0.02，之后线性上升，LIBIDO=1.00时封顶0.30；单靠底火永远低于Charging=0.40，真实身体词命中再从底火继续累积。明确恢复期不托底；释放后仍先恢复，不会被高LIBIDO立刻抬回。`GET /api/arousal/state` 会结合当前真实LIBIDO返回底火后的BODY读数，不需要等词表先命中。
 - **2026-08-28**：新增受网关钥匙保护的 `/desire-lexicon` 亲密语境词表页，并从操作间直接进入；Harper 可逐词查看、添加、删除 `openers/implicit_terms/nonsexual_phrases`。后端仅允许单词操作、原子写入、固定私有权限并把时间/操作者/动作/分组/词/理由写入私有 JSONL 审计；不提供整份覆盖。Cyberboss 将 V 的 list/add/remove 单词能力收进低 token 的按需 `cyberboss_private_manage` 路由，详细字段只在 `guide` 时展开；修改固定记为 V，下一条消息热生效。
 - **2026-08-28**：欲望语境持久队列由整批成败改成逐条生命周期：模型返回的合法 ID 各自验收、应用并 ACK；漏 ID 只增加自己的 attempt，退到队尾并按30/60分钟指数退避，不再堵住新消息；第三次仍失败移入 `desire_classification_dead_letters`，正文保留供审计、活跃队列删除。外部调用严格由半小时 loop 控制，达到 batch_size 和重启恢复都不额外连打；到期失败项整批最多3条，且与新项同时存在时至少给新项留1个位置，避免重组大批或饿死新消息。每次调用另有整次90秒硬截止，防止上游零碎传输不断续命普通 read timeout、长期占住 flush lock。高置信私有亲密词及已打开的45分钟亲密窗在调用外部分类器前由本地确定性规则直接结算；`蹭蹭`、`舔舔` 各自独立命中，工程非性短语排除仍优先。DeepSeek只继续处理本地未判定的模糊语境。

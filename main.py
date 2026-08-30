@@ -12424,6 +12424,9 @@ async def api_desire_wakes():
         elif event_type == "desire_wake_action":
             item["actions"].append({
                 "tool": str(meta.get("tool_name") or ""),
+                "action": str(meta.get("tool_action") or ""),
+                "treasure_id": str(meta.get("treasure_id") or ""),
+                "treasure_label": str(meta.get("treasure_label") or "")[:120],
                 "ok": meta.get("ok") is True, "at": created_at,
             })
             if str(meta.get("tool_name") or "") == "cyberboss_peek_screen":
