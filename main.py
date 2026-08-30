@@ -63,6 +63,15 @@ from arousal.core import (apply_assistant_event, apply_user_event, control_event
                           pending_release_effect, public_snapshot, status_line)
 from arousal.lexicon import load_lexicon
 from arousal.store import ArousalStore
+from memorywall_domain import (
+    MW_AUTHOR_CN,
+    MW_SUMMARY_THRESHOLD,
+    compose_content as _compose_mw_content,
+    extract_body as _extract_mw_body,
+    row_to_item as _mw_item,
+    summary_fallback as _memorywall_summary_fallback,
+    summary_is_valid as _memorywall_summary_is_valid,
+)
 
 # ============================================================
 # 配置项 —— 全部从环境变量读取，部署时在云平台面板里设置
@@ -10199,79 +10208,6 @@ async def api_mutate_desire_lexicon(request: Request):
 # “回忆” = memories 里 mw_meta 非空的记忆（迁入的 + dashboard 新建的），同库不同视图，
 # 因此它们也能被检索/注入给 AI（守铁律：界面可见=AI可感知）。
 # ============================================================
-
-MW_AUTHOR_CN = {
-    "ruanruan": "Harper",
-    "xiaoke": "V",
-    "v": "V",
-    "harper": "Harper",
-}
-MW_SUMMARY_THRESHOLD = 400
-
-
-def _compose_mw_content(title, body, author, mood, created_at, summary):
-    author_cn = MW_AUTHOR_CN.get(author, author or "")
-    header = f"【回忆 · {str(created_at)[:10]} · {author_cn}" + (f" · {mood}" if mood else "") + "】"
-    parts = [header + (title or "")]
-    if summary:
-        parts.append(f"〔检索摘要〕{summary}")
-    if body:
-        parts.append(body)
-    return "\n\n".join([p for p in parts if p and p.strip()])
-
-
-def _extract_mw_body(content):
-    parts = (content or "").split("\n\n")
-    rest = parts[1:]
-    if rest and rest[0].startswith("〔检索摘要〕"):
-        rest = rest[1:]
-    return "\n\n".join(rest)
-
-
-def _memorywall_summary_is_valid(summary, author):
-    """回忆墙检索摘要的统一入口校验；V 写的卡片必须保持 V 第一人称。"""
-    s = str(summary or "").strip()
-    if not s or "\n" in s or _summary_word_count(s) > DAILY_DIARY_SUMMARY_MAX_CHARS:
-        return False
-    if re.search(r"(^|\s)#{1,6}\s|[*_`]|用户", s):
-        return False
-    if not re.search(r"[。！？.!?]$", s):
-        return False
-    normalized_author = str(author or "").strip().lower()
-    if normalized_author in {"xiaoke", "v"} and "我" not in s:
-        return False
-    return True
-
-
-def _memorywall_summary_fallback(body, author):
-    # Never promote an arbitrary opening sentence to a searchable wall summary.
-    # Callers already made a model summarization attempt from the full body; if it
-    # is invalid, leaving the summary empty is safer than inventing a false digest.
-    return ""
-
-
-def _mw_item(row):
-    mm = row.get("mw_meta") or {}
-    event_date = str(row["event_date"]) if row.get("event_date") else None
-    return {
-        "id": row["id"],
-        "title": row.get("title") or mm.get("title") or "",
-        "body": mm.get("body") or _extract_mw_body(row.get("content") or ""),
-        "summary": mm.get("summary") or "",
-        "author": mm.get("author"),
-        "author_cn": mm.get("author_cn") or MW_AUTHOR_CN.get(mm.get("author"), mm.get("author")),
-        "mood": mm.get("mood"),
-        "source": mm.get("source"),
-        "is_period_day": mm.get("is_period_day"),
-        "location": mm.get("location"),
-        "date": event_date or mm.get("date") or (str(row.get("created_at")) if row.get("created_at") else None),
-        "event_date": event_date,
-        "importance": row.get("importance"),
-        "is_active": row.get("is_active"),
-        "pinned": bool(mm.get("pinned")),
-        "photos": row.get("photos", []),
-    }
-
 
 @app.get("/api/memorywall")
 async def api_mw_list(author: str = "", mood: str = "", include_inactive: bool = False):

@@ -233,6 +233,8 @@ HOME1 是一个 **FastAPI 写的"AI 记忆网关"**：前面接 KELIVO（网页�
 - cyberboss 送来的事件可携带稳定 `meta.delivery_id`。HOME1 对该 ID 使用事务级 advisory lock 和永久 pulse 查重，并在同一 PostgreSQL 事务内写欲望状态、念头快照与全部 pulse 审计；网络重试不会重复加分，进程也不会再停在“审计已写、状态未存”或相反的半完成状态。无 delivery ID 的内部旧调用保持兼容。
 ### 2026-08-30 — 标准测试入口与 CI
 - 新增 `requirements-dev.txt`、`scripts/test.sh` 和 GitHub Actions。以后本地/CI 都用同一入口：先编译关键 Python 模块，再跑 `tests/test_*.py`；复现脚本和需要人工生产数据的检查不会被测试 glob 意外带入。
+### 2026-08-30 — 回忆墙纯业务边界从 main.py 拆出
+- 新增 `memorywall_domain.py`，集中管理回忆墙正文组装/拆解、检索摘要校验、作者显示名和 DB 行到 API item 的纯转换；`main.py` 只保留路由、模型调用与数据库编排，并用原函数别名保持旧测试/调用兼容。新增独立领域测试，标准入口现为 272 项 + 21 子测试全绿。
 ### 2026-07-17 19:06 CST — HOME1 迁移最终切换完成
 - **结果**：Neon 数据已最后一次导入到本机 PostgreSQL，`home1-local` 重新启动并通过健康检查；`cyberboss` 已重启，HOME1 指向改为本机 VPS。
 - **对账**：关键表行数与 Neon 一致：conversations 5059、memories 1679、memory_photos 17、persona_suggestions 395、token_usage 624、dreams 18、gateway_config 66、intimacy 3、proactive_push_outbox 3、session_cache_state 2。
